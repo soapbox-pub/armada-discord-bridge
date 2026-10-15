@@ -345,7 +345,7 @@ impl ConcordClient {
         let channel = channel.clone();
         TaskGuard(tokio::spawn(async move {
             let mut seen: HashSet<String> = HashSet::new();
-            while let Some(wrap) = sub.events.recv().await {
+            while let Some(wrap) = sub.recv().await {
                 let Some(chat) = open_chat(&wrap, &channel) else { continue };
                 if wrap.kind == Kind::Custom(kinds::WRAP)
                     && let Some(cursor) = &on_cursor
@@ -392,7 +392,7 @@ impl ConcordClient {
             let mut pending = false;
             loop {
                 let next = if pending {
-                    match tokio::time::timeout(CONTROL_REFOLD, sub.events.recv()).await {
+                    match tokio::time::timeout(CONTROL_REFOLD, sub.recv()).await {
                         Ok(next) => next,
                         Err(_) => {
                             pending = false;
@@ -406,7 +406,7 @@ impl ConcordClient {
                         }
                     }
                 } else {
-                    sub.events.recv().await
+                    sub.recv().await
                 };
                 let Some(wrap) = next else { return };
                 if editions.contains_key(&wrap.id) {

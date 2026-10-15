@@ -56,15 +56,28 @@ pub trait RelayLike: Send + Sync {
     fn register_auth_keys(&self, _keys: Vec<Keys>) {}
 }
 
-/// A live subscription: verified events arrive on `events`.
+/// A live subscription; dropping it sends CLOSE.
+///
+/// The receiver is private on purpose. It used to be a public field, and a
+/// task that read `sub.events` inside `async move` captured that field alone
+/// (edition-2021 disjoint capture): the guard stayed behind in the calling
+/// function and dropped when it returned, so every live subscription was
+/// CLOSEd right after its REQ. In production that silenced Armada -> Discord
+/// and live control folds for every bridge (2026-10-15). With only `recv`
+/// exposed, reading events means owning the whole subscription.
 pub struct Subscription {
-    pub events: mpsc::UnboundedReceiver<Event>,
+    events: mpsc::UnboundedReceiver<Event>,
     _guard: Box<dyn Send + Sync>,
 }
 
 impl Subscription {
     pub fn new(events: mpsc::UnboundedReceiver<Event>, guard: impl Send + Sync + 'static) -> Self {
         Subscription { events, _guard: Box::new(guard) }
+    }
+
+    /// The next verified event; `None` once the subscription is gone.
+    pub async fn recv(&mut self) -> Option<Event> {
+        self.events.recv().await
     }
 }
 
@@ -248,8 +261,25 @@ pub struct MemoryRelay {
 #[derive(Default)]
 struct MemoryState {
     events: Vec<Event>,
-    subs: Vec<(Vec<Filter>, mpsc::UnboundedSender<Event>)>,
+    subs: Vec<(u64, Vec<Filter>, mpsc::UnboundedSender<Event>)>,
+    next_sub: u64,
     refuse: bool,
+}
+
+/// Closes a memory subscription when dropped, as a real relay's CLOSE would:
+/// a fake whose subscriptions outlive their handles hides exactly the bug of
+/// dropping one too early.
+struct MemoryUnsubscribe {
+    state: Weak<Mutex<MemoryState>>,
+    id: u64,
+}
+
+impl Drop for MemoryUnsubscribe {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.upgrade() {
+            state.lock().unwrap_or_else(|e| e.into_inner()).subs.retain(|(id, _, _)| *id != self.id);
+        }
+    }
 }
 
 impl MemoryRelay {
@@ -270,8 +300,8 @@ impl MemoryRelay {
     /// Store an event as if published, delivering it to subscriptions.
     pub fn inject(&self, event: Event) {
         let mut st = self.inner.lock().unwrap();
-        st.subs.retain(|(_, tx)| !tx.is_closed());
-        for (filters, tx) in &st.subs {
+        st.subs.retain(|(_, _, tx)| !tx.is_closed());
+        for (_, filters, tx) in &st.subs {
             if filters.iter().any(|f| f.match_event(&event, MatchEventOptions::default())) {
                 let _ = tx.send(event.clone());
             }
@@ -317,7 +347,9 @@ impl RelayLike for MemoryRelay {
                 let _ = tx.send(e.clone());
             }
         }
-        st.subs.push((filters, tx));
-        Subscription::new(rx, ())
+        let id = st.next_sub;
+        st.next_sub += 1;
+        st.subs.push((id, filters, tx));
+        Subscription::new(rx, MemoryUnsubscribe { state: Arc::downgrade(&self.inner), id })
     }
 }
