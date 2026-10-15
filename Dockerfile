@@ -1,25 +1,25 @@
-# Deps installed with npm (Bun's fetcher misbehaves behind some resolvers;
-# Bun still runs the TypeScript directly at runtime).
-FROM node:22-slim AS deps
-WORKDIR /app
-COPY package.json package-lock.json ./
-COPY packages/concord-core/package.json packages/concord-core/
-COPY packages/bridge/package.json packages/bridge/
-COPY packages/portal/package.json packages/portal/
-RUN npm install --no-audit --no-fund
-
 # The portal SPA is built INSIDE the image so it always matches the source;
-# the host's web/dist (if any) is excluded via .dockerignore.
+# the host's web/dist (if any) is excluded via .dockerignore. It is a plain
+# Vite app with no dependency on the server code.
 FROM node:22-slim AS webbuild
-WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-RUN node_modules/.bin/vite build packages/portal/web
+WORKDIR /web
+COPY packages/portal/web/package.json packages/portal/web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY packages/portal/web ./
+RUN npx vite build
 
-FROM oven/bun:1
+FROM rust:1.99-slim AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+# db.rs embeds the migrations from here at compile time.
+COPY packages/bridge/src/db packages/bridge/src/db
+RUN cargo build --release --locked -p portal -p bridge
+
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY --from=deps /app/node_modules ./node_modules
-COPY . .
-COPY --from=webbuild /app/packages/portal/web/dist ./packages/portal/web/dist
-ENV NODE_ENV=production
-CMD ["bun", "run", "packages/bridge/src/index.ts"]
+COPY --from=build /src/target/release/portal /src/target/release/bridge /usr/local/bin/
+COPY --from=webbuild /web/dist ./web
+ENV PORTAL_WEB_DIR=/app/web
+CMD ["portal"]
