@@ -43,10 +43,10 @@ makes the fix hard to undo by accident.
 
 - **`crates/concord` is the protocol kernel**, a port of the Armada client's,
   which folds the same events, and pinned to it by `tools/vectors`. Changing
-  which editions are *admissible* does not harden the system — it makes the bridge and Armada disagree about
-  who is authorized. Additive signals (reporting an entity as incomplete) are
-  safe; changing an authorization gate is a protocol decision that belongs
-  upstream in the CORD specs first.
+  which editions are *admissible* does not harden the system — it makes the
+  bridge and Armada disagree about who is authorized. Additive signals
+  (reporting an entity as incomplete) are safe; changing an authorization gate
+  is a protocol decision that belongs upstream in the CORD specs first.
 - **The popup handoff contract** (`/api/auth/discord?mode=popup`,
   `/api/auth/claim`) is consumed by the Armada client at `https://armada.buzz`,
   which is a separate codebase. Do not change its shape without shipping the
