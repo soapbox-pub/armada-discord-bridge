@@ -440,6 +440,150 @@ impl Pool {
         result
     }
 
+    /// Publish to relays and return as soon as ONE accepts, with its URL; the
+    /// rest keep trying in the background until the deadline. Err carries every
+    /// refusal when none accepted. This is Concord's broadcast rule: a stream
+    /// event is durable once any relay of the community holds it.
+    pub async fn publish_any(
+        &self,
+        relays: &[String],
+        event: &Event,
+        timeout: Duration,
+    ) -> Result<String, Vec<(String, String)>> {
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+
+        let deadline = Instant::now() + timeout;
+        let relays = normalize_all(relays);
+        let mut pending = FuturesUnordered::new();
+        {
+            let shared = self.shared();
+            let mut st = shared.lock();
+            for r in relays {
+                let (tx, rx) = oneshot::channel();
+                shared.send(
+                    &mut st,
+                    &r,
+                    Cmd::Publish {
+                        event: Box::new(event.clone()),
+                        tx,
+                    },
+                );
+                pending.push(async move { (r, rx.await) });
+            }
+        }
+
+        let mut rejected = Vec::new();
+        loop {
+            match tokio::time::timeout_at(deadline, pending.next()).await {
+                Ok(Some((r, Ok(Ok(()))))) => {
+                    // The stragglers keep trying until the deadline, and are
+                    // then cancelled so a relay that never answers does not
+                    // hold its pending entry forever.
+                    let pool = self.clone();
+                    let id = event.id;
+                    tokio::spawn(async move {
+                        let mut pending = pending;
+                        while let Ok(Some(_)) = tokio::time::timeout_at(deadline, pending.next()).await {}
+                        drop(pending);
+                        pool.cancel_publish(id);
+                    });
+                    return Ok(r);
+                }
+                Ok(Some((r, Ok(Err(reason))))) => rejected.push((r, reason)),
+                Ok(Some((r, Err(_)))) => rejected.push((r, "relay task stopped".to_string())),
+                Ok(None) => return Err(rejected),
+                Err(_) => {
+                    drop(pending);
+                    self.cancel_publish(event.id);
+                    rejected.push(("*".to_string(), "timeout".to_string()));
+                    return Err(rejected);
+                }
+            }
+        }
+    }
+
+    /// Drop pending publishes of `id` that no caller is waiting on any more.
+    /// Entries another caller still awaits are left alone by the relay task.
+    fn cancel_publish(&self, id: EventId) {
+        let st = self.shared().lock();
+        for r in st.relays.keys() {
+            Shared::send_existing(&st, r, Cmd::CancelPublish { id });
+        }
+    }
+
+    /// One-shot query answered by the FIRST relay that completes with a match,
+    /// rather than merged across all of them; empty after the timeout or when
+    /// every relay came back empty.
+    ///
+    /// For self-certifying lookups (an invite bundle, a replaceable profile)
+    /// waiting on the silent relays buys nothing and costs the whole timeout,
+    /// and a relay that answers with nothing must not out-run one that holds
+    /// the event, so an empty answer loses the race rather than winning it.
+    pub async fn query_race(
+        &self,
+        relays: &[String],
+        filters: Vec<Filter>,
+        timeout: Duration,
+    ) -> Vec<Event> {
+        let deadline = Instant::now() + timeout;
+        let relays = normalize_all(relays);
+        let (tx, mut rx) = mpsc::unbounded_channel::<(usize, QueryMsg)>();
+        let mut ids = Vec::with_capacity(relays.len());
+        {
+            let shared = self.shared();
+            let mut st = shared.lock();
+            for (i, r) in relays.iter().enumerate() {
+                let id = SubscriptionId::generate();
+                ids.push((r.clone(), id.clone()));
+                let (qtx, mut qrx) = mpsc::unbounded_channel();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    while let Some(msg) = qrx.recv().await {
+                        let done = matches!(msg, QueryMsg::Done);
+                        if tx.send((i, msg)).is_err() || done {
+                            break;
+                        }
+                    }
+                });
+                shared.send(
+                    &mut st,
+                    r,
+                    Cmd::Query {
+                        id,
+                        filters: filters.clone(),
+                        tx: qtx,
+                    },
+                );
+            }
+        }
+        drop(tx);
+
+        let mut per_relay: Vec<Vec<Event>> = vec![Vec::new(); relays.len()];
+        let mut remaining = relays.len();
+        let mut winner = Vec::new();
+        while remaining > 0 {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some((i, QueryMsg::Event(event)))) => per_relay[i].push(*event),
+                Ok(Some((i, QueryMsg::Done))) => {
+                    remaining -= 1;
+                    if !per_relay[i].is_empty() {
+                        winner = std::mem::take(&mut per_relay[i]);
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        let st = self.shared().lock();
+        for (r, id) in ids {
+            Shared::send_existing(&st, &r, Cmd::CancelQuery { id });
+        }
+        let mut seen = HashSet::new();
+        winner.retain(|e| seen.insert(e.id));
+        winner
+    }
+
     /// Relays currently connected.
     pub fn connected(&self) -> Vec<String> {
         self.shared().lock().connected.iter().cloned().collect()

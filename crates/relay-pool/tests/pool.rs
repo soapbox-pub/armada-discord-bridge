@@ -436,3 +436,50 @@ async fn reconnect_resubscribes_with_since() {
         other => panic!("expected event, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn publish_any_returns_on_first_accept() {
+    let relay = MockRelay::start(false).await;
+    // A relay that accepts the TCP connection and then never speaks.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent_url = format!("ws://{}", silent.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = silent.accept().await {
+            held.push(sock);
+        }
+    });
+
+    let keys = Keys::generate();
+    let (pool, _rx) = Pool::new(keys.clone());
+    let started = Instant::now();
+    let got = pool
+        .publish_any(&[silent_url.clone(), relay.url.clone()], &note(&keys, 1, "hi", 1_700_000_000), Duration::from_secs(8))
+        .await;
+    assert_eq!(got, Ok(relay.url.clone()));
+    assert!(started.elapsed() < Duration::from_secs(4), "waited on the silent relay");
+
+    let refused = pool
+        .publish_any(&relay.urls(), &note(&keys, 1, "reject", 1_700_000_000), Duration::from_secs(5))
+        .await;
+    assert_eq!(refused, Err(vec![(relay.url.clone(), "blocked: nope".to_string())]));
+}
+
+#[tokio::test]
+async fn query_race_skips_empty_answers() {
+    let empty = MockRelay::start(false).await;
+    let holder = MockRelay::start(false).await;
+    let author = Keys::generate();
+    let stored = note(&author, 1, "bundle", 1_700_000_000);
+    holder.store(stored.clone());
+
+    let (pool, _rx) = Pool::new(Keys::generate());
+    let filter = Filter::new().author(author.public_key());
+    let got = pool
+        .query_race(&[empty.url.clone(), holder.url.clone()], vec![filter.clone()], Duration::from_secs(5))
+        .await;
+    assert_eq!(got.iter().map(|e| e.id).collect::<Vec<_>>(), vec![stored.id]);
+
+    let none = pool.query_race(&empty.urls(), vec![filter], Duration::from_secs(5)).await;
+    assert!(none.is_empty());
+}
