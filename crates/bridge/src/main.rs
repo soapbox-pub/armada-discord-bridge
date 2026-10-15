@@ -87,7 +87,7 @@ impl DiscordEvents for Single {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,tokio_postgres=warn".into())).init();
+    tracing_subscriber::fmt().with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout())).with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,tokio_postgres=warn".into())).init();
     let config = BridgeConfig::from_process_env()?;
     let pool = bridge::db::connect(&config.database_url, 8)?;
     let applied = bridge::db::migrate(&pool).await?;
