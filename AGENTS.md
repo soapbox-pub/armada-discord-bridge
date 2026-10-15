@@ -23,13 +23,12 @@ silently wrong. Assume the reader can read the diff and cannot read your mind.
 Run the tests before committing:
 
 ```sh
-bun test                                            # unit + protocol suites
-bunx tsc -b packages/concord-core                   # concord typecheck
-bunx tsc -p packages/portal/tsconfig.json --noEmit  # portal typecheck
+cargo test --workspace
+cargo clippy --workspace --all-targets   # keep it at zero warnings
 ```
 
 Suites needing Postgres skip themselves when `DATABASE_URL` is unreachable, so
-a bare `bun test` is meaningful but not complete. To run them for real, point
+a bare `cargo test` is meaningful but not complete. To run them for real, point
 `DATABASE_URL` at a throwaway database — a container on a spare port is enough,
 and migrations bring it up from empty.
 
@@ -42,9 +41,9 @@ makes the fix hard to undo by accident.
 
 ## Two things are shared, and changing them diverges
 
-- **`packages/concord-core` is the protocol kernel**, extracted from the Armada
-  client, which folds the same events. Changing which editions are *admissible*
-  does not harden the system — it makes the bridge and Armada disagree about
+- **`crates/concord` is the protocol kernel**, a port of the Armada client's,
+  which folds the same events, and pinned to it by `tools/vectors`. Changing
+  which editions are *admissible* does not harden the system — it makes the bridge and Armada disagree about
   who is authorized. Additive signals (reporting an entity as incomplete) are
   safe; changing an authorization gate is a protocol decision that belongs
   upstream in the CORD specs first.
