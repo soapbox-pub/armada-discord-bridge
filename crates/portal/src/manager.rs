@@ -296,7 +296,7 @@ impl BridgeManager {
                 }
                 Err(error) => {
                     let delay = jittered(GATEWAY_RETRY_BASE, GATEWAY_RETRY_MAX, attempt);
-                    tracing::error!(attempt = attempt + 1, retry_in_s = delay.as_secs(), %error, "discord gateway failed to start");
+                    tracing::error!(attempt = attempt + 1, retry_in_s = delay.as_secs(), error = %format!("{error:#}"), "discord gateway failed to start");
                     let me = self.arc();
                     tokio::spawn(async move {
                         tokio::time::sleep(delay).await;
@@ -646,10 +646,10 @@ impl BridgeManager {
             let rb2 = rb.clone();
             tokio::spawn(async move {
                 if let Err(error) = me.backfill_missed(&rb2).await {
-                    tracing::warn!(bridge = %rb2.id, %error, "catch-up backfill failed");
+                    tracing::warn!(bridge = %rb2.id, error = %format!("{error:#}"), "catch-up backfill failed");
                 }
                 if let Err(error) = me.catch_up_discord(&rb2, live_from_ms).await {
-                    tracing::warn!(bridge = %rb2.id, %error, "Discord catch-up failed");
+                    tracing::warn!(bridge = %rb2.id, error = %format!("{error:#}"), "Discord catch-up failed");
                 }
             });
         } else {
@@ -670,7 +670,7 @@ impl BridgeManager {
             let (Some(me), Some(rb)) = (me.upgrade(), weak_rb.upgrade()) else { return };
             tokio::spawn(async move {
                 if let Err(error) = me.on_concord_chat(&rb, chat).await {
-                    tracing::error!(bridge = %rb.id, %error, "concord handler failed");
+                    tracing::error!(bridge = %rb.id, error = %format!("{error:#}"), "concord handler failed");
                 }
             });
         });
@@ -717,7 +717,7 @@ impl BridgeManager {
                 Ok(ids) if !ids.is_empty() => mirrored += 1,
                 Ok(_) => {}
                 Err(error) if is_missing_permissions(&error) => self.alert_missing_webhook_permission(rb).await,
-                Err(error) => tracing::warn!(bridge = %rb.id, rumor = %chat.rumor_id(), %error, "backfill mirror failed"),
+                Err(error) => tracing::warn!(bridge = %rb.id, rumor = %chat.rumor_id(), error = %format!("{error:#}"), "backfill mirror failed"),
             }
         }
         if let Some(newest) = newest {
@@ -818,7 +818,7 @@ impl CatchUpIo for CatchUp<'_> {
         match router.on_discord_message(inbound, link).await {
             Ok(rumor) => rumor.is_some(),
             Err(error) => {
-                tracing::warn!(bridge = %self.rb.id, message = %message.id, %error, "catch-up of Discord message failed");
+                tracing::warn!(bridge = %self.rb.id, message = %message.id, error = %format!("{error:#}"), "catch-up of Discord message failed");
                 false
             }
         }
@@ -1018,7 +1018,7 @@ impl BridgeManager {
                 Ok(()) => {
                     // Started: failing to clear the marker is not a failed start.
                     if let Err(error) = self.clear_start_failure(&row).await {
-                        tracing::warn!(bridge = %row.bridge_id, %error, "could not clear start-failure marker");
+                        tracing::warn!(bridge = %row.bridge_id, error = %format!("{error:#}"), "could not clear start-failure marker");
                     }
                 }
                 Err(error) if error.is::<GatewayUnavailable>() => {
@@ -1084,7 +1084,7 @@ impl BridgeManager {
             let Some(me) = me.upgrade() else { return };
             lock(&me.start_retries).remove(&id);
             if let Err(error) = me.retry_start(&id, attempt + 1).await {
-                tracing::error!(bridge = %id, %error, "retry failed before starting; rescheduling");
+                tracing::error!(bridge = %id, error = %format!("{error:#}"), "retry failed before starting; rescheduling");
                 me.schedule_start_retry(&id, attempt + 1);
             }
         });
@@ -1168,7 +1168,7 @@ impl BridgeManager {
         tokio::spawn(async move {
             let text = if command == "help" { Self::help_text().to_owned() } else { format!("Unknown command /{command}. {}", Self::help_text()) };
             if let Err(error) = adapter.reply(&channel, &id, &text).await {
-                tracing::error!(%command, %error, "command reply failed");
+                tracing::error!(%command, error = %format!("{error:#}"), "command reply failed");
             }
         });
         true
@@ -1188,7 +1188,7 @@ macro_rules! route {
             if is_missing_permissions(&error) {
                 manager.alert_missing_webhook_permission(&rb).await;
             } else {
-                tracing::error!(bridge = %rb.id, %error, "discord handler failed");
+                tracing::error!(bridge = %rb.id, error = %format!("{error:#}"), "discord handler failed");
             }
         }
     }};

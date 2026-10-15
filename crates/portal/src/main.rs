@@ -55,12 +55,12 @@ async fn main() -> anyhow::Result<()> {
         let (manager, importer) = (manager.clone(), importer.clone());
         tokio::spawn(async move {
             if let Err(error) = manager.init().await {
-                tracing::error!(%error, "bridge resume failed");
+                tracing::error!(error = %format!("{error:#}"), "bridge resume failed");
             }
             // After the bridges, whatever became of them: a resumed import's
             // wiring and history stages route through the live bridges.
             if let Err(error) = importer.resume_interrupted().await {
-                tracing::error!(%error, "import resume failed");
+                tracing::error!(error = %format!("{error:#}"), "import resume failed");
             }
         });
     }
@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tick.tick().await;
                 if let Err(error) = sessions.sweep().await {
-                    tracing::warn!(%error, "session sweep failed");
+                    tracing::warn!(error = %format!("{error:#}"), "session sweep failed");
                 }
             }
         });

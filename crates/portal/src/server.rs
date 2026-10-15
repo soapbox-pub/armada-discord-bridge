@@ -131,7 +131,7 @@ async fn guild_authority(st: &AppState, headers: &HeaderMap, session: &SessionDa
                 st.sessions.update(headers, &updated).await?;
             }
             Err(error) => {
-                tracing::warn!(user = %session.user.id, %error, "guild authority refresh failed");
+                tracing::warn!(user = %session.user.id, error = %format!("{error:#}"), "guild authority refresh failed");
                 return Ok(Err(err(StatusCode::UNAUTHORIZED, "could not check your Discord permissions; sign in again")));
             }
         }

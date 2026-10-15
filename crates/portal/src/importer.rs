@@ -780,7 +780,7 @@ impl Importer {
                 anyhow::Ok(())
             };
             if let Err(error) = rehosted.await {
-                tracing::error!(import = %import_id, %error, "icon/banner rehost failed");
+                tracing::error!(import = %import_id, error = %format!("{error:#}"), "icon/banner rehost failed");
                 plan.checkpoints.assets_error = Some(format!("{error:#}"));
             }
             plan.checkpoints.assets_at = Some(now_ms());
@@ -1134,7 +1134,7 @@ impl Importer {
             if !exists {
                 let inbound = rest_to_inbound(&message, &link.discord_guild_id, &discord_id);
                 let rumor = router.on_discord_message(inbound, &link).await.unwrap_or_else(|error| {
-                    tracing::warn!(import = %import_id, message = %message.id, %error, "history message failed");
+                    tracing::warn!(import = %import_id, message = %message.id, error = %format!("{error:#}"), "history message failed");
                     None
                 });
                 if rumor.is_none() {

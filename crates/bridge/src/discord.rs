@@ -606,12 +606,12 @@ async fn run_shard(
             Err(error) if matches!(error.kind(), ReceiveMessageErrorType::Reconnect) => {
                 let message = format!("discord gateway: shard {shard_id} could not connect: {error}");
                 if !report(&mut ready, Err(anyhow!(message))) {
-                    tracing::warn!(shard = %shard_id, %error, "discord gateway reconnect failed; retrying");
+                    tracing::warn!(shard = %shard_id, error = %format!("{error:#}"), "discord gateway reconnect failed; retrying");
                 }
                 continue;
             }
             Err(error) => {
-                tracing::warn!(shard = %shard_id, %error, "discord gateway event dropped");
+                tracing::warn!(shard = %shard_id, error = %format!("{error:#}"), "discord gateway event dropped");
                 continue;
             }
         };
@@ -677,7 +677,7 @@ fn dispatch(adapter: &Arc<DiscordAdapter>, event: Event) {
                 match adapter.reaction(&added.0).await {
                     Ok(Some(reaction)) => events.on_reaction_add(reaction).await,
                     Ok(None) => {}
-                    Err(error) => tracing::error!(%error, "discord reaction add failed"),
+                    Err(error) => tracing::error!(error = %format!("{error:#}"), "discord reaction add failed"),
                 }
             });
         }
@@ -687,7 +687,7 @@ fn dispatch(adapter: &Arc<DiscordAdapter>, event: Event) {
                 match adapter.reaction(&removed.0).await {
                     Ok(Some(reaction)) => events.on_reaction_remove(reaction).await,
                     Ok(None) => {}
-                    Err(error) => tracing::error!(%error, "discord reaction remove failed"),
+                    Err(error) => tracing::error!(error = %format!("{error:#}"), "discord reaction remove failed"),
                 }
             });
         }

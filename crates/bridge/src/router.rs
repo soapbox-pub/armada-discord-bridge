@@ -242,7 +242,7 @@ impl BridgeRouter {
             Ok(_) => {
                 self.joined_puppets.lock().unwrap_or_else(|e| e.into_inner()).insert(discord_user_id.to_owned());
             }
-            Err(error) => tracing::warn!(user = discord_user_id, %error, "guestbook join failed"),
+            Err(error) => tracing::warn!(user = discord_user_id, error = %format!("{error:#}"), "guestbook join failed"),
         }
     }
 
@@ -304,7 +304,7 @@ impl BridgeRouter {
         }
 
         if let Err(error) = self.sync_puppet_profile(&msg.author, &puppet.keys).await {
-            tracing::warn!(user = %msg.author.id, %error, "puppet profile publish failed");
+            tracing::warn!(user = %msg.author.id, error = %format!("{error:#}"), "puppet profile publish failed");
         }
         self.publish_puppet_join(&msg.author.id, &puppet.keys, msg.timestamp_ms).await;
         if let Some(reference) = &msg.referenced_message_id {
@@ -400,7 +400,7 @@ impl BridgeRouter {
 
         let puppet = self.puppets.get(&reaction.user.id)?;
         if let Err(error) = self.sync_puppet_profile(&reaction.user, &puppet.keys).await {
-            tracing::warn!(user = %reaction.user.id, %error, "puppet profile publish failed");
+            tracing::warn!(user = %reaction.user.id, error = %format!("{error:#}"), "puppet profile publish failed");
         }
         let mut tags = vec![
             vec!["e".into(), row.concord_rumor_id.clone()],
@@ -594,7 +594,7 @@ impl BridgeRouter {
                     && self.store.count_concord_reactions(&reaction.discord_message_id, &reaction.emoji).await? == 0
                     && let Err(error) = self.webhooks.unreact(link, &reaction.discord_message_id, &reaction.emoji).await
                 {
-                    tracing::warn!(message = %reaction.discord_message_id, %error, "discord unreact failed");
+                    tracing::warn!(message = %reaction.discord_message_id, error = %format!("{error:#}"), "discord unreact failed");
                 }
                 continue;
             }
@@ -606,7 +606,7 @@ impl BridgeRouter {
             }
             for row in &rows {
                 if let Err(error) = self.webhooks.delete(link, &row.discord_message_id).await {
-                    tracing::warn!(message = %row.discord_message_id, %error, "discord delete failed");
+                    tracing::warn!(message = %row.discord_message_id, error = %format!("{error:#}"), "discord delete failed");
                 }
             }
         }
@@ -656,7 +656,7 @@ impl BridgeRouter {
         for (i, row) in rows.iter().enumerate() {
             let content = parts.get(i).map(String::as_str).unwrap_or("*(removed by edit)*");
             if let Err(error) = self.webhooks.edit(link, &row.discord_message_id, content).await {
-                tracing::warn!(message = %row.discord_message_id, %error, "discord edit failed");
+                tracing::warn!(message = %row.discord_message_id, error = %format!("{error:#}"), "discord edit failed");
             }
         }
         if parts.len() > rows.len() {
@@ -752,7 +752,7 @@ impl BridgeRouter {
                     tags.push(imeta);
                     return Some(substituted(&url));
                 }
-                Err(error) => tracing::warn!(%error, "klipy rehost failed"),
+                Err(error) => tracing::warn!(error = %format!("{error:#}"), "klipy rehost failed"),
             }
         }
         let mut imeta = vec!["imeta".into(), format!("url {}", gif.url), "m image/gif".into()];
@@ -790,7 +790,7 @@ impl BridgeRouter {
                 DiscordInboundMessage { embeds: vec![EmbedIn { url: page, media_url: Some(url) }], ..msg }
             }
             Err(error) => {
-                tracing::warn!(%error, "gif transcode fallback failed");
+                tracing::warn!(error = %format!("{error:#}"), "gif transcode fallback failed");
                 msg
             }
         }
@@ -845,7 +845,7 @@ impl BridgeRouter {
                     out.push(DiscordAttachmentIn { url, filename: attachment.filename.clone() });
                 }
                 Err(error) => {
-                    tracing::warn!(url = %attachment.url, %error, "blossom rehost failed");
+                    tracing::warn!(url = %attachment.url, error = %format!("{error:#}"), "blossom rehost failed");
                     out.push(attachment.clone());
                 }
             }
@@ -925,7 +925,7 @@ impl BridgeRouter {
                     files.push(FileUpload { name: attachment_filename(url, &kind, fields.get("name").map(String::as_str)), data });
                     urls.push(url.clone());
                 }
-                Err(error) => tracing::warn!(%url, %error, "imeta download failed"),
+                Err(error) => tracing::warn!(%url, error = %format!("{error:#}"), "imeta download failed"),
             }
         }
         (files, urls)

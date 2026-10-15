@@ -44,7 +44,7 @@ impl Single {
 
 fn logged<T>(what: &str, result: anyhow::Result<T>) {
     if let Err(error) = result {
-        tracing::error!(%error, "{what} failed");
+        tracing::error!(error = %format!("{error:#}"), "{what} failed");
     }
 }
 
@@ -149,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(channel = %channel.name, "target channel");
 
     if let Err(error) = client.publish_join(now_ms(), None).await {
-        tracing::warn!(%error, "guestbook join failed");
+        tracing::warn!(error = %format!("{error:#}"), "guestbook join failed");
     }
     let profile = json!({
         "name": "Discord <-> Armada Bridge Bot",
@@ -157,12 +157,12 @@ async fn main() -> anyhow::Result<()> {
         "bot": true,
     });
     if let Err(error) = client.publish_profile(&primary, &profile).await {
-        tracing::warn!(%error, "profile publish failed");
+        tracing::warn!(error = %format!("{error:#}"), "profile publish failed");
     }
     // Point our giftwrap inbox at the community relays (NIP-17 kind 10050),
     // the list Armada resolves before sending a Direct Invite.
     if let Err(error) = client.publish_dm_relays(&primary, &community.relays).await {
-        tracing::warn!(%error, "DM relay list publish failed");
+        tracing::warn!(error = %format!("{error:#}"), "DM relay list publish failed");
     }
 
     // ── Storage, Discord, router ────────────────────────────────────────────
@@ -219,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
         let (chats, newest) = client.backfill_channel(&channel, cursor.saturating_sub(60), 500).await?;
         for chat in &chats {
             if let Err(error) = router.on_concord_chat(chat, &link).await {
-                tracing::warn!(rumor = %chat.rumor_id(), %error, "backfill mirror failed");
+                tracing::warn!(rumor = %chat.rumor_id(), error = %format!("{error:#}"), "backfill mirror failed");
             }
         }
         if let Some(newest) = newest {
