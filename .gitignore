@@ -8,3 +8,5 @@ dist/
 # Deployment runbook: hostnames, paths, and hardening details for the live
 # host. This repository is public.
 DEPLOY.md
+
+/target
