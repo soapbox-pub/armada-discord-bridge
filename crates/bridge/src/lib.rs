@@ -4,6 +4,7 @@ pub mod blossom;
 pub mod client;
 pub mod config;
 pub mod db;
+pub mod discord;
 pub mod gif;
 pub mod imeta;
 pub mod key_intake;
