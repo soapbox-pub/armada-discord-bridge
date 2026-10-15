@@ -16,5 +16,6 @@ pub mod puppets;
 pub mod relays;
 pub mod router;
 pub mod store;
+pub mod tls;
 pub mod transform;
 pub mod types;

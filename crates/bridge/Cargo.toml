@@ -20,6 +20,7 @@ nostr.workspace = true
 rand.workspace = true
 regex = "1"
 relay-pool = { path = "../relay-pool" }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
 serde.workspace = true
 serde_json.workspace = true
