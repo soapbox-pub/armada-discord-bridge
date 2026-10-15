@@ -70,7 +70,7 @@ const MAX_RATELIMIT_WAIT_MS: f64 = 60_000.0;
 /// Total 429 waiting per request before giving up and surfacing the 429.
 const RATELIMIT_BUDGET_MS: f64 = 5.0 * 60_000.0;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 pub struct GuildChannel {
     pub id: String,
     #[serde(default)]

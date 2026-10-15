@@ -4,7 +4,7 @@ use anyhow::{Context, anyhow, bail};
 
 use crate::discord_rest::parse_timestamp_ms;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PortalEnv {
     pub database_url: String,
     pub port: u16,
@@ -129,6 +129,32 @@ fn parse_catch_up_since(value: &str) -> anyhow::Result<Option<i64>> {
     match parse_timestamp_ms(value) {
         Some(ms) => Ok(Some(ms)),
         None => bail!("DISCORD_CATCHUP_SINCE is not a date: {value}"),
+    }
+}
+
+/// Written by hand so the secrets never reach a log line: a derived `Debug`
+/// would print PORTAL_SEAL_KEY, which unseals every per-bridge secret in the
+/// database, the moment anything formatted the env with `{:?}`.
+impl std::fmt::Debug for PortalEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted = |s: &str| if s.is_empty() { "" } else { "<redacted>" };
+        f.debug_struct("PortalEnv")
+            .field("database_url", &redacted(&self.database_url))
+            .field("port", &self.port)
+            .field("host", &self.host)
+            .field("base_url", &self.base_url)
+            .field("seal_key_hex", &redacted(&self.seal_key_hex))
+            .field("discord_client_id", &self.discord_client_id)
+            .field("discord_client_secret", &redacted(&self.discord_client_secret))
+            .field("discord_bot_token", &redacted(&self.discord_bot_token))
+            .field("blossom_server", &self.blossom_server)
+            .field("klipy_api_key", &redacted(&self.klipy_api_key))
+            .field("dev_login", &self.dev_login)
+            .field("invite_base_url", &self.invite_base_url)
+            .field("import_relays", &self.import_relays)
+            .field("allowed_origins", &self.allowed_origins)
+            .field("catch_up_since_ms", &self.catch_up_since_ms)
+            .finish()
     }
 }
 
