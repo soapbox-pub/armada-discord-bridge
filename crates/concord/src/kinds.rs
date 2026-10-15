@@ -44,6 +44,10 @@ pub const COMMUNITY_LIST_FRAG: u16 = 33302;
 pub const INVITE_LIST: u16 = 13303;
 /// Bot command manifest (Armada NIP.md).
 pub const BOT_MANIFEST: u16 = 10304;
+/// NIP-17 DM relay list: where a member's giftwrap inbox lives.
+pub const DM_RELAYS: u16 = 10050;
+/// NIP-65 relay list (read/write markers).
+pub const RELAY_LIST: u16 = 10002;
 
 // Control edition sub-kinds (`vsk`)
 pub const VSK_METADATA: &str = "0";

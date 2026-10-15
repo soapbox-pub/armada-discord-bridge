@@ -279,3 +279,83 @@ pub fn build_bundle_event(bundle: &InviteBundle, token: &[u8; TOKEN_BYTES], link
 pub fn token_hex(token: &[u8; TOKEN_BYTES]) -> String {
     to_hex(token)
 }
+
+/// A fresh 16-byte unlock token.
+pub fn mint_token() -> [u8; TOKEN_BYTES] {
+    use rand::RngCore;
+    let mut token = [0u8; TOKEN_BYTES];
+    rand::rngs::OsRng.fill_bytes(&mut token);
+    token
+}
+
+/// The bare naddr of a link signer's bundle coordinate `(33301, signer, d="")`.
+///
+/// Encoded by hand rather than through the `nostr` crate because NIP-19 leaves
+/// TLV order free and the two libraries chose differently: nostr-tools writes
+/// kind, author, identifier. Both decode alike, but this string is the shared
+/// link, and Armada's spelling is the one people have already seen.
+pub fn bundle_naddr(link_signer: &nostr::prelude::PublicKey) -> String {
+    let mut tlv = Vec::with_capacity(46);
+    tlv.extend_from_slice(&[3, 4]);
+    tlv.extend_from_slice(&u32::from(kinds::INVITE_BUNDLE).to_be_bytes());
+    tlv.extend_from_slice(&[2, 32]);
+    tlv.extend_from_slice(&link_signer.to_bytes());
+    tlv.extend_from_slice(&[0, 0]);
+    bech32::encode::<bech32::Bech32>(bech32::Hrp::parse("naddr").expect("valid hrp"), &tlv).expect("short payloads always encode")
+}
+
+/// A shareable invite URL on `base`. The base is cosmetic: any deeplink domain
+/// parses, because the naddr and fragment carry everything.
+pub fn build_invite_url(base: &str, link_signer: &nostr::prelude::PublicKey, token: &[u8; TOKEN_BYTES], relays: &[String]) -> Result<String, InviteError> {
+    Ok(format!("{}/invite/{}#{}", base.trim_end_matches('/'), bundle_naddr(link_signer), encode_fragment(token, relays)?))
+}
+
+/// Where an invite reaches a member (CORD-05 §6): their published inbox when
+/// they have one, else the stock relays every client ships. Send and scan must
+/// resolve this identically or the two sides never meet.
+pub fn invite_delivery_relays(inbox: &[String]) -> Vec<String> {
+    if inbox.is_empty() { stock_relays() } else { inbox.to_vec() }
+}
+
+/// A member's inbox from their published lists: kind-10050 DM relays if any,
+/// else their NIP-65 (kind 10002) read relays. Empty means they published
+/// neither — which is not the same as a lookup that failed, and callers must
+/// not conflate the two or a list-holder's invite goes where they never read.
+pub fn inbox_relays_from(events: &[Event], recipient: &nostr::prelude::PublicKey) -> Vec<String> {
+    let latest = |kind: u16| {
+        events.iter().filter(|e| e.kind == Kind::Custom(kind) && e.pubkey == *recipient).max_by_key(|e| e.created_at)
+    };
+    let tags_of = |e: &Event| e.tags.iter().map(|t| t.as_slice().to_vec()).collect::<Vec<_>>();
+    if let Some(dm) = latest(kinds::DM_RELAYS) {
+        let mut urls: Vec<String> = Vec::new();
+        for t in tags_of(dm) {
+            if t.first().map(String::as_str) != Some("relay") {
+                continue;
+            }
+            if let Some(url) = t.get(1).and_then(|u| normalize_relay(u))
+                && !urls.contains(&url)
+            {
+                urls.push(url);
+            }
+        }
+        if !urls.is_empty() {
+            return cap_relays(urls);
+        }
+    }
+    let Some(nip65) = latest(kinds::RELAY_LIST) else { return vec![] };
+    let reads = tags_of(nip65)
+        .into_iter()
+        .filter(|t| t.first().map(String::as_str) == Some("r") && t.get(2).map(String::as_str) != Some("write"))
+        .filter_map(|t| t.get(1).cloned().filter(|u| !u.is_empty()));
+    cap_relays(reads)
+}
+
+/// A relay URL in the form Armada compares by: ws(s) only, no trailing slash,
+/// and a bare hostname taken as `wss://`.
+fn normalize_relay(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let lower = raw.to_ascii_lowercase();
+    let with_scheme = if lower.starts_with("ws://") || lower.starts_with("wss://") { raw.to_owned() } else { format!("wss://{raw}") };
+    let url = nostr::prelude::RelayUrl::parse(&with_scheme).ok()?;
+    Some(url.as_str().trim_end_matches('/').to_owned())
+}

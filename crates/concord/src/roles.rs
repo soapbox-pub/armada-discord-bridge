@@ -17,6 +17,11 @@ pub mod perm {
 
     /// Bits whose actions are Control editions; holders are staff (CORD-04 §3).
     pub const STAFF: u64 = MANAGE_ROLES | MANAGE_CHANNELS | MANAGE_METADATA | BAN | CREATE_INVITE | PIN_MESSAGES;
+
+    /// Every currently-defined bit: what a stock Admin holds. There is no
+    /// all-powerful bit, so an Admin does not inherit a permission added later.
+    pub const ADMIN_ALL: u64 =
+        MANAGE_ROLES | MANAGE_CHANNELS | MANAGE_METADATA | KICK | BAN | MANAGE_MESSAGES | CREATE_INVITE | VIEW_AUDIT_LOG | MENTION_EVERYONE | PIN_MESSAGES;
 }
 
 pub const NAME_MAX_BYTES: usize = 64;
@@ -40,7 +45,56 @@ pub struct Role {
     pub color: u32,
 }
 
+/// The CORD-04 §2 wire forms, field order matching Armada's `roleToJSON` and
+/// `grantToJSON` so the same Role serializes to the same edition bytes.
+#[derive(serde::Serialize)]
+struct RoleWire<'a> {
+    role_id: &'a str,
+    name: &'a str,
+    position: u32,
+    permissions: String,
+    scope: ScopeWire<'a>,
+    color: u32,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum ScopeWire<'a> {
+    Server,
+    Channel { channel_id: &'a str },
+}
+
+#[derive(serde::Serialize)]
+struct GrantWire<'a> {
+    member: &'a str,
+    role_ids: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control_wrap: Option<&'a str>,
+}
+
+/// A stock server-scope Admin: every current bit, at position 1.
+pub fn admin_role(role_id: &str) -> Role {
+    Role { role_id: role_id.to_owned(), name: "Admin".into(), position: 1, permissions: perm::ADMIN_ALL, scope: RoleScope::Server, color: 0 }
+}
+
 impl Role {
+    /// `permissions` is always written as a decimal string.
+    pub fn to_json(&self) -> String {
+        let scope = match &self.scope {
+            RoleScope::Server => ScopeWire::Server,
+            RoleScope::Channel(id) => ScopeWire::Channel { channel_id: id },
+        };
+        let wire = RoleWire {
+            role_id: &self.role_id,
+            name: &self.name,
+            position: self.position,
+            permissions: self.permissions.to_string(),
+            scope,
+            color: self.color,
+        };
+        serde_json::to_string(&wire).expect("roles always serialize")
+    }
+
     pub fn from_json(json: &str) -> Option<Role> {
         let v: Value = serde_json::from_str(json).ok()?;
         let role_id = v.get("role_id")?.as_str().filter(|s| crate::is_hex64(s))?.to_lowercase();
@@ -75,6 +129,11 @@ pub struct MemberGrant {
 }
 
 impl MemberGrant {
+    pub fn to_json(&self) -> String {
+        let wire = GrantWire { member: &self.member, role_ids: &self.role_ids, control_wrap: self.control_wrap.as_deref() };
+        serde_json::to_string(&wire).expect("grants always serialize")
+    }
+
     pub fn from_json(json: &str) -> Option<MemberGrant> {
         let v: Value = serde_json::from_str(json).ok()?;
         let member = v.get("member")?.as_str().filter(|s| crate::is_hex64(s))?.to_lowercase();

@@ -27,6 +27,14 @@ pub use nostr;
 /// A raw 32-byte id or key.
 pub type Bytes32 = [u8; 32];
 
+/// 32 bytes from the OS CSPRNG: ids, salts and keys.
+pub fn random32() -> Bytes32 {
+    use rand::RngCore;
+    let mut out = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut out);
+    out
+}
+
 /// Lowercase hex of a byte slice.
 pub fn to_hex(bytes: &[u8]) -> String {
     hex::encode(bytes)

@@ -133,28 +133,39 @@ pub fn parse_edition(opened: Opened) -> Result<Edition, EditionError> {
     })
 }
 
+/// Who publishes an edition and where it sits in its entity's chain.
+#[derive(Clone, Copy, Debug)]
+pub struct EditionMeta<'a> {
+    pub actor: &'a str,
+    pub version: u64,
+    pub prev: Option<&'a Bytes32>,
+    /// The Grant the actor acts under; `None` when the owner acts.
+    pub authority: Option<&'a Citation>,
+    /// Defaults to now.
+    pub created_at: Option<u64>,
+}
+
+impl<'a> EditionMeta<'a> {
+    /// A first edition (version 1, no predecessor).
+    pub fn first(actor: &'a str, authority: Option<&'a Citation>) -> Self {
+        EditionMeta { actor, version: 1, prev: None, authority, created_at: None }
+    }
+}
+
 /// Build an unsigned edition rumor.
-pub fn build_edition_rumor(
-    vsk: &str,
-    entity_id: &Bytes32,
-    version: u64,
-    prev: Option<&Bytes32>,
-    content: String,
-    actor: &str,
-    authority: Option<&Citation>,
-) -> Rumor {
+pub fn build_edition_rumor(vsk: &str, entity_id: &Bytes32, content: String, meta: &EditionMeta) -> Rumor {
     let mut tags = vec![
         vec!["vsk".to_string(), vsk.to_string()],
         vec!["eid".to_string(), to_hex(entity_id)],
-        vec!["ev".to_string(), version.to_string()],
+        vec!["ev".to_string(), meta.version.to_string()],
     ];
-    if let Some(p) = prev {
+    if let Some(p) = meta.prev {
         tags.push(vec!["ep".into(), to_hex(p)]);
     }
-    if let Some(a) = authority {
+    if let Some(a) = meta.authority {
         tags.push(a.to_tag());
     }
-    Rumor::new(kinds::CONTROL, content, tags, actor, None, None)
+    Rumor::new(kinds::CONTROL, content, tags, meta.actor, None, meta.created_at)
 }
 
 /// A per-entity head, for chaining the next edition and floor-checking folds.

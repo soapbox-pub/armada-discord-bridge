@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 aes-gcm.workspace = true
+bech32 = "0.12"
 base64.workspace = true
 hex.workspace = true
 hkdf.workspace = true

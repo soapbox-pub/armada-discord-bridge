@@ -5,16 +5,16 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::control::FoldedControl;
+use crate::control::{FoldedControl, cap_relays};
 use crate::derive::{
-    GroupKey, base_rekey_group_key, channel_group_key, channel_rekey_group_key, control_group_key, control_signer_group_key,
-    guestbook_group_key,
+    GroupKey, base_rekey_group_key, channel_group_key, channel_rekey_group_key, community_id_of, control_group_key,
+    control_signer_group_key, guestbook_group_key,
 };
 use crate::invite::{BundleChannel, InviteBundle};
 use crate::rekey::{self, Continuity, Rotation};
 use crate::roles::perm;
 use crate::stream::StreamKey;
-use crate::{Bytes32, hex32, to_hex};
+use crate::{Bytes32, hex32, random32, to_hex};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HeldRoot {
@@ -119,6 +119,48 @@ fn b32(s: &str) -> Bytes32 {
 }
 
 impl Membership {
+    /// A community at its genesis epoch, as its owner (or a custodian of the
+    /// owner's secrets) holds it. `control_root` is `None` for a legacy
+    /// community whose Control Plane predates the write split; its control_pk
+    /// is derived, never stored separately, so the two cannot disagree.
+    pub fn genesis(owner: &str, owner_salt: &Bytes32, root: &Bytes32, control_root: Option<&Bytes32>, relays: Vec<String>, name: String, now_ms: u64) -> Membership {
+        let owner = owner.to_lowercase();
+        let id = community_id_of(&b32(&owner), owner_salt);
+        let control_pk = control_root.map(|cr| control_signer_group_key(cr, &id, 0).pk_hex());
+        Membership {
+            community_id: to_hex(&id),
+            owner,
+            owner_salt: to_hex(owner_salt),
+            root_epoch: 0,
+            root: to_hex(root),
+            control_pk: control_pk.clone(),
+            control_root: control_root.map(|c| to_hex(c)),
+            held_roots: vec![HeldRoot { epoch: 0, key: to_hex(root), control_pk, retired_at: None, refounder: None }],
+            private_channels: vec![],
+            channel_cuts: vec![],
+            relays: cap_relays(relays),
+            name,
+            joined_at_ms: now_ms,
+            excluded_at: None,
+        }
+    }
+
+    /// Mint a brand-new community (CORD-02 §1): a random `owner_salt` commits the
+    /// owner into the self-certifying id, and the access key and the staff write
+    /// key are independent random secrets, so access can rotate while identity
+    /// stays fixed. The caller publishes the genesis editions.
+    pub fn mint(name: &str, owner: &str, relays: Vec<String>, now_ms: u64) -> Membership {
+        Membership::genesis(owner, &random32(), &random32(), Some(&random32()), relays, name.to_owned(), now_ms)
+    }
+
+    /// The current Control Plane stream with its signing secret, or `None` when
+    /// the epoch is split and this member does not hold the staff key: a wrap
+    /// published without it fails the plane's signature check everywhere.
+    pub fn control_write_stream(&self) -> Option<StreamKey> {
+        let stream = self.current_control_stream();
+        stream.sk.is_some().then_some(stream)
+    }
+
     pub fn from_bundle(bundle: &InviteBundle, now_ms: u64) -> Membership {
         Membership {
             community_id: bundle.community_id.to_lowercase(),

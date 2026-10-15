@@ -222,6 +222,22 @@ pub fn decode_base_blob(plain: &[u8], community_id: &Bytes32, epoch: u64) -> Res
     Ok(BaseBlob { new_root, control_pk: Some(control_pk), control_root: Some(control_root) })
 }
 
+/// The Grant `control_wrap` plaintext: `epoch_be[8] ‖ control_root[32]`, the
+/// epoch inside the ciphertext like every rekey blob (CORD-04 §3).
+pub fn encode_control_wrap(epoch: u64, control_root: &Bytes32) -> [u8; 40] {
+    let mut out = [0u8; 40];
+    out[..8].copy_from_slice(&epoch.to_be_bytes());
+    out[8..].copy_from_slice(control_root);
+    out
+}
+
+/// A Grant's `control_wrap` field: the plaintext, base64, NIP-44'd under the
+/// granter↔member pairwise key (a bunker signer's APIs are string-only).
+pub fn seal_control_wrap(epoch: u64, control_root: &Bytes32, granter: &nostr::prelude::SecretKey, member: &nostr::prelude::PublicKey) -> Result<String, nip44::Nip44Error> {
+    let conv = crate::derive::conversation_key(granter, member);
+    nip44::encrypt_str(&conv, &STANDARD.encode(encode_control_wrap(epoch, control_root)))
+}
+
 /// Parse a decrypted 40-byte Grant `control_wrap`: `epoch_be[8] ‖ control_root[32]`.
 pub fn decode_control_wrap(plain: &[u8]) -> Option<(u64, Bytes32)> {
     (plain.len() == 40).then(|| (u64::from_be_bytes(plain[..8].try_into().unwrap()), plain[8..40].try_into().unwrap()))

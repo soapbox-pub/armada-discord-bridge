@@ -213,6 +213,115 @@ fn adopts_armada_refounding() {
     assert_eq!(bm.apply_base_rotations(&rotations, &folded, &bob), RekeyOutcome::Excluded(1));
 }
 
+/// The owner-side builders produce Armada's exact rumors, ids included.
+#[test]
+fn builders_match_armada() {
+    use concord::control::*;
+    use concord::edition::{Citation, EditionMeta};
+    use concord::roles::{MemberGrant, Role, RoleScope, admin_role};
+
+    let v = vectors();
+    let k = &v["keys"];
+    let b = &v["builders"];
+    let s = |v: &Value| v.as_str().unwrap().to_owned();
+    let (cid, owner, op) = (h(&k["community_id"]), s(&k["owner"]), s(&k["alice"]));
+    let role_id = to_hex(&[0x03; 32]);
+    let at = Some(1_700_000_300);
+    let check = |got: concord::rumor::Rumor, want: &Value| {
+        assert_eq!(got.content, s(&want["content"]));
+        assert_eq!(serde_json::to_value(&got.tags).unwrap(), want["tags"]);
+        assert_eq!(got.id, s(&want["id"]));
+    };
+
+    // The vac every op-key action carries cites the owner's grant to op.
+    let grant = MemberGrant { member: op.clone(), role_ids: vec![role_id.clone()], control_wrap: None };
+    let grant_rumor = build_grant_edition(&cid, &grant, &EditionMeta { created_at: at, ..EditionMeta::first(&owner, None) }).unwrap();
+    let grant_hash = edition_hash(&grant_locator(&cid, &hex32(&op).unwrap()), 1, None, grant_rumor.content.as_bytes());
+    let vac = Citation { entity_id: grant_locator(&cid, &hex32(&op).unwrap()), version: 1, edition_hash: grant_hash };
+    let owner_meta = EditionMeta { created_at: at, ..EditionMeta::first(&owner, None) };
+    let op_meta = EditionMeta { created_at: at, ..EditionMeta::first(&op, Some(&vac)) };
+    check(grant_rumor, &b["grant"]);
+
+    check(build_role_edition(&admin_role(&role_id), &owner_meta).unwrap(), &b["admin_role"]);
+    let access = Role {
+        role_id: to_hex(&[0x04; 32]),
+        name: "mods".into(),
+        position: 7,
+        permissions: 0,
+        scope: RoleScope::Channel(s(&k["channel_id"])),
+        color: 0,
+    };
+    check(build_role_edition(&access, &op_meta).unwrap(), &b["access_role"]);
+    assert!(build_role_edition(&Role { position: 0, ..access }, &op_meta).is_err());
+
+    let owner_key = MemberGrant { member: owner.clone(), role_ids: vec![], control_wrap: Some("AbC=".into()) };
+    check(build_grant_edition(&cid, &owner_key, &op_meta).unwrap(), &b["owner_key_grant"]);
+
+    let link_signer = s(&v["invite"]["link_signer"]);
+    check(build_registry_edition(&cid, &owner, &[link_signer], &owner_meta).unwrap(), &b["registry"]);
+
+    let mut meta = serde_json::json!({ "name": "voice-chat", "private": true });
+    with_channel_position(&mut meta, Some(4));
+    with_channel_category(&mut meta, Some("  Hangouts "));
+    meta["custom"]["discord.import"] = serde_json::json!({ "topic": "t", "type": "voice" });
+    check(build_channel_edition(&h(&k["channel_id"]), &meta, &op_meta).unwrap(), &b["channel"]);
+
+    use base64::Engine;
+    let plain = concord::rekey::encode_control_wrap(3, &h(&k["control_root"]));
+    assert_eq!(base64::engine::general_purpose::STANDARD.encode(plain), s(&b["control_wrap"]));
+}
+
+#[test]
+fn minted_community_can_write_its_control_plane() {
+    let owner = Keys::generate();
+    let m = Membership::mint("x", &owner.public_key().to_hex(), vec!["wss://a".into(); 7], 0);
+    assert_eq!(m.relays, ["wss://a"]);
+    let control = m.control_write_stream().expect("the minter holds the staff key");
+    assert_eq!(Some(control.pk_hex()), m.control_pk);
+    // A member who joined by bundle reads the same plane but cannot write it.
+    let bundle = serde_json::json!({
+        "community_id": m.community_id, "owner": m.owner, "owner_salt": m.owner_salt,
+        "community_root": m.root, "root_epoch": 0, "control_pk": m.control_pk, "name": "x",
+    });
+    let member = Membership::from_bundle(&serde_json::from_value::<concord::invite::InviteBundle>(bundle).unwrap().validate().unwrap(), 0);
+    assert_eq!(member.current_control_stream().pk, control.pk);
+    assert!(member.control_write_stream().is_none());
+}
+
+#[test]
+fn inbox_prefers_dm_relays_then_nip65_reads() {
+    use concord::nostr::prelude::*;
+    let alice = Keys::generate();
+    let ev = |kind: u16, tags: Vec<Vec<&str>>| {
+        EventBuilder::new(Kind::Custom(kind), "").tags(tags.into_iter().map(|t| Tag::parse(t).unwrap())).finalize(&alice).unwrap()
+    };
+    let nip65 = ev(10002, vec![vec!["r", "wss://read.example"], vec!["r", "wss://write.example", "write"]]);
+    assert_eq!(concord::invite::inbox_relays_from(std::slice::from_ref(&nip65), &alice.public_key()), ["wss://read.example"]);
+    let dm = ev(10050, vec![vec!["relay", "inbox.example/"], vec!["relay", "wss://inbox.example"]]);
+    assert_eq!(concord::invite::inbox_relays_from(&[nip65, dm], &alice.public_key()), ["wss://inbox.example"]);
+    assert_eq!(concord::invite::invite_delivery_relays(&[]), stock_relays());
+}
+
+#[test]
+fn invite_url_matches_armada() {
+    let v = vectors();
+    let i = &v["invite"];
+    let signer = concord::nostr::prelude::PublicKey::from_hex(i["link_signer"].as_str().unwrap()).unwrap();
+    let relays: Vec<String> = ["wss://relay.ditto.pub", "wss://relay.example.com"].map(String::from).to_vec();
+    let url = concord::invite::build_invite_url("https://armada.buzz/", &signer, &[0x99; 16], &relays).unwrap();
+    assert_eq!(url, i["url"].as_str().unwrap());
+}
+
+#[test]
+fn opens_armada_direct_invite() {
+    let v = vectors();
+    let bob = keys(&v["keys"]["bob_sk"]);
+    let opened = concord::direct_invite::unwrap(&event(&v["direct_invite"]["wrap"]), &bob).expect("Bob opens Armada's invite");
+    assert_eq!(opened.inviter, v["keys"]["owner"].as_str().unwrap());
+    assert_eq!(opened.bundle.channels[0].key, v["keys"]["private_channel_key"].as_str().unwrap());
+    assert!(concord::direct_invite::unwrap(&event(&v["direct_invite"]["wrap"]), &keys(&v["keys"]["alice_sk"])).is_none());
+}
+
 #[test]
 fn guestbook_and_comment_tags_match() {
     let v = vectors();

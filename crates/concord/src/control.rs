@@ -5,14 +5,15 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use nostr::prelude::{Event, Keys};
 use serde_json::Value;
 
 use crate::derive::{banlist_locator, grant_locator, invite_links_locator, signal_locator};
-use crate::edition::{Citation, Edition, Head, bootstrap_head, build_edition_rumor, fold_chain};
+use crate::edition::{Citation, Edition, EditionMeta, Head, bootstrap_head, build_edition_rumor, fold_chain};
 use crate::kinds::{self, SIGNAL_PAUSE};
 use crate::roles::{MAX_ROLES_PER_COMMUNITY, MemberGrant, NAME_MAX_BYTES, Role, Roster, perm};
 use crate::rumor::Rumor;
-use crate::stream::Opened;
+use crate::stream::{Opened, StreamError, StreamKey, WrapOptions, seal_and_wrap};
 use crate::{Bytes32, hex32, is_hex64, to_hex};
 
 pub const DESCRIPTION_MAX_BYTES: usize = 10_000;
@@ -720,12 +721,112 @@ fn fold_once(
 
 // ── Builders ────────────────────────────────────────────────────────────────
 
-pub fn build_metadata_edition(community_id: &Bytes32, metadata: &Value, actor: &str, version: u64, prev: Option<&Bytes32>, authority: Option<&Citation>) -> Rumor {
-    build_edition_rumor(kinds::VSK_METADATA, community_id, version, prev, metadata.to_string(), actor, authority)
+/// An edition its author must not publish: every verifier would drop it, so it
+/// is refused here, at the one place that can still say why.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BuildError {
+    #[error("{0} exceeds {NAME_MAX_BYTES} bytes")]
+    NameTooLong(&'static str),
+    #[error("description exceeds {DESCRIPTION_MAX_BYTES} bytes")]
+    DescriptionTooLong,
+    #[error("role position must be 1 or greater (position 0 is the owner's)")]
+    RolePosition,
+    #[error("not a 64-hex id: {0}")]
+    BadId(&'static str),
 }
 
-pub fn build_channel_edition(channel_id: &Bytes32, metadata: &Value, actor: &str, version: u64, prev: Option<&Bytes32>, authority: Option<&Citation>) -> Rumor {
-    build_edition_rumor(kinds::VSK_CHANNEL, channel_id, version, prev, metadata.to_string(), actor, authority)
+/// Community metadata (vsk 0); eid = the community_id. Gated by MANAGE_METADATA.
+pub fn build_metadata_edition(community_id: &Bytes32, metadata: &Value, meta: &EditionMeta) -> Result<Rumor, BuildError> {
+    if !metadata.get("name").and_then(Value::as_str).is_some_and(|n| utf8_len_ok(n, NAME_MAX_BYTES)) {
+        return Err(BuildError::NameTooLong("community name"));
+    }
+    if metadata.get("description").and_then(Value::as_str).is_some_and(|d| !utf8_len_ok(d, DESCRIPTION_MAX_BYTES)) {
+        return Err(BuildError::DescriptionTooLong);
+    }
+    Ok(build_edition_rumor(kinds::VSK_METADATA, community_id, metadata.to_string(), meta))
+}
+
+/// Channel metadata (vsk 2); eid = the channel_id. Gated by MANAGE_CHANNELS.
+pub fn build_channel_edition(channel_id: &Bytes32, metadata: &Value, meta: &EditionMeta) -> Result<Rumor, BuildError> {
+    if !metadata.get("name").and_then(Value::as_str).is_some_and(|n| utf8_len_ok(n, NAME_MAX_BYTES)) {
+        return Err(BuildError::NameTooLong("channel name"));
+    }
+    Ok(build_edition_rumor(kinds::VSK_CHANNEL, channel_id, metadata.to_string(), meta))
+}
+
+/// Role (vsk 1); eid = the role_id. Gated by MANAGE_ROLES. Position 0 is the
+/// owner's alone (CORD-04 §3): a Role claiming it would be a peer nobody outranks.
+pub fn build_role_edition(role: &Role, meta: &EditionMeta) -> Result<Rumor, BuildError> {
+    if !utf8_len_ok(&role.name, NAME_MAX_BYTES) {
+        return Err(BuildError::NameTooLong("role name"));
+    }
+    if role.position < 1 {
+        return Err(BuildError::RolePosition);
+    }
+    let eid = hex32(&role.role_id).ok_or(BuildError::BadId("role_id"))?;
+    Ok(build_edition_rumor(kinds::VSK_ROLE, &eid, role.to_json(), meta))
+}
+
+/// Grant (vsk 3); eid = grant_locator(cid, member). Empty role_ids = a revoke.
+pub fn build_grant_edition(community_id: &Bytes32, grant: &MemberGrant, meta: &EditionMeta) -> Result<Rumor, BuildError> {
+    let member = hex32(&grant.member).ok_or(BuildError::BadId("member"))?;
+    Ok(build_edition_rumor(kinds::VSK_GRANT, &grant_locator(community_id, &member), grant.to_json(), meta))
+}
+
+/// Invite Registry (vsk 8); eid = invite_links_locator(cid, creator). Link-signer pubkeys only.
+pub fn build_registry_edition(community_id: &Bytes32, creator_hex: &str, link_signers: &[String], meta: &EditionMeta) -> Result<Rumor, BuildError> {
+    let creator = hex32(creator_hex).ok_or(BuildError::BadId("creator"))?;
+    let content = serde_json::to_string(link_signers).expect("strings always serialize");
+    Ok(build_edition_rumor(kinds::VSK_INVITE_REGISTRY, &invite_links_locator(community_id, &creator), content, meta))
+}
+
+/// The citation an actor attaches to act under the Grant edition `grant_hash`
+/// at `version` (CORD-04 §5).
+pub fn grant_citation(community_id: &Bytes32, member: &Bytes32, version: u64, grant_hash: Bytes32) -> Citation {
+    Citation { entity_id: grant_locator(community_id, member), version, edition_hash: grant_hash }
+}
+
+// ── Armada channel extensions (CORD.md) ─────────────────────────────────────
+
+pub const CHANNEL_CATEGORY_KEY: &str = "armada.category";
+pub const CHANNEL_ORDER_KEY: &str = "armada.order";
+
+/// Set (or clear) one `custom` member of channel metadata, other extensions
+/// untouched; an emptied `custom` is removed rather than left as `{}`.
+fn set_custom(metadata: &mut Value, key: &str, value: Option<Value>) {
+    let Some(obj) = metadata.as_object_mut() else { return };
+    let mut custom = match obj.remove("custom") {
+        Some(Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    match value {
+        Some(v) => {
+            custom.insert(key.to_owned(), v);
+        }
+        None => {
+            custom.remove(key);
+        }
+    }
+    if !custom.is_empty() {
+        obj.insert("custom".into(), Value::Object(custom));
+    }
+}
+
+/// The sidebar category (`custom["armada.category"].name`); blank clears it.
+pub fn with_channel_category(metadata: &mut Value, name: Option<&str>) {
+    let trimmed = name.map(str::trim).filter(|n| !n.is_empty());
+    set_custom(metadata, CHANNEL_CATEGORY_KEY, trimmed.map(|n| serde_json::json!({ "name": n })));
+}
+
+/// The sidebar position (`custom["armada.order"].position`).
+pub fn with_channel_position(metadata: &mut Value, position: Option<u64>) {
+    set_custom(metadata, CHANNEL_ORDER_KEY, position.map(|p| serde_json::json!({ "position": p })));
+}
+
+/// Sign (plaintext seal) and wrap one edition for the Control Plane. `control`
+/// must be a write key: a split epoch's wrap is signed by the staff key.
+pub fn seal_edition(rumor: &Rumor, control: &StreamKey, author: &Keys) -> Result<Event, StreamError> {
+    seal_and_wrap(rumor, kinds::Plane::Control, control, author, WrapOptions::default())
 }
 
 // ── Dissolution (CORD-02 §9) ────────────────────────────────────────────────

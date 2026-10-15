@@ -196,4 +196,41 @@ out.guestbook = {
 };
 out.comment_tags = chat.buildConcordCommentTags({ id: msgRumor.id, kind: 9, pubkey: alice, tags: msgRumor.tags });
 
+// The owner-side builders a custodial importer publishes with: whole rumors
+// (ids included), so field order and number formatting are pinned too.
+const roles = await lib("roles");
+const channelCategory = await lib("channelCategory");
+const channelOrder = await lib("channelOrder");
+const directInvite = await lib("directInvite");
+const at = { createdAtSecs: 1_700_000_300 };
+const opPk = alice;
+const vac = { entityId: grantEid, version: 1n, editionHash: grantHash };
+let channelMeta = { name: "voice-chat", private: true };
+channelMeta = channelOrder.withChannelPosition(channelMeta, 4);
+channelMeta = channelCategory.withChannelCategory(channelMeta, "  Hangouts ");
+channelMeta = { ...channelMeta, custom: { ...channelMeta.custom, "discord.import": { topic: "t", type: "voice" } } };
+out.builders = {
+  admin_role: control.buildRoleEdition(roles.adminRole(roleId), { actorPubkey: owner, version: 1n, ...at }),
+  access_role: control.buildRoleEdition(
+    { roleId: bytesToHex(fill(0x04)), name: "mods", position: 7, permissions: 0n, scope: { kind: "channel", channelId: bytesToHex(channelId) }, color: 0 },
+    { actorPubkey: opPk, version: 1n, authority: vac, ...at },
+  ),
+  grant: control.buildGrantEdition(communityId, { member: opPk, roleIds: [roleId] }, { actorPubkey: owner, version: 1n, ...at }),
+  owner_key_grant: control.buildGrantEdition(communityId, { member: owner, roleIds: [], controlWrap: "AbC=" }, { actorPubkey: opPk, version: 1n, authority: vac, ...at }),
+  registry: control.buildRegistryEdition(communityId, owner, [linkSigner], { actorPubkey: owner, version: 1n, ...at }),
+  channel: control.buildChannelEdition(channelId, channelMeta, { actorPubkey: opPk, version: 1n, authority: vac, ...at }),
+  control_wrap: rekey.bytesToBase64(rekey.encodeControlWrap(3n, controlRoot)),
+};
+
+// A Direct Invite sealed by Armada to Bob, carrying a private channel key.
+out.direct_invite = {
+  wrap: directInvite.wrapDirectInvite(
+    await directInvite.sealDirectInvite(directInvite.buildDirectInviteRumor(bundle, owner), bob, {
+      ...signer(ownerSk),
+      nip44: { encrypt: async (pk: string, text: string) => nip44Encrypt(text, getConversationKey(ownerSk, pk)) },
+    }),
+    bob,
+  ),
+};
+
 console.log(JSON.stringify(out, null, 2));
