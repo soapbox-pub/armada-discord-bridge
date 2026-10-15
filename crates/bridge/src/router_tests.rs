@@ -630,3 +630,170 @@ async fn typing_crosses_both_ways_throttled() {
     h.router.on_concord_chat(&h.chat(&alice, kinds::TYPING, "", vec![]), &h.link).await.unwrap();
     assert_eq!(h.webhooks.typing.load(Ordering::SeqCst), 1);
 }
+
+// ── GIF pickers ─────────────────────────────────────────────────────────────
+
+struct FakeKlipy {
+    asked: Mutex<Vec<String>>,
+    answer: Option<crate::klipy::KlipyGif>,
+}
+
+#[async_trait]
+impl GifResolver for FakeKlipy {
+    async fn resolve_gif(&self, page: &str, _: u64) -> Option<crate::klipy::KlipyGif> {
+        self.asked.lock().unwrap().push(page.into());
+        self.answer.clone()
+    }
+}
+
+fn klipy(url: &str, dim: Option<(u32, u32)>) -> Arc<FakeKlipy> {
+    let answer = crate::klipy::KlipyGif { url: url.into(), width: dim.map(|d| d.0), height: dim.map(|d| d.1), size: None };
+    Arc::new(FakeKlipy { asked: Mutex::default(), answer: Some(answer) })
+}
+
+const REAL_GIF: &str = "https://static.klipy.com/ii/a/b/REAL.gif";
+
+#[tokio::test]
+async fn resolves_a_klipy_send_through_the_items_api_and_rehosts_the_real_gif() {
+    let k = klipy(REAL_GIF, Some((300, 200)));
+    let h = harness_with(|o, blobs| {
+        o.blobs = Some(blobs.clone() as Arc<dyn BlobPort>);
+        o.klipy = Some(k.clone() as Arc<dyn GifResolver>);
+    });
+    h.blobs.blobs.lock().unwrap().insert(REAL_GIF.into(), (b"GIF89a...".to_vec(), "image/gif".into()));
+    // No embed: Discord can attach it later, and the slug is all the lookup needs.
+    h.router.on_discord_message(DiscordInboundMessage { content: "https://klipy.com/gifs/monday-1".into(), ..discord_msg() }, &h.link).await.unwrap();
+    assert_eq!(*k.asked.lock().unwrap(), ["https://klipy.com/gifs/monday-1"]);
+    let opened = h.chats().pop().unwrap();
+    let sha = hex::encode(Sha256::digest(b"GIF89a..."));
+    assert_eq!(opened.rumor.content, format!("https://blossom.example/{sha}.gif"));
+    let imeta: Vec<&Vec<String>> = opened.rumor.tags.iter().filter(|t| t[0] == "imeta").collect();
+    assert_eq!(imeta.len(), 1);
+    assert!(imeta[0].contains(&"m image/gif".to_string()) && imeta[0].contains(&"dim 300x200".to_string()));
+    assert_eq!(h.blobs.uploads.lock().unwrap()[0].1, "image/gif");
+}
+
+#[tokio::test]
+async fn links_the_real_klipy_gif_when_it_cannot_be_rehosted_and_never_rehosts_a_non_gif() {
+    let k = klipy(REAL_GIF, None);
+    let h = harness_with(|o, blobs| {
+        o.blobs = Some(blobs.clone() as Arc<dyn BlobPort>);
+        o.klipy = Some(k.clone() as Arc<dyn GifResolver>);
+    });
+    // The CDN serves a placeholder, not a GIF: it must not be rehosted.
+    h.blobs.blobs.lock().unwrap().insert(REAL_GIF.into(), (b"<html>".to_vec(), "image/gif".into()));
+    h.router.on_discord_message(DiscordInboundMessage { content: "https://klipy.com/gifs/monday-1".into(), ..discord_msg() }, &h.link).await.unwrap();
+    assert!(h.blobs.uploads.lock().unwrap().is_empty());
+    let opened = h.chats().pop().unwrap();
+    assert_eq!(opened.rumor.content, REAL_GIF);
+    assert_eq!(opened.rumor.tags.iter().find(|t| t[0] == "imeta").unwrap(), &s(&["imeta", &format!("url {REAL_GIF}"), "m image/gif"]));
+
+    // A Klipy link inside prose is left to the ordinary path.
+    k.asked.lock().unwrap().clear();
+    h.router.on_discord_message(DiscordInboundMessage { id: "2".into(), content: "lol https://klipy.com/gifs/monday-1".into(), ..discord_msg() }, &h.link).await.unwrap();
+    assert!(k.asked.lock().unwrap().is_empty());
+}
+
+struct ScriptedProbe {
+    answer: Option<ProbeResult>,
+    probed: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl Prober for ScriptedProbe {
+    async fn probe(&self, url: &str) -> Option<ProbeResult> {
+        self.probed.lock().unwrap().push(url.into());
+        self.answer.clone()
+    }
+}
+
+fn probe(answer: Option<(bool, &str)>) -> ScriptedProbe {
+    ScriptedProbe { answer: answer.map(|(ok, mime)| ProbeResult { ok, mime: mime.into() }), probed: Mutex::default() }
+}
+
+#[tokio::test]
+async fn gif_variants_are_probed_and_the_mp4_kept_when_none_verifies() {
+    use crate::markup::resolve_gif_variant;
+    let (gif_ok, dead, html) = (probe(Some((true, "image/gif"))), probe(Some((false, ""))), probe(Some((true, "text/html"))));
+    assert_eq!(resolve_gif_variant("https://p", "https://cdn/x.gif", &dead).await, "https://cdn/x.gif");
+    assert_eq!(resolve_gif_variant("https://tenor.com/view/x", "https://media.tenor.com/a.mp4", &gif_ok).await, "https://media.tenor.com/a.gif");
+    // Never on Klipy: its CDN answers every missing rendition with a
+    // placeholder GIF, so a probe that says yes proves nothing.
+    assert_eq!(resolve_gif_variant("https://klipy.com/gifs/x", "https://static.klipy.com/a.mp4", &gif_ok).await, "https://static.klipy.com/a.mp4");
+    // A 200 that serves html is not a gif.
+    assert_eq!(resolve_gif_variant("https://tenor.com/view/x", "https://media.tenor.com/a.mp4", &html).await, "https://media.tenor.com/a.mp4");
+    assert_eq!(resolve_gif_variant("https://p/x", "https://cdn/a.mp4", &dead).await, "https://cdn/a.mp4");
+
+    // The media URL is an OpenGraph value off a page the author chose: the
+    // guard's refusal must read as "no", not as an absent content type.
+    let refuse = probe(None);
+    let metadata = "http://169.254.169.254/latest/meta-data/x.mp4";
+    assert_eq!(resolve_gif_variant("https://tenor.com/view/x", metadata, &refuse).await, metadata);
+    assert_eq!(*refuse.probed.lock().unwrap(), ["http://169.254.169.254/latest/meta-data/x.gif", "https://tenor.com/view/x.gif"]);
+}
+
+// ── Threads, ordering, attachments ──────────────────────────────────────────
+
+#[tokio::test]
+async fn flattens_a_thread_reply_with_a_parent_jump_link() {
+    let h = harness();
+    let alice = Keys::generate();
+    let parent = h.chat(&alice, kinds::MESSAGE, "parent", vec![]);
+    h.router.on_concord_chat(&parent, &h.link).await.unwrap();
+    let a = alice.public_key().to_hex();
+    let tags = vec![
+        s(&["K", "9"]), s(&["E", parent.rumor_id(), "", &a]), s(&["P", &a]),
+        s(&["k", "9"]), s(&["e", parent.rumor_id(), "", &a]), s(&["p", &a]),
+    ];
+    let reply = h.chat(&Keys::generate(), kinds::COMMENT, "thread reply", tags);
+    assert_eq!(h.router.on_concord_chat(&reply, &h.link).await.unwrap().len(), 1);
+    let sent = &h.sent()[1];
+    assert_eq!(sent.content, "thread reply");
+    assert!(sent.embeds[0].contains("/9000"));
+    // Mapped, so reactions and deletes on the comment resolve too.
+    assert!(h.rows().iter().any(|r| r.concord_rumor_id == reply.rumor_id()));
+}
+
+#[tokio::test]
+async fn mirrors_concurrent_rumors_one_at_a_time_in_order() {
+    let h = harness();
+    let alice = Keys::generate();
+    let chats: Vec<OpenedChat> = (1..=5).map(|n| h.chat(&alice, kinds::MESSAGE, &format!("msg {n}"), vec![])).collect();
+    futures_util::future::join_all(chats.iter().map(|c| h.router.on_concord_chat(c, &h.link))).await;
+    assert_eq!(h.sent().iter().map(|m| m.content.as_str()).collect::<Vec<_>>(), ["msg 1", "msg 2", "msg 3", "msg 4", "msg 5"]);
+}
+
+#[tokio::test]
+async fn keeps_a_sender_chosen_filename_out_of_the_multipart_header() {
+    let h = with_blobs();
+    let url = "https://blossom.example/abc123";
+    h.blobs.blobs.lock().unwrap().insert(url.into(), (b"png".to_vec(), "image/png".into()));
+    let imeta = s(&["imeta", "url https://blossom.example/abc123", "m image/png", "size 3", "name ../../etc/\"passwd\r\n.png"]);
+    h.router.on_concord_chat(&h.chat(&Keys::generate(), kinds::MESSAGE, "pic", vec![imeta]), &h.link).await.unwrap();
+    let name = &h.sent()[0].files[0].name;
+    assert!(!name.contains(['/', '"', '\r', '\n']), "{name}");
+    assert!(!name.starts_with('.') && name.ends_with(".png"), "{name}");
+}
+
+#[tokio::test]
+async fn keeps_the_url_when_the_blob_is_too_large_to_attach() {
+    let h = with_blobs();
+    let url = "https://blossom.example/abc123";
+    let imeta = s(&["imeta", "url https://blossom.example/abc123", "m image/gif", "size 99999999"]);
+    h.router.on_concord_chat(&h.chat(&Keys::generate(), kinds::MESSAGE, url, vec![imeta]), &h.link).await.unwrap();
+    let sent = &h.sent()[0];
+    assert_eq!(sent.content, url);
+    assert!(sent.files.is_empty());
+    assert_eq!(h.blobs.downloads.load(Ordering::SeqCst), 0, "an admittedly oversized blob is not even fetched");
+}
+
+#[tokio::test]
+async fn backdates_a_history_message_and_its_join() {
+    let h = harness();
+    let ms = 1_709_294_400_000; // 2024-03-01T12:00:00Z
+    h.router.on_discord_message(DiscordInboundMessage { timestamp_ms: Some(ms), ..discord_msg() }, &h.link).await.unwrap();
+    assert_eq!(h.chats()[0].ms, ms);
+    let gb: StreamKey = h.client.community().current_guestbook_stream();
+    let join = h.relay.published().into_iter().find(|e| e.pubkey == gb.pk).unwrap();
+    assert_eq!(open_wrap(&join, &gb).unwrap().ms, ms);
+}
