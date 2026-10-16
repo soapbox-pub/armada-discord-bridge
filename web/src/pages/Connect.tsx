@@ -103,7 +103,11 @@ export function Connect() {
 
   const flow: ConnectFlow = { draft, update, reset, close, login, steps: draft.from ? FROM_STEPS : STEPS };
 
-  if (from && draft.from !== from) {
+  // Always a fresh start: StartFromBridge drops the parameter once it has
+  // opened the community, so its presence means a new click. Skipping this
+  // when a stale draft named the same bridge fell through to the server step,
+  // which discarded that draft and asked for the server and community again.
+  if (from) {
     return (
       <FlowContext.Provider value={flow}>
         <StartFromBridge from={from} />
