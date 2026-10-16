@@ -1,0 +1,9 @@
+{
+  "name": "armada-concord-vectors",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "description": "Generates crates/concord/tests/vectors/armada.json from the Armada client's own Concord code.",
+  "dependencies": {
+    "nostr-tools": "^2.13.0"
+  }
+}

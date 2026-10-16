@@ -1,6 +1,7 @@
 // Generates cross-implementation test vectors from Armada's own Concord code, so
 // the Rust crate is checked against the implementation it must interoperate with.
 //
+//   (cd tools/vectors && bun install)
 //   bun tools/vectors/gen.ts > crates/concord/tests/vectors/armada.json
 //
 // ARMADA points at a checkout of the Armada client (default ~/Projects/armada).

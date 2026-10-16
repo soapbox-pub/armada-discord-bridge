@@ -188,7 +188,7 @@ mod tests {
     use super::*;
 
     fn web() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packages/portal/web")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web")
     }
 
     fn directive(name: &str) -> String {

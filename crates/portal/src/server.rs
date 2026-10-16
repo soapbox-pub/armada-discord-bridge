@@ -1,5 +1,5 @@
 //! The portal's HTTP surface: JSON API plus the static SPA. In dev, run the
-//! Vite dev server alongside (`npm run --prefix packages/portal/web dev`),
+//! Vite dev server alongside (`npm run --prefix web dev`),
 //! which proxies /api here; in production this serves web/dist directly.
 
 use std::sync::{Arc, LazyLock};

@@ -3,9 +3,9 @@
 # Vite app with no dependency on the server code.
 FROM node:22-slim AS webbuild
 WORKDIR /web
-COPY packages/portal/web/package.json packages/portal/web/package-lock.json ./
+COPY web/package.json web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
-COPY packages/portal/web ./
+COPY web ./
 RUN npx vite build
 
 FROM rust:1.99-slim AS build
@@ -13,7 +13,7 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 # db.rs embeds the migrations from here at compile time.
-COPY packages/bridge/src/db packages/bridge/src/db
+COPY crates/bridge/db crates/bridge/db
 RUN cargo build --release --locked -p portal -p bridge
 
 FROM debian:trixie-slim

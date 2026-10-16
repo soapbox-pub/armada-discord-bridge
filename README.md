@@ -44,18 +44,18 @@ slash commands.
 | `crates/relay-pool` | Nostr relay pool that answers NIP-42 as many stream keys at once. Shared with armada-matrix. |
 | `crates/bridge` | The bridge itself: Discord adapter (twilight), router, puppets, transforms, Postgres mapping store. Its `bridge` binary is the env-provisioned single-link daemon. |
 | `crates/portal` | Web setup flow and multi-tenant host, running bridges in-process. Its `portal` binary is the deployment. |
-| `packages/portal/web` | The portal's React SPA, a standalone Vite app. |
+| `web` | The portal's React SPA, a standalone Vite app. |
 
-Postgres is the only runtime dependency. The TypeScript implementation still
-lives under `packages/` while the Rust one is proven in production; the
-migrations in `packages/bridge/src/db` are shared, and are embedded into the
-Rust binaries at build time.
+Postgres is the only runtime dependency. The migrations live in
+`crates/bridge/db` and are embedded into the binaries at build time.
+`tools/vectors` is the one piece of TypeScript left: it runs Armada's own
+Concord code to generate the vectors `crates/concord` is tested against.
 
 ## Local development
 
 ```sh
 docker compose up -d postgres
-(cd packages/portal/web && npm install)
+(cd web && npm install)
 ```
 
 Then the portal, which is the interesting path — it runs bridges in-process
@@ -69,7 +69,7 @@ PORTAL_DEV_LOGIN=1 \
 cargo run -p portal
 
 # SPA with hot reload (terminal 2), proxying /api to :8787
-npm run --prefix packages/portal/web dev
+npm run --prefix web dev
 # open http://localhost:5173
 ```
 
@@ -78,7 +78,7 @@ you can click through the UI without Discord credentials. Going live needs a
 real Discord application: a client id and secret for OAuth, and a bot token
 with the MESSAGE_CONTENT intent enabled.
 
-For production, `npm run --prefix packages/portal/web build` once — the API
+For production, `npm run --prefix web build` once — the API
 then serves `web/dist` itself (or `PORTAL_WEB_DIR`). It expects a
 TLS-terminating proxy in front and binds loopback by default. The Docker image
 builds both and serves from `/app/web`. `RUST_LOG` sets log verbosity (default
@@ -143,13 +143,15 @@ material — every bridge included — so treat it as permanent.
 
 ## Diagnostics
 
-`scripts/probe-channel.ts` (still TypeScript, against `packages/`) resolves a
-bridge's community from its sealed invite, folds the control plane, and reads the bridged channel from each relay
-separately — which is how a per-relay delivery gap becomes visible at all,
-since the pool view merges them.
+`crates/portal/examples/load_probe.rs` rehearses a portal boot read-only:
+every bridge that would start is started on the relay side, on the same
+community runtimes the portal uses, and nothing is published, written, or sent
+to Discord. It reports sockets, descriptors and memory, then listens and checks
+that every rumor the running portal recorded meanwhile reached its bridge.
 
 ```sh
-PORTAL_SEAL_KEY=… DATABASE_URL=… bun run scripts/probe-channel.ts <bridge-id-prefix>
+cargo build --release -p portal --example load_probe
+PORTAL_SEAL_KEY=… DATABASE_URL=… target/release/examples/load_probe <listen-minutes>
 ```
 
 ## References

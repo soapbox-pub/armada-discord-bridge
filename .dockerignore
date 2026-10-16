@@ -1,5 +1,5 @@
 # Stale host build outputs must never reach the image; webbuild regenerates.
-packages/portal/web/dist
+web/dist
 .git
 node_modules
 **/node_modules

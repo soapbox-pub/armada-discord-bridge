@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let web_dir = std::env::var("PORTAL_WEB_DIR").unwrap_or_else(|_| "packages/portal/web/dist".into());
+    let web_dir = std::env::var("PORTAL_WEB_DIR").unwrap_or_else(|_| "web/dist".into());
     let addr = format!("{}:{}", env.host, env.port);
     let base_url = env.base_url.clone();
     let state = AppState { pool, env: Arc::new(env), sessions, manager, importer, rest: portal::discord_rest::DiscordRest::new() };

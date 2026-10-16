@@ -13,24 +13,24 @@ use tokio_postgres::NoTls;
 
 /// Every migration, in order, under the name `schema_migrations` records.
 pub const MIGRATIONS: &[(&str, &str)] = &[
-    ("schema.sql", include_str!("../../../packages/bridge/src/db/schema.sql")),
-    ("migrations/001_portal.sql", include_str!("../../../packages/bridge/src/db/migrations/001_portal.sql")),
-    ("migrations/002_reactions.sql", include_str!("../../../packages/bridge/src/db/migrations/002_reactions.sql")),
-    ("migrations/003_shared_puppet_secret.sql", include_str!("../../../packages/bridge/src/db/migrations/003_shared_puppet_secret.sql")),
-    ("migrations/004_channel_names.sql", include_str!("../../../packages/bridge/src/db/migrations/004_channel_names.sql")),
-    ("migrations/005_guild_name.sql", include_str!("../../../packages/bridge/src/db/migrations/005_guild_name.sql")),
-    ("migrations/006_imports.sql", include_str!("../../../packages/bridge/src/db/migrations/006_imports.sql")),
-    ("migrations/007_import_owner_sign.sql", include_str!("../../../packages/bridge/src/db/migrations/007_import_owner_sign.sql")),
-    ("migrations/008_history_claims.sql", include_str!("../../../packages/bridge/src/db/migrations/008_history_claims.sql")),
-    ("migrations/009_claims_bot_command.sql", include_str!("../../../packages/bridge/src/db/migrations/009_claims_bot_command.sql")),
-    ("migrations/010_claim_codes.sql", include_str!("../../../packages/bridge/src/db/migrations/010_claim_codes.sql")),
-    ("migrations/011_bridge_announced.sql", include_str!("../../../packages/bridge/src/db/migrations/011_bridge_announced.sql")),
-    ("migrations/012_bridge_perm_alerted.sql", include_str!("../../../packages/bridge/src/db/migrations/012_bridge_perm_alerted.sql")),
-    ("migrations/013_secrets_at_rest.sql", include_str!("../../../packages/bridge/src/db/migrations/013_secrets_at_rest.sql")),
-    ("migrations/014_session_lookup_indexes.sql", include_str!("../../../packages/bridge/src/db/migrations/014_session_lookup_indexes.sql")),
-    ("migrations/015_retire_claims.sql", include_str!("../../../packages/bridge/src/db/migrations/015_retire_claims.sql")),
-    ("migrations/016_popup_handoff_approval.sql", include_str!("../../../packages/bridge/src/db/migrations/016_popup_handoff_approval.sql")),
-    ("migrations/017_one_bridge_per_discord_channel.sql", include_str!("../../../packages/bridge/src/db/migrations/017_one_bridge_per_discord_channel.sql")),
+    ("schema.sql", include_str!("../db/schema.sql")),
+    ("migrations/001_portal.sql", include_str!("../db/migrations/001_portal.sql")),
+    ("migrations/002_reactions.sql", include_str!("../db/migrations/002_reactions.sql")),
+    ("migrations/003_shared_puppet_secret.sql", include_str!("../db/migrations/003_shared_puppet_secret.sql")),
+    ("migrations/004_channel_names.sql", include_str!("../db/migrations/004_channel_names.sql")),
+    ("migrations/005_guild_name.sql", include_str!("../db/migrations/005_guild_name.sql")),
+    ("migrations/006_imports.sql", include_str!("../db/migrations/006_imports.sql")),
+    ("migrations/007_import_owner_sign.sql", include_str!("../db/migrations/007_import_owner_sign.sql")),
+    ("migrations/008_history_claims.sql", include_str!("../db/migrations/008_history_claims.sql")),
+    ("migrations/009_claims_bot_command.sql", include_str!("../db/migrations/009_claims_bot_command.sql")),
+    ("migrations/010_claim_codes.sql", include_str!("../db/migrations/010_claim_codes.sql")),
+    ("migrations/011_bridge_announced.sql", include_str!("../db/migrations/011_bridge_announced.sql")),
+    ("migrations/012_bridge_perm_alerted.sql", include_str!("../db/migrations/012_bridge_perm_alerted.sql")),
+    ("migrations/013_secrets_at_rest.sql", include_str!("../db/migrations/013_secrets_at_rest.sql")),
+    ("migrations/014_session_lookup_indexes.sql", include_str!("../db/migrations/014_session_lookup_indexes.sql")),
+    ("migrations/015_retire_claims.sql", include_str!("../db/migrations/015_retire_claims.sql")),
+    ("migrations/016_popup_handoff_approval.sql", include_str!("../db/migrations/016_popup_handoff_approval.sql")),
+    ("migrations/017_one_bridge_per_discord_channel.sql", include_str!("../db/migrations/017_one_bridge_per_discord_channel.sql")),
 ];
 
 pub fn connect(database_url: &str, max_size: usize) -> anyhow::Result<Pool> {
@@ -66,7 +66,7 @@ mod tests {
     /// run; this is the reminder.
     #[test]
     fn every_migration_file_is_listed() {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/bridge/src/db/migrations");
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/db/migrations");
         let mut files: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
             .filter_map(|e| e.ok()?.file_name().into_string().ok())

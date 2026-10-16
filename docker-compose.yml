@@ -44,7 +44,7 @@ services:
         - action: rebuild
           path: ./crates
         - action: rebuild
-          path: ./packages/portal/web
+          path: ./web
           ignore:
             - dist/
     depends_on:
