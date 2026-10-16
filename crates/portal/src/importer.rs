@@ -1027,6 +1027,62 @@ impl Importer {
         Ok(())
     }
 
+    /// The finished import that minted `community_id` for this Discord user:
+    /// the communities whose operator key the portal holds, and so the only
+    /// ones it can add channels to.
+    pub async fn import_for_community(&self, community_id: &str, owner_discord_id: &str) -> anyhow::Result<Option<String>> {
+        let row = self
+            .pool
+            .get()
+            .await?
+            .query_opt(
+                "SELECT import_id::text FROM imports WHERE owner_discord_id = $1 AND community_id = $2 AND status = 'done'
+                 ORDER BY updated_at DESC LIMIT 1",
+                &[&owner_discord_id, &community_id],
+            )
+            .await?;
+        Ok(row.map(|r| r.get(0)))
+    }
+
+    /// Publish new public channels into a community this portal imported, as
+    /// the operator key the owner granted Admin, and return their ids in order.
+    ///
+    /// The grant is revocable from Armada, and a revoked one makes these
+    /// editions inert rather than refused: they land on the relays and every
+    /// fold ignores them. So the result is checked against a fold before it is
+    /// returned — a channel that no member would see must not be bridged.
+    pub async fn create_channels(&self, import_id: &str, channels: &[(String, Option<String>)]) -> anyhow::Result<Vec<String>> {
+        let (community, op, plan) = self.load(import_id).await?;
+        let control = community.control_write_stream().context("the portal does not hold this community's control key")?;
+        let relays = (self.io.relays)(community.relays.clone());
+        relays.register_auth_keys(stream_keys(&community.control_streams()));
+        let vac = Self::op_vac(&community, &op, &plan)?;
+        let op_pk = op.public_key().to_hex();
+        let op_v1 = EditionMeta::first(&op_pk, Some(&vac));
+        let first_position = plan.channels.iter().filter(|c| c.selected).count() as u64;
+        let mut ids = Vec::new();
+        for (i, (name, category)) in channels.iter().enumerate() {
+            let id = random32();
+            let mut metadata = json!({ "name": name, "private": false });
+            with_channel_position(&mut metadata, Some(first_position + i as u64));
+            with_channel_category(&mut metadata, category.as_deref());
+            let edition = seal_edition(&build_channel_edition(&id, &metadata, &op_v1)?, &control, &op)?;
+            self.publish_verified(relays.as_ref(), &edition, &format!("channel edition for #{name}")).await?;
+            ids.push(to_hex(&id));
+        }
+        let reader = bridge::client::ConcordClient::new(community, relays, Keys::generate());
+        for attempt in 0..5 {
+            reader.sync_control().await?;
+            if ids.iter().all(|id| reader.channel(id).is_some()) {
+                return Ok(ids);
+            }
+            if attempt < 4 {
+                tokio::time::sleep(self.io.publish_retry).await;
+            }
+        }
+        bail!("the new channels did not appear in the community; the bridge's Admin role may have been revoked in Armada")
+    }
+
     fn public_bundle(&self, community: &Membership, plan: &ImportPlan) -> anyhow::Result<InviteBundle> {
         Ok(serde_json::from_value(json!({
             "community_id": community.community_id,
@@ -1510,6 +1566,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bridges.iter().map(|r| r.get::<_, String>(0)).collect::<Vec<_>>(), [format!("{p}21"), format!("{p}22")]);
+
+        // Later, the channel map adds a channel to the community it imported.
+        let cid = row.community_id.clone().unwrap();
+        assert_eq!(importer.import_for_community(&cid, &owner_discord).await.unwrap().as_deref(), Some(import_id.as_str()));
+        assert_eq!(importer.import_for_community(&cid, "someone-else").await.unwrap(), None);
+        let made = importer.create_channels(&import_id, &[("from-discord".into(), Some("Talk".into()))]).await.unwrap();
+        member.sync_control().await.unwrap();
+        let added = member.channel(&made[0]).expect("a member sees the new channel");
+        assert_eq!((added.name.as_str(), added.category.as_deref(), added.private), ("from-discord", Some("Talk"), false));
 
         let db = pool.get().await.unwrap();
         db.execute("DELETE FROM bridges WHERE discord_guild_id = $1", &[&guild_id]).await.unwrap();
