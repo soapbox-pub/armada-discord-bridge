@@ -39,9 +39,27 @@ pub fn connect(database_url: &str, max_size: usize) -> anyhow::Result<Pool> {
     Ok(Pool::builder(manager).max_size(max_size).build()?)
 }
 
+/// Key of the advisory lock that serializes [`migrate`] across processes.
+const MIGRATE_LOCK: i64 = 0x6172_6d61_6461_6d67; // "armadamg"
+
 /// Apply every migration not yet recorded; returns the names applied.
+///
+/// Holds an advisory lock for the duration: two migrators (a portal and a
+/// load probe, or parallel test binaries) each saw the same migration as
+/// pending, and the second failed on the `schema_migrations` key, or on DDL
+/// the first had already run. Callers wait instead.
 pub async fn migrate(pool: &Pool) -> anyhow::Result<Vec<String>> {
     let mut db = pool.get().await?;
+    db.execute("SELECT pg_advisory_lock($1)", &[&MIGRATE_LOCK]).await?;
+    let result = migrate_locked(&mut db).await;
+    // The lock belongs to this session, and the connection goes back to the
+    // pool: release it here, on success or failure. A failed migration's
+    // transaction was rolled back when it dropped.
+    db.execute("SELECT pg_advisory_unlock($1)", &[&MIGRATE_LOCK]).await?;
+    result
+}
+
+async fn migrate_locked(db: &mut deadpool_postgres::Object) -> anyhow::Result<Vec<String>> {
     db.batch_execute("CREATE TABLE IF NOT EXISTS schema_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
         .await?;
     let mut applied = Vec::new();
