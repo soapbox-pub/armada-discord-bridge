@@ -638,8 +638,34 @@ impl BridgeManager {
 
     /// Mint per-bridge secrets and move draft -> pending_confirm.
     pub async fn activate(&self, row: &BridgeRow) -> anyhow::Result<()> {
-        let fresh = self.provision(row, "pending_confirm", Some(random_hex(4))).await?;
+        self.activate_with_code(row, &random_hex(4)).await
+    }
+
+    /// `activate`, under a code the caller chose: bridges linked together
+    /// share one, and confirming any of them confirms the group.
+    pub async fn activate_with_code(&self, row: &BridgeRow, code: &str) -> anyhow::Result<()> {
+        let fresh = self.provision(row, "pending_confirm", Some(code.to_owned())).await?;
         self.start(&fresh).await
+    }
+
+    /// Mint a bridge's identity and start it live, skipping the in-channel
+    /// confirm. Only for a link whose consent was already proven: a request
+    /// signed by a key that holds Manage Channels in the community, checked
+    /// against the same fold the confirm would be (see `authorizes`).
+    pub async fn activate_approved(&self, row: &BridgeRow) -> anyhow::Result<()> {
+        let fresh = self.provision(row, "active", None).await?;
+        self.start(&fresh).await
+    }
+
+    /// Whether `pubkey` holds `bits` (or owns the community) in the community
+    /// an invite resolves to, per a fresh fold of its Control Plane.
+    pub async fn authorizes(&self, invite_url: &str, pubkey: &str, bits: u64) -> anyhow::Result<bool> {
+        let bootstrap = self.bootstrap_relays(&Hub::new(Keys::generate()), invite_url).await?;
+        let joined = resolve_invite(invite_url, &bootstrap).await?;
+        let relays = self.guarded(&Hub::new(Keys::generate()), &joined.membership.relays).await;
+        let client = ConcordClient::new(joined.membership, Arc::new(relays), Keys::generate());
+        client.sync_control().await?;
+        Ok(client.is_authorized(pubkey, bits))
     }
 
     /// Mint the identity of a bridge the server importer created and mark it
@@ -834,15 +860,48 @@ impl BridgeManager {
                 }
             });
         } else {
-            let content = format!(
-                "A Discord bridge requests to link this channel. Bridged messages LEAVE end-to-end encryption and are \
-                 mirrored to Discord in plaintext. A member with Manage Channels can enable it by replying:\n/bridge confirm {}",
-                rb.confirm_code
-            );
+            let content = self.confirm_request(row, &client, &rb.confirm_code).await?;
             stage("posting the confirm request", STAGE_RELAY, client.send_chat(&channel, SendChat::message(rb.primary(), content))).await?;
         }
         lock(&self.running).insert(rb.id.clone(), rb);
         Ok(())
+    }
+
+    /// The request a pending bridge posts in its Armada channel. A bridge
+    /// linked with others names every channel of the group, because one
+    /// confirm approves them all: a moderator must see what they enable.
+    async fn confirm_request(&self, row: &BridgeRow, client: &ConcordClient, code: &str) -> anyhow::Result<String> {
+        let disclosure = "Bridged messages LEAVE end-to-end encryption and are mirrored to Discord in plaintext.";
+        let mut names = Vec::new();
+        if let Some(group) = &row.link_group {
+            let siblings = self
+                .pool
+                .get()
+                .await?
+                .query(
+                    "SELECT concord_channel_id FROM bridges WHERE link_group = ($1::text)::uuid AND community_id = $2
+                       AND confirm_code = $3 AND status = 'pending_confirm' ORDER BY created_at",
+                    &[group, &row.community_id, &code],
+                )
+                .await?;
+            for sibling in siblings {
+                let id: Option<String> = sibling.get(0);
+                let name = id.as_deref().and_then(|id| client.channel(id)).map_or_else(|| "an unknown channel".to_owned(), |c| format!("#{}", c.name));
+                names.push(name);
+            }
+        }
+        Ok(if names.len() > 1 {
+            format!(
+                "A Discord bridge requests to link {} channels of this community: {}. {disclosure} A member with Manage Channels \
+                 can enable all of them by replying here or in any of them:\n/bridge confirm {code}",
+                names.len(),
+                names.join(", ")
+            )
+        } else {
+            format!(
+                "A Discord bridge requests to link this channel. {disclosure} A member with Manage Channels can enable it by replying:\n/bridge confirm {code}"
+            )
+        })
     }
 
     /// The runtime for `membership`'s community, opened if no bridge holds it.
@@ -1089,24 +1148,50 @@ impl BridgeManager {
             if !code[1].eq_ignore_ascii_case(&rb.confirm_code) || !rb.client.is_authorized(chat.author(), perm::MANAGE_CHANNELS) {
                 return Ok(());
             }
+            // The whole group the channel was linked with goes live together:
+            // its request named every channel in it (see `confirm_request`).
+            // Bounded to the same community and code, so a group id can never
+            // reach past what that message showed.
             let sql = format!(
                 "UPDATE bridges SET status = 'active', status_detail = NULL, updated_at = now()
-                 WHERE bridge_id = ($1::text)::uuid RETURNING {BRIDGE_COLUMNS}"
+                 WHERE status = 'pending_confirm' AND (bridge_id = ($1::text)::uuid OR (
+                   link_group IS NOT NULL
+                   AND link_group = (SELECT link_group FROM bridges WHERE bridge_id = ($1::text)::uuid)
+                   AND community_id = $2 AND confirm_code = $3))
+                 RETURNING {BRIDGE_COLUMNS}"
             );
-            let row = BridgeRow::from_row(&self.pool.get().await?.query_one(&sql, &[&rb.id]).await?);
-            *lock(&rb.status) = LiveStatus::Active;
-            let master = unseal(&self.env.seal_key_hex, row.master_secret_sealed.as_deref().context("no master secret")?)?;
-            if let Err(error) = self.attach_routing(rb, &master, &row.options) {
-                if error.is::<GatewayUnavailable>() {
-                    // Confirmed while the gateway was down. The row stays
-                    // active and routing attaches on reconnect. Don't sever,
-                    // and don't claim it's live.
-                    tracing::warn!(bridge = %rb.id, "confirmed while Discord gateway down; will attach on reconnect");
-                    return Ok(());
+            let rows: Vec<BridgeRow> = self
+                .pool
+                .get()
+                .await?
+                .query(&sql, &[&rb.id, &rb.link.community_id, &rb.confirm_code])
+                .await?
+                .iter()
+                .map(BridgeRow::from_row)
+                .collect();
+            for row in rows {
+                let Some(target) = lock(&self.running).get(&row.bridge_id).cloned() else {
+                    // Not running here (failing to start): it is active now,
+                    // and routing attaches on its next start.
+                    continue;
+                };
+                *lock(&target.status) = LiveStatus::Active;
+                let master = unseal(&self.env.seal_key_hex, row.master_secret_sealed.as_deref().context("no master secret")?)?;
+                if let Err(error) = self.attach_routing(&target, &master, &row.options) {
+                    if error.is::<GatewayUnavailable>() {
+                        // Confirmed while the gateway was down. The row stays
+                        // active and routing attaches on reconnect. Don't sever,
+                        // and don't claim it's live.
+                        tracing::warn!(bridge = %target.id, "confirmed while Discord gateway down; will attach on reconnect");
+                        continue;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
+                let _ = target
+                    .client
+                    .send_chat(&target.channel(), SendChat::message(target.primary(), "Bridge confirmed. This channel is now mirrored with Discord."))
+                    .await;
             }
-            let _ = rb.client.send_chat(&rb.channel(), SendChat::message(rb.primary(), "Bridge confirmed. This channel is now mirrored with Discord.")).await;
             return Ok(());
         }
         let Some(router) = rb.router() else { return Ok(()) };
