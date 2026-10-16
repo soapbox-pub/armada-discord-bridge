@@ -18,11 +18,14 @@ pub trait CatchUpIo: Send + Sync {
     async fn mirror(&self, message: &RestMessage) -> bool;
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CatchUpResult {
     pub mirrored: usize,
     /// True when the cap cut the replay short of the live cutoff.
     pub capped: bool,
+    /// The newest message read, mirrored or not: where the next replay can
+    /// start. `None` when nothing was read.
+    pub read_to: Option<String>,
 }
 
 const PAGE_SIZE: usize = 100;
@@ -60,9 +63,10 @@ pub async fn replay_discord_since<Io: CatchUpIo + ?Sized>(
     let mut after = anchor_id.to_owned();
     let mut mirrored = 0;
     let mut seen = 0;
+    let done = |mirrored, capped, after: &str| CatchUpResult { mirrored, capped, read_to: (after != anchor_id).then(|| after.to_owned()) };
     loop {
         let Some(page) = io.fetch_after(&after).await.filter(|p| !p.is_empty()) else {
-            return CatchUpResult { mirrored, capped: false };
+            return done(mirrored, false, &after);
         };
         // Pages arrive newest first; replay oldest first so reply targets exist
         // by the time a message cites them.
@@ -72,10 +76,10 @@ pub async fn replay_discord_since<Io: CatchUpIo + ?Sized>(
             // An unparseable timestamp is not evidence the message is live, so
             // it replays, as it did under the TypeScript `Date.parse` (NaN).
             if parse_timestamp_ms(&message.timestamp).is_some_and(|ms| ms >= live_from_ms) {
-                return CatchUpResult { mirrored, capped: false };
+                return done(mirrored, false, &after);
             }
             if seen >= max {
-                return CatchUpResult { mirrored, capped: true };
+                return done(mirrored, true, &after);
             }
             seen += 1;
             after.clone_from(&message.id);
@@ -93,7 +97,7 @@ pub async fn replay_discord_since<Io: CatchUpIo + ?Sized>(
             }
         }
         if page.len() < PAGE_SIZE {
-            return CatchUpResult { mirrored, capped: false };
+            return done(mirrored, false, &after);
         }
     }
 }
@@ -193,7 +197,7 @@ mod tests {
         let ch = Channel::new(range(1, 250));
         let result = replay_discord_since("10", t0() + 10_000_000, 500, &ch).await;
         assert_eq!(ch.published(), ids(&range(11, 250)));
-        assert_eq!(result, CatchUpResult { mirrored: 240, capped: false });
+        assert_eq!(result, CatchUpResult { mirrored: 240, capped: false, read_to: Some("250".into()) });
         // Each page picks up after the newest id of the one before.
         assert_eq!(*ch.fetches.lock().unwrap(), vec!["10", "110", "210"]);
     }
@@ -202,8 +206,10 @@ mod tests {
     async fn stops_at_the_live_cutoff_leaving_later_messages_to_the_gateway() {
         let ch = Channel::new(range(1, 50));
         // Message 30 was posted at T0+30s: the moment routing attached.
-        replay_discord_since("0", t0() + 30_000, 500, &ch).await;
+        let result = replay_discord_since("0", t0() + 30_000, 500, &ch).await;
         assert_eq!(ch.published(), ids(&range(1, 29)));
+        // Not past the cutoff: the live path owns message 30 onward.
+        assert_eq!(result.read_to.as_deref(), Some("29"));
     }
 
     #[tokio::test]
@@ -221,6 +227,9 @@ mod tests {
         let result = replay_discord_since("0", t0() + 10_000_000, 500, &ch).await;
         assert_eq!(ch.published(), vec!["1", "5"]);
         assert_eq!(result.mirrored, 2);
+        // Read past everything, skipped or not, so a channel whose newest
+        // messages are never mirrored still moves on.
+        assert_eq!(result.read_to.as_deref(), Some("5"));
     }
 
     #[tokio::test]
@@ -229,6 +238,8 @@ mod tests {
         let result = replay_discord_since("0", t0() + 10_000_000, 120, &ch).await;
         assert_eq!(ch.published(), ids(&range(1, 120)));
         assert!(result.capped);
+        // The next replay continues where this one stopped.
+        assert_eq!(result.read_to.as_deref(), Some("120"));
     }
 
     #[tokio::test]
@@ -242,6 +253,6 @@ mod tests {
     async fn does_nothing_for_a_channel_it_cannot_read() {
         let ch = Channel { unreadable: true, ..Channel::default() };
         let result = replay_discord_since("0", t0(), 500, &ch).await;
-        assert_eq!(result, CatchUpResult { mirrored: 0, capped: false });
+        assert_eq!(result, CatchUpResult { mirrored: 0, capped: false, read_to: None });
     }
 }

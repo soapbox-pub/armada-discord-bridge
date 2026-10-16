@@ -899,13 +899,25 @@ impl BridgeManager {
         // The anchor is the largest snowflake mirrored, never the newest row:
         // created_at is when WE wrote a row, and a history import writes old
         // messages now. The snowflake is Discord's own clock.
+        //
+        // Or the newest message a previous catch-up read, if later. Messages
+        // it read and skipped (bots, commands, failures) leave no row, so a
+        // channel whose newest traffic is never mirrored kept its anchor where
+        // it was and re-read the same 500 messages on every boot (two bridges,
+        // every boot of 2026-10-15/16). An operator's DISCORD_CATCHUP_SINCE
+        // asks to replay from an older point on purpose, so it ignores this.
         let before_ms = self.env.catch_up_since_ms.unwrap_or(now_ms() as i64);
+        let honour_mark = self.env.catch_up_since_ms.is_none();
         let anchor: Option<String> = db
             .query_one(
-                "SELECT max(discord_message_id::numeric)::text AS anchor FROM messages
-                 WHERE tenant_id = 'default' AND discord_channel_id = $1 AND community_id = $2
-                   AND created_at < to_timestamp($3::bigint / 1000.0)",
-                &[&rb.link.discord_channel_id, &rb.link.community_id, &before_ms],
+                "SELECT greatest(
+                   (SELECT max(discord_message_id::numeric) FROM messages
+                    WHERE tenant_id = 'default' AND discord_channel_id = $1 AND community_id = $2
+                      AND created_at < to_timestamp($3::bigint / 1000.0)),
+                   (SELECT (options->>'discordCaughtUpTo')::numeric FROM bridges
+                    WHERE $4 AND bridge_id = ($5::text)::uuid AND options->>'discordCaughtUpTo' ~ '^[0-9]+$')
+                 )::text AS anchor",
+                &[&rb.link.discord_channel_id, &rb.link.community_id, &before_ms, &honour_mark, &rb.id],
             )
             .await?
             .get(0);
@@ -924,6 +936,16 @@ impl BridgeManager {
         }
         if result.capped {
             tracing::warn!(bridge = %rb.id, "Discord catch-up stopped at {DISCORD_CATCHUP_MAX} messages");
+        }
+        if let Some(read_to) = result.read_to.filter(|_| honour_mark) {
+            self.pool
+                .get()
+                .await?
+                .execute(
+                    "UPDATE bridges SET options = options || jsonb_build_object('discordCaughtUpTo', $2::text) WHERE bridge_id = ($1::text)::uuid",
+                    &[&rb.id, &read_to],
+                )
+                .await?;
         }
         Ok(())
     }
