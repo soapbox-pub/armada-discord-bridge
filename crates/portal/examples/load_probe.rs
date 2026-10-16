@@ -40,6 +40,8 @@ type Slot = Arc<tokio::sync::Mutex<Option<Arc<Community>>>>;
 struct Probe {
     seal_key: String,
     bootstrap: Arc<Hub>,
+    /// One hub for every community, as the portal runs them.
+    communities: Arc<Hub>,
     slots: Mutex<HashMap<String, Slot>>,
     heard: Arc<Mutex<HashSet<String>>>,
     live: Mutex<Vec<(BridgeRow, Arc<ConcordClient>, Attachment)>>,
@@ -59,8 +61,7 @@ impl Probe {
         if let Some(c) = slot.as_ref() {
             return Ok(c.clone());
         }
-        let hub = Hub::new(Keys::generate());
-        let relays = hub.relays(filter_public_relays(&m.relays, &stock_relays()).await);
+        let relays = self.communities.relays(filter_public_relays(&m.relays, &stock_relays()).await);
         let runtime = stage("folding the control plane", 90, CommunityRuntime::open(m.clone(), Arc::new(relays.clone()), None)).await?;
         anyhow::ensure!(runtime.folded().is_some_and(|f| !f.channels.is_empty()), "the control plane came back empty");
         let c = Arc::new(Community { runtime, relays });
@@ -109,6 +110,14 @@ impl Probe {
     }
 }
 
+fn relays_line(hub: &Hub) -> String {
+    hub.stats()
+        .iter()
+        .map(|(url, s)| format!("{url} up={} reqs={} refused={} closed={} auth_rejected={} connect_failures={}", s.connected, s.reqs, s.refused, s.closed, s.auth_rejected, s.connect_failures))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn process_line() -> String {
     let fds = std::fs::read_dir("/proc/self/fd").map(|d| d.count()).unwrap_or(0);
     let sockets = std::fs::read_dir("/proc/self/fd")
@@ -133,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
     let probe = Arc::new(Probe {
         seal_key: std::env::var("PORTAL_SEAL_KEY")?,
         bootstrap: Hub::new(Keys::generate()),
+        communities: Hub::with_query_limit(Keys::generate(), bridge::relays::SHARED_HUB_QUERY_CONCURRENCY),
         slots: Mutex::default(),
         heard: Arc::default(),
         live: Mutex::default(),
@@ -167,6 +177,7 @@ async fn main() -> anyhow::Result<()> {
     for (why, n) in probe.failures.lock().unwrap().iter() {
         eprintln!("PROBE failed x{n}: {why}");
     }
+    eprintln!("PROBE relays: {}", relays_line(&probe.communities));
 
     // Listen, then check against what the running portal recorded meanwhile.
     let listen_from = chrono_now(&db).await?;
@@ -203,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
     for m in missed.iter().take(20) {
         eprintln!("PROBE missed {m}");
     }
+    eprintln!("PROBE relays: {}", relays_line(&probe.communities));
     eprintln!("PROBE communities={} {}", probe.slots.lock().unwrap().len(), process_line());
     Ok(())
 }

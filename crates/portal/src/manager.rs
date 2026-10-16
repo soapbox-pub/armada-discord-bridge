@@ -298,6 +298,10 @@ pub struct BridgeManager {
     /// relays that limit connection rate answer a burst with 429s. Connections
     /// close on their own once idle.
     bootstrap: Arc<Hub>,
+    /// Every community's connections: one per relay for the process, whose
+    /// subscriptions relay-pool merges into a few REQs (see bridge::relays
+    /// for the three layouts that failed first).
+    communities_hub: Arc<Hub>,
     adapter: RwLock<Option<Arc<DiscordAdapter>>>,
     running: Mutex<HashMap<String, Arc<Running>>>,
     by_discord_channel: Mutex<HashMap<String, String>>,
@@ -323,6 +327,7 @@ impl BridgeManager {
             rest: DiscordRest::new(),
             communities: Mutex::default(),
             bootstrap: Hub::new(Keys::generate()),
+            communities_hub: Hub::with_query_limit(Keys::generate(), bridge::relays::SHARED_HUB_QUERY_CONCURRENCY),
             adapter: RwLock::new(None),
             running: Mutex::default(),
             by_discord_channel: Mutex::default(),
@@ -846,7 +851,7 @@ impl BridgeManager {
             bail!("opening the community failed {}s ago: {error}", at.elapsed().as_secs());
         }
         let opened = async {
-            let hub = Hub::new(Keys::generate());
+            let hub = self.communities_hub.clone();
             let relays = stage("vetting community relays", STAGE_DNS, async { Ok(self.guarded(&hub, &membership.relays).await) }).await?;
             let store = self.store.clone();
             let community_id = membership.community_id.clone();

@@ -1,10 +1,10 @@
 //! One community's presence on its relays, shared by every bridge into it.
 //!
-//! A community with 63 bridged channels is one set of connections, one
-//! Control Plane fold, one control subscription and one chat subscription,
-//! not 63 of each: relays cap subscriptions per connection (see relays.rs for
-//! the two designs that broke on that cap), and the fold is the same work for
-//! every bridge of the community.
+//! A community with 63 bridged channels is one Control Plane fold, one
+//! control subscription and one chat subscription, not 63 of each: relays cap
+//! subscriptions (see relays.rs for the designs that broke on that), and the
+//! fold is the same work for every bridge of the community. Its connections
+//! are the hub's, which the portal shares among every community.
 //!
 //! What is NOT shared is key custody. Each bridge keeps its own
 //! [`Membership`]: a private channel's key is vended to one bridge's npub by a

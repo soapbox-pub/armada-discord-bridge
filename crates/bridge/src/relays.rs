@@ -2,25 +2,32 @@
 //! community relay, and a publish succeeds when ANY relay accepts (Armada's
 //! `broadcast`).
 //!
-//! Relays cap concurrent subscriptions per connection, and that cap is what
-//! every design here has to fit under. A [`Hub`] — one set of connections —
-//! serves one community (see the portal's `CommunityRuntime`), holding two
-//! standing REQs whatever the community's size: one for the Control Plane and
-//! one whose authors are every bridged channel's stream keys. Its one-shot
-//! queries are bounded by [`HUB_QUERY_CONCURRENCY`].
+//! Relays cap concurrent subscriptions per connection, and limit them per IP
+//! besides; those caps are what every design here has to fit under. The
+//! portal runs every community over one [`Hub`] — one connection per relay
+//! for the whole process. Each community still subscribes twice (Control
+//! Plane, and every bridged channel's stream keys), but relay-pool merges the
+//! subscriptions of every community into a few REQs per connection and
+//! routes events back by each one's own filters. One-shot queries are bounded
+//! by the hub's query limit, inside what the merged REQs leave of the cap.
 //!
-//! Both alternatives failed in production on 2026-10-16. A hub per community
+//! Three alternatives failed in production on 2026-10-16. A hub per community
 //! with a REQ per bridge put ~130 standing REQs on one socket for a community
 //! of 63 bridged channels; the stock relays answered "too many concurrent REQs"
 //! (a NOTICE, the REQ silently dropped) and "too many subscriptions" by the
 //! thousand. A hub per bridge, as the TypeScript ran, is ~5,000 sockets for
 //! 1340 channels: it ran out of file descriptors at 250 bridges, and opening
-//! that many at once draws 429s from relays that limit connection rate.
+//! that many at once draws 429s from relays that limit connection rate. A hub
+//! per community with two REQs each fit every connection's cap, but at 78
+//! communities relay.dreamith.to's per-IP limit refused ~170 subscriptions a
+//! boot, and kept refusing a few every minute after.
 //!
 //! NIP-42: relays that gate kind 1059 serve a REQ only to a connection that has
 //! authenticated as every pubkey in its `authors`. Stream addresses are derived
 //! keys the bridge holds, so their secrets are registered here and the pool
 //! answers each challenge as all of them, scoped to the community's relays.
+//! Key custody is not pooled by sharing a hub: the hub only opens connections
+//! as these keys; which bridge may read which channel is `CommunityRuntime`'s.
 //!
 //! Every event is signature-checked before anyone sees it: relay-pool leaves
 //! that to its consumer, and a relay is not trusted to have done it.
@@ -45,6 +52,12 @@ pub const SETTLE_GRACE: Duration = Duration::from_secs(2);
 /// (fold, Direct Invite scans, catch-up per bridge) put dozens on one socket
 /// and met the same per-connection cap the standing REQs did.
 pub const HUB_QUERY_CONCURRENCY: usize = 8;
+
+/// The query limit of a hub every community shares. relay-pool keeps 18 REQs
+/// open per connection and queues queries past that, but a queued query is
+/// already spending its timeout: waiting here instead costs nothing. 12
+/// leaves room for the merged standing REQs (a few per relay).
+pub const SHARED_HUB_QUERY_CONCURRENCY: usize = 12;
 
 /// Bound on the process-wide verified-signature memo.
 const VERIFIED_MAX: usize = 200_000;
@@ -133,10 +146,15 @@ impl Hub {
     /// `auth` is the identity offered first on every challenge; further keys
     /// are added with [`Relays::register_auth_keys`].
     pub fn new(auth: Keys) -> Arc<Hub> {
+        Hub::with_query_limit(auth, HUB_QUERY_CONCURRENCY)
+    }
+
+    /// A hub allowing `queries` one-shot queries in flight.
+    pub fn with_query_limit(auth: Keys, queries: usize) -> Arc<Hub> {
         let (pool, rx) = Pool::new(auth);
         let routes: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Event>>>> = Arc::default();
         tokio::spawn(dispatch(rx, Arc::downgrade(&routes)));
-        Arc::new(Hub { pool, routes, queries: tokio::sync::Semaphore::new(HUB_QUERY_CONCURRENCY) })
+        Arc::new(Hub { pool, routes, queries: tokio::sync::Semaphore::new(queries) })
     }
 
     /// A handle reading and writing `urls` over this hub's connections.
