@@ -2,6 +2,7 @@
 
 pub mod blossom;
 pub mod client;
+pub mod community;
 pub mod config;
 pub mod db;
 pub mod fdlimit;

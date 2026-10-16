@@ -125,6 +125,12 @@ pub async fn resolve_invite(invite_url: &str, relays: &dyn RelayLike) -> anyhow:
 /// Aborts its task when dropped, taking the task's subscription with it.
 pub struct TaskGuard(JoinHandle<()>);
 
+impl TaskGuard {
+    pub fn spawn(task: impl std::future::Future<Output = ()> + Send + 'static) -> TaskGuard {
+        TaskGuard(tokio::spawn(task))
+    }
+}
+
 impl Drop for TaskGuard {
     fn drop(&mut self) {
         self.0.abort();
@@ -134,6 +140,9 @@ impl Drop for TaskGuard {
 pub type ChatHandler = Arc<dyn Fn(OpenedChat) + Send + Sync>;
 pub type CursorHandler = Arc<dyn Fn(String, u64) + Send + Sync>;
 pub type FoldHandler = Arc<dyn Fn(Arc<FoldedControl>) + Send + Sync>;
+
+/// The latest Control Plane fold, shareable between clients of one community.
+type FoldCell = Arc<RwLock<Option<Arc<FoldedControl>>>>;
 
 /// One entry of the kind-10304 command manifest (Armada's draft bot NIP).
 pub struct BotCommand {
@@ -154,7 +163,7 @@ pub struct ConcordClient {
     community: Membership,
     relays: Arc<dyn RelayLike>,
     primary: Keys,
-    folded: RwLock<Option<Arc<FoldedControl>>>,
+    folded: FoldCell,
 }
 
 impl ConcordClient {
@@ -163,7 +172,16 @@ impl ConcordClient {
         let mut keys = stream_keys(&community.control_streams());
         keys.extend(stream_keys(&community.guestbook_streams()));
         relays.register_auth_keys(keys);
-        Arc::new(ConcordClient { community, relays, primary, folded: RwLock::new(None) })
+        Arc::new(ConcordClient { community, relays, primary, folded: FoldCell::default() })
+    }
+
+    /// A client for another member of `with`'s community: its own membership
+    /// (so its own private-channel keys) and posting identity, over `with`'s
+    /// relays and reading `with`'s fold. The fold depends only on the base the
+    /// two must share: a Direct Invite can add channel keys but never move it.
+    pub fn sharing_fold(community: Membership, primary: Keys, with: &ConcordClient) -> Arc<ConcordClient> {
+        debug_assert_eq!(community.community_id, with.community.community_id);
+        Arc::new(ConcordClient { community, relays: with.relays.clone(), primary, folded: with.folded.clone() })
     }
 
     pub fn community(&self) -> &Membership {

@@ -269,6 +269,8 @@ struct MemoryState {
     subs: Vec<(u64, Vec<Filter>, mpsc::UnboundedSender<Event>)>,
     next_sub: u64,
     refuse: bool,
+    max_subs: Option<usize>,
+    refused_subs: usize,
 }
 
 /// Closes a memory subscription when dropped, as a real relay's CLOSE would:
@@ -300,6 +302,24 @@ impl MemoryRelay {
     /// Refuse every publish from now on.
     pub fn refuse_publishes(&self, refuse: bool) {
         self.inner.lock().unwrap().refuse = refuse;
+    }
+
+    /// Refuse standing subscriptions past `max` at once, as real relays do per
+    /// connection; a refused one is closed straight away.
+    pub fn cap_subscriptions(&self, max: usize) {
+        self.inner.lock().unwrap().max_subs = Some(max);
+    }
+
+    /// Subscriptions refused for the cap so far.
+    pub fn refused_subscriptions(&self) -> usize {
+        self.inner.lock().unwrap().refused_subs
+    }
+
+    /// Standing subscriptions currently open.
+    pub fn open_subscriptions(&self) -> usize {
+        let mut st = self.inner.lock().unwrap();
+        st.subs.retain(|(_, _, tx)| !tx.is_closed());
+        st.subs.len()
     }
 
     /// Store an event as if published, delivering it to subscriptions.
@@ -347,6 +367,11 @@ impl RelayLike for MemoryRelay {
     fn subscribe(&self, filters: Vec<Filter>) -> Subscription {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut st = self.inner.lock().unwrap();
+        st.subs.retain(|(_, _, tx)| !tx.is_closed());
+        if st.max_subs.is_some_and(|max| st.subs.len() >= max) {
+            st.refused_subs += 1;
+            return Subscription::new(rx, ());
+        }
         for e in &st.events {
             if filters.iter().any(|f| f.match_event(e, MatchEventOptions::default())) {
                 let _ = tx.send(e.clone());
