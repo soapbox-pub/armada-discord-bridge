@@ -9,15 +9,17 @@
 //! back to each subscription by matching that subscription's own filters.
 //!
 //! The REQs themselves are bounded too: strfry refuses websocket messages over
-//! 128KiB and REQs over 200 filters, ditto-relay over 100 filters and 20,000
-//! filter values.
+//! 128KiB, ditto-relay REQs over 100 filters and 20,000 filter values. Two of
+//! the stock relays (jskitty.com, asia.vectorapp.io) refuse REQs of more than
+//! 20 filters with "bad req: arr too big", though NIP-11 says nothing of it:
+//! measured 2026-10-16, after a rehearsal at 50 left both relays silent.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use nostr::prelude::*;
 
-/// Filters per REQ: inside ditto-relay's 100 and strfry's 200.
-pub(crate) const WIRE_MAX_FILTERS: usize = 50;
+/// Filters per REQ: inside the 20 two stock relays allow.
+pub(crate) const WIRE_MAX_FILTERS: usize = 16;
 /// Serialized size per REQ: inside strfry's 128KiB websocket message limit.
 pub(crate) const WIRE_MAX_BYTES: usize = 96 * 1024;
 /// Authors per merged filter: ~16KB of hex.
@@ -33,7 +35,7 @@ pub(crate) struct Carried {
 /// A filter that is only kinds, authors and since can share a filter with
 /// others like it. Anything else (ids, tags, limit, until, search) means
 /// something only as written, so it goes on the wire as is.
-fn mergeable(f: &Filter) -> bool {
+pub(crate) fn mergeable(f: &Filter) -> bool {
     f.ids.is_none()
         && f.search.is_none()
         && f.until.is_none()
@@ -46,12 +48,23 @@ fn mergeable(f: &Filter) -> bool {
 /// the same events. A filter is sent from the later of its own `since` and its
 /// floor; a floor of `None` sends it as written.
 ///
-/// Merged filters may match events a subscription did not ask for (a lower
-/// `since`, or another subscription's author under the same kinds); routing
-/// re-checks each subscription's own filters, so that costs only bandwidth.
+/// Merged filters may match events a subscription did not ask for (an
+/// earlier `since`, or another subscription's author under the same kinds);
+/// routing re-checks each subscription's own filters, so that costs only
+/// bandwidth.
+///
+/// Filters of the same kinds that have a floor share the earliest of them.
+/// Grouped by exact floor instead, every subscription still replaying (each
+/// with its own `since`) was a filter of its own, and a boot's merged REQ
+/// carried one per community. Filters with no floor stay apart from those
+/// with one: merged, one new control subscription would replay the whole
+/// history of every other subscription in its bin.
 pub(crate) fn merge<'a>(entries: impl IntoIterator<Item = (&'a str, &'a Filter, Option<Timestamp>)>) -> Vec<Carried> {
-    type Key = (Option<Vec<u16>>, Option<Timestamp>);
-    let mut groups: BTreeMap<Key, BTreeMap<PublicKey, BTreeSet<String>>> = BTreeMap::new();
+    /// Kinds, and whether the group has a floor.
+    type Key = (Option<Vec<u16>>, bool);
+    /// The group's floor, and the subscriptions asking for each author.
+    type Group = (Option<Timestamp>, BTreeMap<PublicKey, BTreeSet<String>>);
+    let mut groups: BTreeMap<Key, Group> = BTreeMap::new();
     let mut out = Vec::new();
     for (sub, f, floor) in entries {
         let floor = match (f.since, floor) {
@@ -65,12 +78,13 @@ pub(crate) fn merge<'a>(entries: impl IntoIterator<Item = (&'a str, &'a Filter, 
             continue;
         }
         let kinds = f.kinds.as_ref().map(|k| k.iter().map(|k| k.as_u16()).collect());
-        let authors = groups.entry((kinds, floor)).or_default();
+        let (since, authors) = groups.entry((kinds, floor.is_some())).or_insert((floor, BTreeMap::new()));
+        *since = (*since).min(floor);
         for pk in f.authors.iter().flatten() {
             authors.entry(*pk).or_default().insert(sub.to_owned());
         }
     }
-    for ((kinds, floor), authors) in groups {
+    for ((kinds, _), (floor, authors)) in groups {
         let authors: Vec<(PublicKey, BTreeSet<String>)> = authors.into_iter().collect();
         for chunk in authors.chunks(AUTHORS_PER_FILTER) {
             let mut f = Filter::new().authors(chunk.iter().map(|(pk, _)| *pk));
@@ -139,11 +153,14 @@ mod tests {
     }
 
     #[test]
-    fn keeps_different_floors_apart_and_applies_them() {
+    fn floors_merge_to_the_earliest_and_no_floor_stays_apart() {
         let a = Filter::new().kind(Kind::GiftWrap).authors(pks(1));
         let b = Filter::new().kind(Kind::GiftWrap).authors(pks(1)).since(Timestamp::from_secs(500));
-        let merged = merge([("a", &a, None), ("b", &b, None)]);
-        assert_eq!(merged.len(), 2);
+        let c = Filter::new().kind(Kind::GiftWrap).authors(pks(1)).since(Timestamp::from_secs(300));
+        let merged = merge([("a", &a, None), ("b", &b, None), ("c", &c, None)]);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert!(merged.iter().any(|m| m.filter.since.is_none() && m.subs.len() == 1));
+        assert!(merged.iter().any(|m| m.filter.since == Some(Timestamp::from_secs(300)) && m.subs.len() == 2));
         let raised = merge([("a", &a, Some(Timestamp::from_secs(900))), ("b", &b, Some(Timestamp::from_secs(900)))]);
         assert_eq!(raised.len(), 1);
         assert_eq!(raised[0].filter.since, Some(Timestamp::from_secs(900)));

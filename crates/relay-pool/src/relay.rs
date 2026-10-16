@@ -538,9 +538,11 @@ impl RelayTask {
     /// Place a subscription in the first bin of its kind with room for it.
     fn add_sub(&mut self, sub_id: String, filters: Vec<Filter>) {
         let authable = self.shared.can_auth_as(&self.url, &wire::pubkeys_of(&filters));
+        // A filter that cannot be merged is a filter on the wire of its own,
+        // and a REQ holds only so many (wire::WIRE_MAX_FILTERS).
         let weight = filters
             .iter()
-            .map(|f| f.authors.as_ref().map_or(1, |a| a.len().max(1)))
+            .map(|f| if wire::mergeable(f) { f.authors.as_ref().map_or(1, |a| a.len()) } else { BIN_AUTHORS / 8 })
             .sum::<usize>();
         let found = self
             .bins
