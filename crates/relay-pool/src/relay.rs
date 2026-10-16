@@ -114,6 +114,12 @@ struct RelayTask {
     publishes: HashMap<EventId, PendingPublish>,
     conn: Option<Conn>,
     out: Vec<String>,
+    /// After a failed connect, when the next attempt may be made. Until then
+    /// queries and publishes fail at once instead of waiting out their own
+    /// timeouts, and nothing redials early: a task with no standing
+    /// subscription used to skip the backoff entirely, so a pool that only
+    /// queried redialed a relay refusing it (jskitty's 429s) on every query.
+    down_until: Option<Instant>,
 }
 
 pub(crate) async fn run(shared: Arc<Shared>, url: String, rx: mpsc::UnboundedReceiver<Cmd>) {
@@ -126,6 +132,7 @@ pub(crate) async fn run(shared: Arc<Shared>, url: String, rx: mpsc::UnboundedRec
         publishes: HashMap::new(),
         conn: None,
         out: Vec::new(),
+        down_until: None,
     }
     .run()
     .await
@@ -181,6 +188,7 @@ impl RelayTask {
 
             match self.connect().await {
                 Ok(ws) => {
+                    self.down_until = None;
                     let started = Instant::now();
                     self.conn = Some(Conn::default());
                     self.shared.set_connected(&self.url, true);
@@ -195,6 +203,8 @@ impl RelayTask {
                 }
                 Err(e) => {
                     tracing::warn!(relay = %self.url, error = %e, "relay connection failed");
+                    self.down_until = Some(Instant::now() + jitter(backoff));
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
                     self.fail_pending(&format!("connection failed: {e}"));
                 }
             }
@@ -203,8 +213,14 @@ impl RelayTask {
                 idle_since = Instant::now();
                 continue;
             }
-            let deadline = Instant::now() + jitter(backoff);
-            backoff = (backoff * 2).min(BACKOFF_MAX);
+            let deadline = match self.down_until {
+                Some(until) => until,
+                None => {
+                    let until = Instant::now() + jitter(backoff);
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
+                    until
+                }
+            };
             loop {
                 tokio::select! {
                     cmd = self.rx.recv() => match cmd {
@@ -434,6 +450,10 @@ impl RelayTask {
         self.push(msg);
     }
 
+    fn backing_off(&self) -> bool {
+        self.conn.is_none() && self.down_until.is_some_and(|until| Instant::now() < until)
+    }
+
     fn handle_cmd(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Subscribe { sub_id, filters } => {
@@ -456,6 +476,10 @@ impl RelayTask {
                 }
             }
             Cmd::Query { id, filters, tx } => {
+                if self.backing_off() {
+                    let _ = tx.send(QueryMsg::Done);
+                    return;
+                }
                 self.queries.insert(
                     id.clone(),
                     PendingQuery {
@@ -474,6 +498,10 @@ impl RelayTask {
                 }
             }
             Cmd::Publish { event, tx } => {
+                if self.backing_off() {
+                    let _ = tx.send(Err("relay unreachable; waiting to reconnect".to_string()));
+                    return;
+                }
                 let id = event.id;
                 if let Some(p) = self.publishes.get_mut(&id) {
                     p.txs.push(tx);

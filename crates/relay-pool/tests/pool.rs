@@ -203,6 +203,43 @@ async fn query_times_out_on_unreachable_relay() {
     );
 }
 
+/// A relay refusing connections (a 429, say) is retried on the backoff, not
+/// once per query: a pool that only queries had no backoff at all, and every
+/// query reconnected to a relay already refusing it.
+#[tokio::test]
+async fn refused_relay_is_not_redialed_per_query() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let refusing = format!("ws://{}", listener.local_addr().unwrap());
+    let dials = Arc::new(AtomicUsize::new(0));
+    let counted = dials.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    let (pool, _rx) = Pool::new(Keys::generate());
+    let start = Instant::now();
+    for _ in 0..5 {
+        let events = pool
+            .query(std::slice::from_ref(&refusing), vec![Filter::new()], Duration::from_secs(5))
+            .await;
+        assert!(events.is_empty());
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "queries during the backoff should fail at once, took {:?}",
+        start.elapsed()
+    );
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+    let refused = pool.publish(&[refusing], &note(&Keys::generate(), 1, "x", 1), Duration::from_secs(5)).await;
+    assert!(refused.accepted.is_empty() && refused.rejected.len() == 1);
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn publish_accepted_and_rejected() {
     let relay = MockRelay::start(false).await;
