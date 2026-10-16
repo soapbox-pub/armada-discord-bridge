@@ -69,7 +69,7 @@ const RESUME_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_ASSET_BYTES: usize = 8 * 1024 * 1024;
 
 pub const IMPORT_COLUMNS: &str = "import_id::text AS import_id, owner_discord_id, discord_guild_id, discord_guild_name, status, \
-     status_detail, plan, owner_sk_sealed, community_sealed, community_id, invite_url_sealed, link_signer_sk_sealed, updated_at";
+     status_detail, plan, history_progress, owner_sk_sealed, community_sealed, community_id, invite_url_sealed, link_signer_sk_sealed, updated_at";
 
 #[derive(Clone, Debug)]
 pub struct ImportRow {
@@ -90,6 +90,8 @@ pub struct ImportRow {
 
 impl ImportRow {
     fn from_row(r: &tokio_postgres::Row) -> anyhow::Result<ImportRow> {
+        let mut plan: ImportPlan = serde_json::from_value(r.get("plan")).context("import plan does not parse")?;
+        overlay_progress(&mut plan, &r.get("history_progress"));
         Ok(ImportRow {
             import_id: r.get("import_id"),
             owner_discord_id: r.get("owner_discord_id"),
@@ -97,7 +99,7 @@ impl ImportRow {
             discord_guild_name: r.get("discord_guild_name"),
             status: r.get("status"),
             status_detail: r.get("status_detail"),
-            plan: serde_json::from_value(r.get("plan")).context("import plan does not parse")?,
+            plan,
             owner_sk_sealed: r.get("owner_sk_sealed"),
             community_sealed: r.get("community_sealed"),
             community_id: r.get("community_id"),
@@ -246,6 +248,21 @@ fn plan_json(plan: &ImportPlan) -> Value {
     serde_json::to_value(plan).expect("plans always serialize")
 }
 
+/// Apply `imports.history_progress` checkpoints, which are newer than the
+/// plan for their channels (see migration 018).
+fn overlay_progress(plan: &mut ImportPlan, progress: &Value) {
+    let Some(progress) = progress.as_object() else { return };
+    for c in plan.channels.iter_mut() {
+        let Some(p) = progress.get(&c.discord_id) else { continue };
+        if let Some(n) = p["imported"].as_u64() {
+            c.history_imported = Some(n);
+        }
+        if let Some(cursor) = p["cursor"].as_str() {
+            c.history_cursor = Some(cursor.to_owned());
+        }
+    }
+}
+
 impl Importer {
     pub fn new(pool: Pool, env: crate::env::PortalEnv, host: Arc<dyn BridgeHost>, io: ImporterIo) -> Arc<Importer> {
         Arc::new(Importer { pool, env, host, io, rest: DiscordRest::new(), running: Mutex::default() })
@@ -283,7 +300,25 @@ impl Importer {
         self.pool
             .get()
             .await?
-            .execute("UPDATE imports SET plan = $2, updated_at = now() WHERE import_id = ($1::text)::uuid", &[&import_id, &plan_json(plan)])
+            .execute(
+                "UPDATE imports SET plan = $2, history_progress = '{}', updated_at = now() WHERE import_id = ($1::text)::uuid",
+                &[&import_id, &plan_json(plan)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Checkpoint one channel's history progress without rewriting the plan,
+    /// which can be ~150KB for a large guild.
+    async fn save_progress(&self, import_id: &str, discord_id: &str, imported: u64, cursor: &str) -> anyhow::Result<()> {
+        let entry = json!({ discord_id: { "imported": imported, "cursor": cursor } });
+        self.pool
+            .get()
+            .await?
+            .execute(
+                "UPDATE imports SET history_progress = history_progress || $2, updated_at = now() WHERE import_id = ($1::text)::uuid",
+                &[&import_id, &entry],
+            )
             .await?;
         Ok(())
     }
@@ -468,7 +503,7 @@ impl Importer {
             .await?
             .execute(
                 "UPDATE imports SET owner_sk_sealed = $2, community_sealed = $3, community_id = $4, invite_url_sealed = $5,
-                   link_signer_sk_sealed = $6, plan = $7, status = 'awaiting_sigs', status_detail = NULL, updated_at = now()
+                   link_signer_sk_sealed = $6, plan = $7, history_progress = '{}', status = 'awaiting_sigs', status_detail = NULL, updated_at = now()
                  WHERE import_id = ($1::text)::uuid",
                 &[
                     &import_id,
@@ -514,7 +549,8 @@ impl Importer {
             .get()
             .await?
             .execute(
-                "UPDATE imports SET plan = $2, status = 'publishing', status_detail = NULL, updated_at = now() WHERE import_id = ($1::text)::uuid",
+                "UPDATE imports SET plan = $2, history_progress = '{}', status = 'publishing', status_detail = NULL, updated_at = now()
+                 WHERE import_id = ($1::text)::uuid",
                 &[&import_id, &plan_json(&plan)],
             )
             .await?;
@@ -1089,7 +1125,8 @@ impl Importer {
             .get()
             .await?
             .execute(
-                "UPDATE imports SET plan = $2, status = 'history', status_detail = NULL, updated_at = now() WHERE import_id = ($1::text)::uuid",
+                "UPDATE imports SET plan = $2, history_progress = '{}', status = 'history', status_detail = NULL, updated_at = now()
+                 WHERE import_id = ($1::text)::uuid",
                 &[&import_id, &plan_json(&plan)],
             )
             .await?;
@@ -1193,7 +1230,7 @@ impl Importer {
             plan.channels[i].history_imported = Some(published);
             plan.channels[i].history_cursor = Some(message.id.clone());
             if published.is_multiple_of(20) {
-                self.save_plan(import_id, plan).await?;
+                self.save_progress(import_id, &discord_id, published, &message.id).await?;
             }
         }
         if skipped > 0 {
@@ -1539,6 +1576,58 @@ mod tests {
         db.execute("DELETE FROM bridges WHERE discord_guild_id = $1", &[&guild_id]).await.unwrap();
         db.execute("DELETE FROM imports WHERE discord_guild_id = $1", &[&guild_id]).await.unwrap();
         db.execute("DELETE FROM guild_community_secrets WHERE discord_guild_id = $1", &[&guild_id]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_checkpoints_overlay_the_plan_until_it_is_next_written() {
+        let Some(pool) = test_pool().await else { return };
+        let guild_id = format!("8{}", std::process::id());
+        let env = crate::env::PortalEnv::from_env(|k| match k {
+            "PORTAL_SEAL_KEY" => Some(SEAL_KEY.into()),
+            "DATABASE_URL" => Some("postgres://unused".into()),
+            _ => None,
+        })
+        .unwrap();
+        let io = ImporterIo {
+            relays: Arc::new(|_| Arc::new(MemoryRelay::new()) as Arc<dyn RelayLike>),
+            history: Arc::new(|_, _| Box::pin(async { Ok(Some(vec![])) })),
+            vet_relays: Arc::new(|_| Box::pin(async { Ok(()) })),
+            publish_retry: Duration::from_millis(5),
+            blobs: Arc::new(NoBlobs),
+        };
+        let importer = Importer::new(pool.clone(), env, Arc::new(FakeHost { pool: pool.clone() }), io);
+        let mut plan = build_import_plan(&snapshot(&guild_id, &guild_id));
+        let channel = format!("{guild_id}21");
+        let import_id: String = pool
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "INSERT INTO imports (owner_discord_id, discord_guild_id, plan) VALUES ('test-progress', $1, $2) RETURNING import_id::text",
+                &[&guild_id, &plan_json(&plan)],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let read = async |importer: &Importer| {
+            let plan = importer.row(&import_id, None).await.unwrap().unwrap().plan;
+            let c = plan.channels.into_iter().find(|c| c.discord_id == channel).unwrap();
+            (c.history_imported, c.history_cursor)
+        };
+
+        importer.save_progress(&import_id, &channel, 20, "120").await.unwrap();
+        importer.save_progress(&import_id, &channel, 40, "140").await.unwrap();
+        assert_eq!(read(&importer).await, (Some(40), Some("140".into())));
+        let stored: Value = pool.get().await.unwrap().query_one("SELECT plan FROM imports WHERE import_id = ($1::text)::uuid", &[&import_id]).await.unwrap().get(0);
+        assert!(stored.to_string().len() > 100 && !stored.to_string().contains("\"140\""), "a checkpoint leaves the plan alone");
+
+        // A re-run resets progress in the plan; a stale checkpoint must not undo that.
+        let c = plan.channels.iter_mut().find(|c| c.discord_id == channel).unwrap();
+        (c.history_imported, c.history_cursor) = (Some(0), None);
+        importer.save_plan(&import_id, &plan).await.unwrap();
+        assert_eq!(read(&importer).await, (Some(0), None));
+
+        pool.get().await.unwrap().execute("DELETE FROM imports WHERE import_id = ($1::text)::uuid", &[&import_id]).await.unwrap();
     }
 
     fn refused() -> anyhow::Error {
