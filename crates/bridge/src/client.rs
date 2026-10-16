@@ -234,8 +234,16 @@ impl ConcordClient {
     }
 
     /// Fetch and fold the Control Plane (channels, roles, banlist).
+    ///
+    /// Settled, not merged across every relay: a start waited out the slowest
+    /// relay of its community on this fold, and a boot took ~40 minutes while
+    /// one sat at 7.7s (2026-10-16). What a late relay holds — a channel, a
+    /// role, a ban — reaches the fold through the live control subscription,
+    /// which replays the whole plane from every relay and re-folds within
+    /// CONTROL_REFOLD of it arriving. A start that misses a channel this way
+    /// re-folds once, then retries on backoff.
     pub async fn sync_control(&self) -> anyhow::Result<Arc<FoldedControl>> {
-        let wraps = self.relays.query(vec![self.control_filter()]).await?;
+        let wraps = self.relays.query_settled(vec![self.control_filter()]).await?;
         Ok(self.fold(&self.open_editions(&wraps)))
     }
 

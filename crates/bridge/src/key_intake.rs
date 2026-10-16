@@ -67,11 +67,13 @@ pub async fn intake_direct_invite_keys(
         .custom_tag(SingleLetterTag::from_char('k').expect("k is a single-letter tag"), kinds::DIRECT_INVITE.to_string())
         .limit(SCAN_LIMIT);
 
+    // All sets at once, each settled: a start waited on this scan, set after
+    // set, for the slowest relay of each. A key a late relay holds is missed
+    // for this start only; it fails "channel not found" and retries.
+    let scans = relay_sets.iter().map(|relays| relays.query_settled(vec![filter.clone()]));
     let mut wraps: HashMap<EventId, Event> = HashMap::new();
-    for relays in relay_sets {
-        for event in relays.query(vec![filter.clone()]).await.unwrap_or_default() {
-            wraps.insert(event.id, event);
-        }
+    for event in futures_util::future::join_all(scans).await.into_iter().flat_map(Result::unwrap_or_default) {
+        wraps.insert(event.id, event);
     }
     // Oldest first, so a later vend at the same epoch never undoes an earlier one.
     let mut wraps: Vec<Event> = wraps.into_values().collect();

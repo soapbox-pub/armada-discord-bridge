@@ -62,7 +62,9 @@ impl ProfileResolver for Kind0ProfileResolver {
         // A relay or JSON failure falls back, and retries after the TTL.
         if let Ok(pk) = PublicKey::from_hex(pubkey_hex) {
             let filter = Filter::new().kind(Kind::Metadata).author(pk).limit(1);
-            if let Ok(events) = self.relays.query(vec![filter]).await
+            // Settled: this is a display name on the path of a message, and
+            // no relay is worth holding the message for.
+            if let Ok(events) = self.relays.query_settled(vec![filter]).await
                 && let Some(newest) = events.iter().max_by_key(|e| e.created_at)
                 && let Some(p) = profile_from_kind0(&newest.content)
             {

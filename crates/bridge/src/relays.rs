@@ -36,6 +36,9 @@ use tokio::sync::mpsc;
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long a settled query waits for the rest once one relay has answered.
+/// Healthy relays answer well inside it (0.3-1s, 2026-10-16).
+pub const SETTLE_GRACE: Duration = Duration::from_secs(2);
 
 /// One-shot queries in flight per hub. Each is a REQ on every relay of the
 /// hub, on top of its standing subscriptions: unbounded, a community's boot
@@ -52,6 +55,13 @@ const VERIFIED_MAX: usize = 200_000;
 pub trait RelayLike: Send + Sync {
     /// Merge results from every relay, deduped by id, newest first.
     async fn query(&self, filters: Vec<Filter>) -> anyhow::Result<Vec<Event>>;
+
+    /// Like `query`, but stops waiting [`SETTLE_GRACE`] after the first relay
+    /// answers; see [`Pool::query_settled`]. Only for a caller that hears
+    /// what a late relay holds some other way, or can afford not to.
+    async fn query_settled(&self, filters: Vec<Filter>) -> anyhow::Result<Vec<Event>> {
+        self.query(filters).await
+    }
 
     /// The first relay holding a match wins; see [`Pool::query_race`].
     async fn query_race(&self, filters: Vec<Filter>) -> Vec<Event> {
@@ -194,6 +204,12 @@ impl RelayLike for Relays {
     async fn query(&self, filters: Vec<Filter>) -> anyhow::Result<Vec<Event>> {
         let _slot = self.hub.queries.acquire().await?;
         let events = self.hub.pool.query(&self.urls, filters, QUERY_TIMEOUT).await;
+        Ok(newest_first(events.into_iter().filter(verify_once).collect()))
+    }
+
+    async fn query_settled(&self, filters: Vec<Filter>) -> anyhow::Result<Vec<Event>> {
+        let _slot = self.hub.queries.acquire().await?;
+        let events = self.hub.pool.query_settled(&self.urls, filters, QUERY_TIMEOUT, SETTLE_GRACE).await;
         Ok(newest_first(events.into_iter().filter(verify_once).collect()))
     }
 
