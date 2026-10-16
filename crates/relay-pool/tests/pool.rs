@@ -251,7 +251,7 @@ async fn rate_limited_subscription_is_resent() {
     pool.subscribe("s", &relay.urls(), vec![Filter::new().kind(Kind::TextNote)]);
     // The re-sent REQ is answered with EOSE like any other.
     assert!(matches!(next_sub_event(&mut rx, "s").await, PoolEvent::Eose { .. }));
-    assert_eq!(relay.reqs_for("s").len(), 2);
+    assert_eq!(relay.standing_reqs().len(), 2);
     let stats = pool.stats()[&relay.url].clone();
     assert_eq!((stats.refused, stats.closed, stats.connects), (1, 0, 1), "{stats:?}");
     assert!(stats.connected);
@@ -270,7 +270,7 @@ async fn blocked_subscription_is_not_resent() {
     relay.refuse_next_reqs(1, "blocked: not here");
     pool.subscribe("s", &relay.urls(), vec![Filter::new().kind(Kind::TextNote)]);
     assert_quiet(&mut rx, "s", Duration::from_secs(9)).await;
-    assert_eq!(relay.reqs_for("s").len(), 1);
+    assert_eq!(relay.standing_reqs().len(), 1);
 }
 
 /// A relay that accepts TCP and never completes the websocket handshake.
@@ -388,8 +388,9 @@ async fn nip42_authenticates_every_stream_key() {
     assert!(!authed.contains(&unrelated.public_key()));
     assert_eq!(authed.len(), 3, "keys authenticated more than once");
 
-    // The first REQ was refused, the retry after AUTH succeeded.
-    assert!(relay.reqs_for("concord").len() >= 2);
+    // Usually AUTH completes inside the settle and the first REQ is served;
+    // if it was refused, the retry after AUTH was.
+    assert!(!relay.standing_reqs().is_empty());
 
     // Query and publish on the already-authenticated connection.
     let got = pool
@@ -531,7 +532,7 @@ async fn reconnect_resubscribes_with_since() {
     let events = collect_until_eose(&mut rx, "s", 1).await;
     assert!(events.is_empty(), "redelivered {events:?}");
 
-    let reqs = relay.reqs_for("s");
+    let reqs = relay.standing_reqs();
     assert_eq!(reqs.len(), 2);
     assert_eq!(reqs[0][0].since, Some(original_since));
     let raised = Timestamp::from_secs(newest - 60);
@@ -595,4 +596,101 @@ async fn query_race_skips_empty_answers() {
 
     let none = pool.query_race(&empty.urls(), vec![filter], Duration::from_secs(5)).await;
     assert!(none.is_empty());
+}
+
+/// Many subscriptions share a REQ, and each still hears only what its own
+/// filters ask for: a REQ per subscription met the relays' cap of 20 per
+/// connection, and their per-IP subscription limits (2026-10-16).
+#[tokio::test]
+async fn subscriptions_share_a_req_and_are_routed_by_their_own_filters() {
+    let relay = MockRelay::start(false).await;
+    let (pool, mut rx) = Pool::new(Keys::generate());
+    let authors: Vec<Keys> = (0..40).map(|_| Keys::generate()).collect();
+    for (i, a) in authors.iter().enumerate() {
+        pool.subscribe(&format!("s{i}"), &relay.urls(), vec![Filter::new().kind(Kind::GiftWrap).author(a.public_key())]);
+    }
+    // Gathered and sent as one REQ, answered once per subscription.
+    let mut answered = std::collections::BTreeSet::new();
+    while answered.len() < 40 {
+        if let PoolEvent::Eose { sub_id, .. } = timeout(WAIT, rx.recv()).await.unwrap().unwrap() {
+            assert!(answered.insert(sub_id), "answered twice");
+        }
+    }
+    assert_eq!(relay.open_standing(), 1);
+    assert_eq!(relay.standing_reqs().len(), 1);
+
+    relay.inject(note(&authors[7], 1059, "for seven", 1_700_000_000));
+    match next_sub_event(&mut rx, "s7").await {
+        PoolEvent::Event { event, sub_id, .. } => assert_eq!((sub_id.as_str(), event.content.as_str()), ("s7", "for seven")),
+        other => panic!("expected the event, got {other:?}"),
+    }
+    assert_quiet(&mut rx, "s8", Duration::from_millis(300)).await;
+
+    // Leaving re-sends the bin without it; the rest keep hearing.
+    pool.unsubscribe("s7");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(relay.open_standing(), 1, "the replaced REQ was closed");
+    let last = relay.standing_reqs().pop().unwrap();
+    assert!(last.iter().all(|f| !f.authors.as_ref().unwrap().contains(&authors[7].public_key())));
+    relay.inject(note(&authors[8], 1059, "for eight", 1_700_000_001));
+    relay.inject(note(&authors[7], 1059, "for nobody", 1_700_000_002));
+    loop {
+        if let PoolEvent::Event { sub_id, event, .. } = timeout(WAIT, rx.recv()).await.unwrap().unwrap() {
+            assert_ne!(sub_id, "s7", "delivered after unsubscribe");
+            if sub_id == "s8" && event.content == "for eight" {
+                break;
+            }
+        }
+    }
+}
+
+/// A subscription naming an author this pool cannot AUTH as stays out of
+/// the others' REQ: on a relay that gates reads, merged in, it would have
+/// refused the REQ for all of them.
+#[tokio::test]
+async fn an_unauthable_author_does_not_silence_the_others() {
+    let relay = MockRelay::start(true).await;
+    let (pool, mut rx) = Pool::new(Keys::generate());
+    let held = Keys::generate();
+    pool.register_auth_keys(&relay.urls(), vec![held.clone()]);
+    relay.store(note(&held, 1059, "readable", 1_700_000_000));
+    let foreign = Keys::generate().public_key();
+    pool.subscribe("control", &relay.urls(), vec![Filter::new().kind(Kind::GiftWrap).author(foreign)]);
+    pool.subscribe("chat", &relay.urls(), vec![Filter::new().kind(Kind::GiftWrap).author(held.public_key())]);
+    let events = collect_until_eose(&mut rx, "chat", 1).await;
+    assert_eq!(events.iter().map(|e| e.content.as_str()).collect::<Vec<_>>(), ["readable"]);
+}
+
+/// A subscription that joins a live bin does not make the bin's other
+/// subscriptions replay their history: they restart from the newest event.
+#[tokio::test]
+async fn joining_a_live_bin_replays_only_the_newcomer() {
+    let relay = MockRelay::start(false).await;
+    let (pool, mut rx) = Pool::new(Keys::generate());
+    let (a, b) = (Keys::generate(), Keys::generate());
+    relay.store(note(&a, 1059, "a old", 1_700_000_000));
+    relay.store(note(&b, 1059, "b old", 1_600_000_000));
+    pool.subscribe("a", &relay.urls(), vec![Filter::new().kind(Kind::GiftWrap).author(a.public_key())]);
+    assert_eq!(collect_until_eose(&mut rx, "a", 1).await.len(), 1);
+    pool.subscribe("b", &relay.urls(), vec![Filter::new().kind(Kind::GiftWrap).author(b.public_key())]);
+    assert_eq!(collect_until_eose(&mut rx, "b", 1).await.len(), 1, "the newcomer gets its history");
+    let reqs = relay.standing_reqs();
+    assert_eq!(reqs.len(), 2);
+    let floor = |pk: PublicKey| reqs[1].iter().find(|f| f.authors.as_ref().unwrap().contains(&pk)).unwrap().since;
+    assert_eq!(floor(a.public_key()), Some(Timestamp::from_secs(1_700_000_000 - 60)));
+    assert_eq!(floor(b.public_key()), None);
+}
+
+/// Queries past the per-connection cap wait for a slot instead of being
+/// sent for the relay to refuse.
+#[tokio::test]
+async fn queries_past_the_cap_wait_their_turn() {
+    let relay = MockRelay::start(false).await;
+    relay.store(note(&Keys::generate(), 1, "x", 1_700_000_000));
+    relay.answer_after(Duration::from_millis(20));
+    let (pool, _rx) = Pool::new(Keys::generate());
+    let urls = relay.urls();
+    let queries = (0..40).map(|_| pool.query(&urls, vec![Filter::new().kind(Kind::TextNote)], Duration::from_secs(10)));
+    let results = futures_util::future::join_all(queries).await;
+    assert!(results.iter().all(|r| r.len() == 1));
 }

@@ -1,6 +1,15 @@
 //! The per-relay connection task.
+//!
+//! Subscriptions are not REQs. Relays cap REQs per connection (20 on all four
+//! stock relays) and limit subscriptions per IP besides, so a process that
+//! held a REQ per subscription, or a connection per community, met one limit
+//! or the other: relay.dreamith.to refused ~170 subscriptions per boot at 78
+//! communities (2026-10-16). Instead each subscription is placed in a [`Bin`],
+//! a bin's subscriptions are merged into one REQ, and an arriving event is
+//! handed to each subscription of its bin whose own filters match it. One-shot
+//! queries take what [`MAX_REQS`] leaves, and wait their turn past it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -15,6 +24,18 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 use crate::Shared;
+use crate::wire;
+
+/// REQs kept open on one connection, standing and one-shot. The stock relays
+/// allow 20; the margin covers a bin's replacement, which goes out before the
+/// REQ it replaces is closed.
+const MAX_REQS: usize = 18;
+/// Authors per bin, so that a bin's merged filters fit one REQ (wire.rs).
+const BIN_AUTHORS: usize = 1000;
+/// How long subscription changes are gathered before bins are re-sent: a
+/// boot attaches communities one after another, and a re-send per attach
+/// would replay the bin per attach.
+const FLUSH_SETTLE: Duration = Duration::from_millis(200);
 
 /// Relay messages larger than this are ignored.
 const MAX_MESSAGE_SIZE: usize = 1 << 20;
@@ -78,9 +99,38 @@ impl QueryMsg {
     }
 }
 
+/// A subscription as the pool's caller made it.
 struct RelaySub {
     filters: Vec<Filter>,
+    bin: u64,
+    /// What it counts for against [`BIN_AUTHORS`].
+    weight: usize,
+    /// An EOSE answered a REQ carrying it, so its stored events are in and a
+    /// re-send may start it from the bin's newest event. Until then a re-send
+    /// starts it from its own since: one cut short by another subscription
+    /// joining its bin would otherwise lose the stored events not yet sent.
+    live: bool,
+}
+
+/// Subscriptions sharing one REQ (several, for one oversized subscription).
+///
+/// Only subscriptions alike in whether this pool can AUTH as every author
+/// they name share a bin. Control streams usually fail that (a bridge holds
+/// no control signer key), and a relay that gates reads by NIP-42 refuses the
+/// whole REQ for one such author: merged with the rest, one community's
+/// control plane would silence every community's chat on that relay.
+struct Bin {
+    authable: bool,
+    subs: BTreeSet<String>,
+    weight: usize,
+    /// The REQs on the wire: id, filters, and the subscriptions each carries.
+    wire: Vec<(String, Vec<Filter>, BTreeSet<String>)>,
+    /// Bumped by every re-send with new contents, which goes out under new
+    /// ids: the EOSE of the REQ being replaced must not mark the
+    /// subscriptions of its replacement live.
+    generation: u64,
     newest: Option<Timestamp>,
+    dirty: bool,
     sent_epoch: u64,
     awaiting_auth: bool,
     /// Closed by the relay for a transient reason: re-sent at this time.
@@ -89,9 +139,34 @@ struct RelaySub {
     refusals: u32,
 }
 
+impl Bin {
+    fn new(authable: bool) -> Bin {
+        Bin {
+            authable,
+            subs: BTreeSet::new(),
+            weight: 0,
+            wire: Vec::new(),
+            generation: 0,
+            newest: None,
+            dirty: false,
+            sent_epoch: 0,
+            awaiting_auth: false,
+            retry_at: None,
+            refusals: 0,
+        }
+    }
+
+    /// The subscriptions a REQ of this bin carries.
+    fn carried(&self, wire_id: &str) -> Option<&BTreeSet<String>> {
+        self.wire.iter().find(|(id, _, _)| id == wire_id).map(|(_, _, subs)| subs)
+    }
+}
+
 struct PendingQuery {
     filters: Vec<Filter>,
     tx: mpsc::UnboundedSender<QueryMsg>,
+    /// On the wire, rather than waiting for a slot under [`MAX_REQS`].
+    sent: bool,
     sent_epoch: u64,
     retried: bool,
     awaiting_auth: Option<String>,
@@ -110,6 +185,8 @@ struct PendingPublish {
 struct Conn {
     challenge: Option<String>,
     pending: HashMap<EventId, PublicKey>,
+    /// The values of `pending`, for lookup by key.
+    in_flight: HashSet<PublicKey>,
     acked: HashSet<PublicKey>,
     rejected: HashSet<PublicKey>,
     /// Bumped whenever the relay accepts an AUTH. A request sent at an older
@@ -127,6 +204,12 @@ struct RelayTask {
     url: String,
     rx: mpsc::UnboundedReceiver<Cmd>,
     subs: HashMap<String, RelaySub>,
+    bins: BTreeMap<u64, Bin>,
+    next_bin: u64,
+    /// Which bin each REQ on the wire belongs to.
+    wire_ids: HashMap<String, u64>,
+    /// When dirty bins are next re-sent.
+    flush_at: Option<Instant>,
     queries: HashMap<SubscriptionId, PendingQuery>,
     publishes: HashMap<EventId, PendingPublish>,
     conn: Option<Conn>,
@@ -145,6 +228,10 @@ pub(crate) async fn run(shared: Arc<Shared>, url: String, rx: mpsc::UnboundedRec
         url,
         rx,
         subs: HashMap::new(),
+        bins: BTreeMap::new(),
+        next_bin: 0,
+        wire_ids: HashMap::new(),
+        flush_at: None,
         queries: HashMap::new(),
         publishes: HashMap::new(),
         conn: None,
@@ -287,6 +374,7 @@ impl RelayTask {
             Ws(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
             Tick,
             Resubscribe,
+            Flush,
         }
 
         tracing::debug!(relay = %self.url, "connected");
@@ -297,6 +385,7 @@ impl RelayTask {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
+            self.pump_queries();
             // Anything that changes what is open on the wire sends something.
             if !self.out.is_empty() {
                 let reqs = self.open_reqs();
@@ -309,12 +398,14 @@ impl RelayTask {
                 }
             }
 
-            let next_retry = self.subs.values().filter_map(|s| s.retry_at).min();
+            let next_retry = self.bins.values().filter_map(|b| b.retry_at).min();
+            let flush_at = self.flush_at;
             let ev = tokio::select! {
                 cmd = self.rx.recv() => Ev::Cmd(cmd),
                 msg = ws.next() => Ev::Ws(msg),
                 _ = tick.tick() => Ev::Tick,
                 _ = tokio::time::sleep_until(next_retry.unwrap_or_else(Instant::now)), if next_retry.is_some() => Ev::Resubscribe,
+                _ = tokio::time::sleep_until(flush_at.unwrap_or_else(Instant::now)), if flush_at.is_some() => Ev::Flush,
             };
 
             match ev {
@@ -338,11 +429,12 @@ impl RelayTask {
                 Ev::Ws(None) => return Outcome::Disconnected,
                 Ev::Resubscribe => {
                     let now = Instant::now();
-                    let due: Vec<String> = self.subs.iter().filter(|(_, s)| s.retry_at.is_some_and(|t| t <= now)).map(|(id, _)| id.clone()).collect();
+                    let due: Vec<u64> = self.bins.iter().filter(|(_, b)| b.retry_at.is_some_and(|t| t <= now)).map(|(id, _)| *id).collect();
                     for id in due {
-                        self.send_sub(&id);
+                        self.send_bin(id);
                     }
                 }
+                Ev::Flush => self.flush(),
                 Ev::Tick => {
                     if last_rx.elapsed() >= DEAD_AFTER {
                         tracing::warn!(relay = %self.url, "relay silent, reconnecting");
@@ -365,7 +457,7 @@ impl RelayTask {
     }
 
     fn open_reqs(&self) -> usize {
-        self.subs.len() + self.queries.len()
+        self.wire_ids.len() + self.queries.values().filter(|q| q.sent).count()
     }
 
     fn has_work(&self) -> bool {
@@ -393,11 +485,12 @@ impl RelayTask {
     fn on_disconnect(&mut self) {
         self.conn = None;
         self.out.clear();
-        for sub in self.subs.values_mut() {
-            sub.awaiting_auth = false;
+        for bin in self.bins.values_mut() {
+            bin.awaiting_auth = false;
         }
         for q in self.queries.values_mut() {
             q.awaiting_auth = None;
+            q.sent = false;
         }
         for p in self.publishes.values_mut() {
             p.awaiting_auth = None;
@@ -428,46 +521,158 @@ impl RelayTask {
     }
 
     fn resend_all(&mut self) {
-        let subs: Vec<String> = self.subs.keys().cloned().collect();
-        for id in subs {
-            self.send_sub(&id);
+        // Settled like any change, not sent at once: the subscriptions that
+        // queued while the connection opened are read only after this, and
+        // would each cost the bin another replay.
+        for bin in self.bins.values_mut() {
+            bin.dirty = true;
         }
-        let queries: Vec<SubscriptionId> = self.queries.keys().cloned().collect();
-        for id in queries {
-            self.send_query(&id);
-        }
+        self.schedule_flush();
+        self.pump_queries();
         let publishes: Vec<EventId> = self.publishes.keys().copied().collect();
         for id in publishes {
             self.send_publish(&id);
         }
     }
 
-    fn send_sub(&mut self, sub_id: &str) {
+    /// Place a subscription in the first bin of its kind with room for it.
+    fn add_sub(&mut self, sub_id: String, filters: Vec<Filter>) {
+        let authable = self.shared.can_auth_as(&self.url, &wire::pubkeys_of(&filters));
+        let weight = filters
+            .iter()
+            .map(|f| f.authors.as_ref().map_or(1, |a| a.len().max(1)))
+            .sum::<usize>();
+        let found = self
+            .bins
+            .iter()
+            .find(|(_, b)| b.authable == authable && b.weight + weight <= BIN_AUTHORS)
+            .map(|(id, _)| *id);
+        let id = found.unwrap_or_else(|| {
+            self.next_bin += 1;
+            self.bins.insert(self.next_bin, Bin::new(authable));
+            self.next_bin
+        });
+        let bin = self.bins.get_mut(&id).expect("found or made");
+        bin.subs.insert(sub_id.clone());
+        bin.weight += weight;
+        bin.dirty = true;
+        self.subs.insert(sub_id, RelaySub { filters, bin: id, weight, live: false });
+        self.schedule_flush();
+    }
+
+    fn remove_sub(&mut self, sub_id: &str) {
+        let Some(sub) = self.subs.remove(sub_id) else {
+            return;
+        };
+        let Some(bin) = self.bins.get_mut(&sub.bin) else {
+            return;
+        };
+        bin.subs.remove(sub_id);
+        bin.weight -= sub.weight;
+        if !bin.subs.is_empty() {
+            bin.dirty = true;
+            self.schedule_flush();
+            return;
+        }
+        let bin = self.bins.remove(&sub.bin).expect("just read");
+        for (wid, _, _) in bin.wire {
+            self.wire_ids.remove(&wid);
+            self.push(ClientMessage::close(SubscriptionId::new(wid)));
+        }
+    }
+
+    fn schedule_flush(&mut self) {
+        self.flush_at.get_or_insert_with(|| Instant::now() + FLUSH_SETTLE);
+    }
+
+    /// Re-send every bin whose subscriptions changed.
+    fn flush(&mut self) {
+        self.flush_at = None;
+        let dirty: Vec<u64> = self.bins.iter().filter(|(_, b)| b.dirty).map(|(id, _)| *id).collect();
+        for id in dirty {
+            self.rebuild(id);
+        }
+    }
+
+    /// Merge a bin's subscriptions into fresh REQs, send them, then close the
+    /// ones they replace.
+    fn rebuild(&mut self, id: u64) {
+        let Some(bin) = self.bins.get(&id) else {
+            return;
+        };
+        let floor = bin
+            .newest
+            .map(|n| Timestamp::from_secs(n.as_secs().saturating_sub(SINCE_OVERLAP_SECS)));
+        let entries: Vec<(&str, &Filter, Option<Timestamp>)> = bin
+            .subs
+            .iter()
+            .filter_map(|s| Some((s.as_str(), self.subs.get(s)?)))
+            .flat_map(|(s, sub)| sub.filters.iter().map(move |f| (s, f, floor.filter(|_| sub.live))))
+            .collect();
+        let parts = wire::pack(wire::merge(entries));
+        let bin = self.bins.get_mut(&id).expect("just read");
+        bin.generation += 1;
+        bin.dirty = false;
+        let generation = bin.generation;
+        let old = std::mem::replace(
+            &mut bin.wire,
+            parts
+                .into_iter()
+                .enumerate()
+                .map(|(i, part)| {
+                    let filters = part.iter().map(|c| c.filter.clone()).collect();
+                    let subs = part.into_iter().flat_map(|c| c.subs).collect();
+                    (format!("w.{id}.{generation}.{i}"), filters, subs)
+                })
+                .collect(),
+        );
+        for (wid, _, _) in &old {
+            self.wire_ids.remove(wid);
+        }
+        for (wid, _, _) in &self.bins[&id].wire {
+            self.wire_ids.insert(wid.clone(), id);
+        }
+        self.send_bin(id);
+        for (wid, _, _) in old {
+            self.push(ClientMessage::close(SubscriptionId::new(wid)));
+        }
+    }
+
+    /// (Re-)send a bin's REQs as they stand.
+    fn send_bin(&mut self, id: u64) {
         if self.conn.is_none() {
             return;
         }
         let epoch = self.epoch();
-        let Some(sub) = self.subs.get_mut(sub_id) else {
+        let Some(bin) = self.bins.get_mut(&id) else {
             return;
         };
-        sub.sent_epoch = epoch;
-        sub.retry_at = None;
-        let filters = match sub.newest {
-            None => sub.filters.clone(),
-            Some(newest) => {
-                let floor =
-                    Timestamp::from_secs(newest.as_secs().saturating_sub(SINCE_OVERLAP_SECS));
-                sub.filters
-                    .iter()
-                    .cloned()
-                    .map(|mut f| {
-                        f.since = Some(f.since.map_or(floor, |s| s.max(floor)));
-                        f
-                    })
-                    .collect()
-            }
-        };
-        self.push(ClientMessage::req(SubscriptionId::new(sub_id), filters));
+        bin.sent_epoch = epoch;
+        bin.retry_at = None;
+        bin.awaiting_auth = false;
+        let reqs = bin
+            .wire
+            .iter()
+            .map(|(wid, filters, _)| ClientMessage::req(SubscriptionId::new(wid), filters.clone()).as_json());
+        self.out.extend(reqs);
+    }
+
+    /// Send waiting queries while there is room under [`MAX_REQS`].
+    fn pump_queries(&mut self) {
+        if self.conn.is_none() {
+            return;
+        }
+        let room = MAX_REQS.saturating_sub(self.open_reqs());
+        let waiting: Vec<SubscriptionId> = self
+            .queries
+            .iter()
+            .filter(|(_, q)| !q.sent)
+            .map(|(id, _)| id.clone())
+            .take(room)
+            .collect();
+        for id in waiting {
+            self.send_query(&id);
+        }
     }
 
     fn send_query(&mut self, id: &SubscriptionId) {
@@ -475,9 +680,15 @@ impl RelayTask {
             return;
         }
         let epoch = self.epoch();
+        let open = self.open_reqs();
         let Some(q) = self.queries.get_mut(id) else {
             return;
         };
+        // Past the cap the relay would refuse it; it waits for a slot instead.
+        if !q.sent && open >= MAX_REQS {
+            return;
+        }
+        q.sent = true;
         q.sent_epoch = epoch;
         let msg = ClientMessage::req(id.clone(), q.filters.clone());
         self.push(msg);
@@ -503,26 +714,13 @@ impl RelayTask {
     fn handle_cmd(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Subscribe { sub_id, filters } => {
-                let sub = self.subs.entry(sub_id.clone()).or_insert_with(|| RelaySub {
-                    filters: Vec::new(),
-                    newest: None,
-                    sent_epoch: 0,
-                    awaiting_auth: false,
-                    retry_at: None,
-                    refusals: 0,
-                });
-                if sub.filters != filters {
-                    sub.filters = filters;
-                    sub.newest = None;
+                if self.subs.get(&sub_id).is_some_and(|s| s.filters == filters) {
+                    return;
                 }
-                sub.awaiting_auth = false;
-                self.send_sub(&sub_id);
+                self.remove_sub(&sub_id);
+                self.add_sub(sub_id, filters);
             }
-            Cmd::Unsubscribe { sub_id } => {
-                if self.subs.remove(&sub_id).is_some() {
-                    self.push(ClientMessage::close(SubscriptionId::new(sub_id)));
-                }
-            }
+            Cmd::Unsubscribe { sub_id } => self.remove_sub(&sub_id),
             Cmd::Query { id, filters, tx } => {
                 if self.backing_off() {
                     let _ = tx.send(QueryMsg::Done);
@@ -533,6 +731,7 @@ impl RelayTask {
                     PendingQuery {
                         filters,
                         tx,
+                        sent: false,
                         sent_epoch: 0,
                         retried: false,
                         awaiting_auth: None,
@@ -541,7 +740,7 @@ impl RelayTask {
                 self.send_query(&id);
             }
             Cmd::CancelQuery { id } => {
-                if self.queries.remove(&id).is_some() {
+                if self.queries.remove(&id).is_some_and(|q| q.sent) {
                     self.push(ClientMessage::close(id));
                 }
             }
@@ -617,24 +816,42 @@ impl RelayTask {
         }
     }
 
+    /// A bin's event goes to each subscription it carries whose own filters
+    /// match: the merged filters can match more than any one of them asked.
     fn on_event(&mut self, id: &SubscriptionId, event: Event) {
-        if let Some(sub) = self.subs.get_mut(id.as_str()) {
-            if sub.newest.is_none_or(|n| event.created_at > n) {
-                sub.newest = Some(event.created_at);
+        if let Some(bin) = self.wire_ids.get(id.as_str()).and_then(|b| self.bins.get_mut(b)) {
+            if bin.newest.is_none_or(|n| event.created_at > n) {
+                bin.newest = Some(event.created_at);
             }
-            self.shared.deliver(&self.url, id.as_str(), event);
+            let Some(carried) = bin.carried(id.as_str()) else {
+                return;
+            };
+            let opts = MatchEventOptions::default();
+            for sub_id in carried {
+                if let Some(sub) = self.subs.get(sub_id)
+                    && sub.filters.iter().any(|f| f.match_event(&event, opts))
+                {
+                    self.shared.deliver(&self.url, sub_id, event.clone());
+                }
+            }
         } else if let Some(q) = self.queries.get(id) {
             let _ = q.tx.send(QueryMsg::Event(Box::new(event)));
         }
     }
 
     fn on_eose(&mut self, id: &SubscriptionId) {
-        if let Some(sub) = self.subs.get_mut(id.as_str()) {
-            sub.refusals = 0;
-            self.shared.emit(crate::PoolEvent::Eose {
-                relay: self.url.clone(),
-                sub_id: id.to_string(),
-            });
+        if let Some(bin) = self.wire_ids.get(id.as_str()).and_then(|b| self.bins.get_mut(b)) {
+            bin.refusals = 0;
+            let carried = bin.carried(id.as_str()).cloned().unwrap_or_default();
+            for sub_id in carried {
+                if let Some(sub) = self.subs.get_mut(&sub_id) {
+                    sub.live = true;
+                    self.shared.emit(crate::PoolEvent::Eose {
+                        relay: self.url.clone(),
+                        sub_id,
+                    });
+                }
+            }
         } else if let Some(q) = self.queries.remove(id) {
             let _ = q.tx.send(QueryMsg::Eose);
             self.push(ClientMessage::close(id.clone()));
@@ -643,7 +860,9 @@ impl RelayTask {
 
     fn on_closed(&mut self, id: &SubscriptionId, reason: &str) {
         let auth = is_auth_required(reason);
-        if let Some(sub) = self.subs.get_mut(id.as_str()) {
+        if let Some(&bin_id) = self.wire_ids.get(id.as_str())
+            && let Some(sub) = self.bins.get_mut(&bin_id)
+        {
             if auth {
                 tracing::debug!(relay = %self.url, sub = %id, %reason, "subscription needs auth");
                 sub.awaiting_auth = true;
@@ -661,9 +880,12 @@ impl RelayTask {
                 tracing::warn!(relay = %self.url, sub = %id, %reason, retry_in_s = delay.as_secs(), "subscription closed by relay; will re-send");
                 return;
             } else {
+                // Its subscriptions stay assigned and go out again with the
+                // bin's next change; asking again now would hear the same.
                 tracing::warn!(relay = %self.url, sub = %id, %reason, "subscription closed by relay");
                 self.shared.stat(&self.url, |s| s.closed += 1);
-                self.subs.remove(id.as_str());
+                sub.wire.retain(|(wid, _, _)| wid != id.as_str());
+                self.wire_ids.remove(id.as_str());
                 return;
             }
         } else if let Some(q) = self.queries.get_mut(id) {
@@ -687,6 +909,7 @@ impl RelayTask {
         if let Some(conn) = &mut self.conn
             && let Some(pk) = conn.pending.remove(&id)
         {
+            conn.in_flight.remove(&pk);
             if status {
                 tracing::debug!(relay = %self.url, pubkey = %pk, "authenticated");
                 conn.acked.insert(pk);
@@ -741,18 +964,15 @@ impl RelayTask {
         let Some(challenge) = self.conn.as_ref().and_then(|c| c.challenge.clone()) else {
             return;
         };
-        let keys = self.shared.keys_for(&self.url);
         let Some(conn) = &mut self.conn else {
             return;
         };
-        let mut sent = HashSet::new();
+        let keys = self.shared.keys_for(&self.url, |pk| {
+            conn.acked.contains(pk) || conn.rejected.contains(pk) || conn.in_flight.contains(pk)
+        });
         for keys in keys {
             let pk = keys.public_key();
-            if conn.acked.contains(&pk)
-                || conn.rejected.contains(&pk)
-                || conn.pending.values().any(|p| *p == pk)
-                || !sent.insert(pk)
-            {
+            if !conn.in_flight.insert(pk) {
                 continue;
             }
             let event = EventBuilder::new(Kind::Authentication, "")
@@ -783,17 +1003,14 @@ impl RelayTask {
         }
         let epoch = conn.epoch;
 
-        let subs: Vec<String> = self
-            .subs
-            .iter_mut()
-            .filter(|(_, s)| s.awaiting_auth && s.sent_epoch < epoch)
-            .map(|(id, s)| {
-                s.awaiting_auth = false;
-                id.clone()
-            })
+        let bins: Vec<u64> = self
+            .bins
+            .iter()
+            .filter(|(_, b)| b.awaiting_auth && b.sent_epoch < epoch)
+            .map(|(id, _)| *id)
             .collect();
-        for id in subs {
-            self.send_sub(&id);
+        for id in bins {
+            self.send_bin(id);
         }
 
         let mut retry = Vec::new();

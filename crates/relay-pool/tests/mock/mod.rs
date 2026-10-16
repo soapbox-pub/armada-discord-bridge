@@ -30,6 +30,7 @@ pub struct MockRelay {
     kill: watch::Sender<u64>,
     refuse: Arc<Mutex<(usize, String)>>,
     delay: Arc<Mutex<std::time::Duration>>,
+    open: Arc<Mutex<usize>>,
 }
 
 impl MockRelay {
@@ -42,6 +43,7 @@ impl MockRelay {
         let (kill, _) = watch::channel(0);
         let refuse = Arc::new(Mutex::new((0, String::new())));
         let delay = Arc::new(Mutex::new(std::time::Duration::ZERO));
+        let open = Arc::new(Mutex::new(0));
         let relay = MockRelay {
             url: url.clone(),
             log: log.clone(),
@@ -50,6 +52,7 @@ impl MockRelay {
             kill: kill.clone(),
             refuse: refuse.clone(),
             delay: delay.clone(),
+            open: open.clone(),
         };
         tokio::spawn(async move {
             loop {
@@ -66,6 +69,7 @@ impl MockRelay {
                     live_tx: live.clone(),
                     refuse: refuse.clone(),
                     delay: delay.clone(),
+                    open: open.clone(),
                 };
                 tokio::spawn(async move {
                     if let Ok(ws) = tokio_tungstenite::accept_async(tcp).await {
@@ -107,15 +111,22 @@ impl MockRelay {
         self.kill.send_modify(|n| *n += 1);
     }
 
-    pub fn reqs_for(&self, sub_id: &str) -> Vec<Vec<Filter>> {
+    /// Every standing REQ received. Subscriptions are merged into the pool's
+    /// own REQs, whose ids start `w.`; one-shot queries use random ids.
+    pub fn standing_reqs(&self) -> Vec<Vec<Filter>> {
         self.log
             .lock()
             .unwrap()
             .reqs
             .iter()
-            .filter(|(id, _)| id == sub_id)
+            .filter(|(id, _)| id.starts_with("w."))
             .map(|(_, f)| f.clone())
             .collect()
+    }
+
+    /// Standing REQs open now, on every connection.
+    pub fn open_standing(&self) -> usize {
+        *self.open.lock().unwrap()
     }
 
     pub fn authed(&self) -> Vec<PublicKey> {
@@ -137,6 +148,11 @@ struct Ctx {
     kill: watch::Receiver<u64>,
     refuse: Arc<Mutex<(usize, String)>>,
     delay: Arc<Mutex<std::time::Duration>>,
+    open: Arc<Mutex<usize>>,
+}
+
+fn standing(id: &str) -> bool {
+    id.starts_with("w.")
 }
 
 fn matches(filters: &[Filter], event: &Event) -> bool {
@@ -211,7 +227,9 @@ impl Ctx {
                                 })
                             };
                             if let Some(reason) = refusal {
-                                subs.remove(&id);
+                                if subs.remove(&id).is_some() && standing(&id) {
+                                    *self.open.lock().unwrap() -= 1;
+                                }
                                 send(RelayMessage::closed(SubscriptionId::new(&id), &reason));
                                 continue;
                             }
@@ -220,7 +238,9 @@ impl Ctx {
                                     f.authors.as_ref().is_none_or(|a| a.iter().all(|pk| authed.contains(pk)))
                                 });
                                 if !all_authed {
-                                    subs.remove(&id);
+                                    if subs.remove(&id).is_some() && standing(&id) {
+                                        *self.open.lock().unwrap() -= 1;
+                                    }
                                     send(RelayMessage::closed(
                                         SubscriptionId::new(&id),
                                         "auth-required: all authors must be authenticated",
@@ -237,10 +257,14 @@ impl Ctx {
                                 send(RelayMessage::event(SubscriptionId::new(&id), ev));
                             }
                             send(RelayMessage::eose(SubscriptionId::new(&id)));
-                            subs.insert(id, filters);
+                            if subs.insert(id.clone(), filters).is_none() && standing(&id) {
+                                *self.open.lock().unwrap() += 1;
+                            }
                         }
                         ClientMessage::Close(id) => {
-                            subs.remove(id.as_str());
+                            if subs.remove(id.as_str()).is_some() && standing(id.as_str()) {
+                                *self.open.lock().unwrap() -= 1;
+                            }
                         }
                         ClientMessage::Event(event) => {
                             let event = event.into_owned();
@@ -259,6 +283,7 @@ impl Ctx {
                 }
             }
         }
+        *self.open.lock().unwrap() -= subs.keys().filter(|id| standing(id)).count();
         writer.abort();
     }
 }

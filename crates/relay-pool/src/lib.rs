@@ -18,6 +18,7 @@
 
 mod relay;
 mod url;
+mod wire;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -173,17 +174,27 @@ impl Shared {
         }
     }
 
-    /// The main key plus every registered key whose scope includes `relay`.
-    pub(crate) fn keys_for(&self, relay: &str) -> Vec<Keys> {
+    /// The main key plus every registered key whose scope includes `relay`,
+    /// skipping those `skip` says this connection is already done with.
+    ///
+    /// One pool now holds every community's keys, thousands of them, and this
+    /// runs on every registration: cloning them all to discard the ones
+    /// already sent made a boot quadratic in keys.
+    pub(crate) fn keys_for(&self, relay: &str, skip: impl Fn(&PublicKey) -> bool) -> Vec<Keys> {
         let st = self.lock();
-        let mut keys = vec![self.main_keys.clone()];
-        keys.extend(
-            st.auth_keys
-                .values()
-                .filter(|k| k.relays.contains(relay))
-                .map(|k| k.keys.clone()),
-        );
-        keys
+        std::iter::once(&self.main_keys)
+            .chain(st.auth_keys.values().filter(|k| k.relays.contains(relay)).map(|k| &k.keys))
+            .filter(|k| !skip(&k.public_key()))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether this pool can AUTH as every one of `pubkeys` on `relay`.
+    pub(crate) fn can_auth_as(&self, relay: &str, pubkeys: &BTreeSet<PublicKey>) -> bool {
+        let st = self.lock();
+        pubkeys
+            .iter()
+            .all(|pk| *pk == self.main_keys.public_key() || st.auth_keys.get(pk).is_some_and(|k| k.relays.contains(relay)))
     }
 
     pub(crate) fn stat(&self, relay: &str, f: impl FnOnce(&mut RelayStats)) {
@@ -305,10 +316,13 @@ impl Pool {
     }
 
     /// Persistent subscription; replaces one with the same id. Connects to
-    /// relays lazily. On reconnect, re-REQ with each filter's `since` raised to
-    /// (newest created_at seen on that relay for that sub) - 60s, never lowered
-    /// below the original since. Each event id is delivered at most once per
-    /// sub_id (bounded to the most recent 50k ids per subscription).
+    /// relays lazily. Subscriptions do not get a REQ each: every relay task
+    /// merges them into a few (see `wire.rs` and `relay.rs`), and routes what
+    /// arrives by each subscription's own filters. A re-sent REQ starts each
+    /// subscription whose stored events are in from (newest created_at seen on
+    /// that REQ) - 60s, never below its own since. Each event id is delivered
+    /// at most once per sub_id (bounded to the most recent 50k ids per
+    /// subscription).
     pub fn subscribe(&self, sub_id: &str, relays: &[String], filters: Vec<Filter>) {
         let relays = normalize_all(relays);
         let shared = self.shared();
