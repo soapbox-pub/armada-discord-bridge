@@ -107,6 +107,11 @@ pub trait DiscordEvents: Send + Sync + 'static {
     async fn on_reaction_add(&self, _r: DiscordReaction) {}
     async fn on_reaction_remove(&self, _r: DiscordReaction) {}
     async fn on_typing(&self, _t: TypingEvent) {}
+    /// A server's GUILD_CREATE arrived: on connect for every server the bot
+    /// is in, and when it is added to one.
+    async fn on_guild_available(&self, _guild_id: String) {}
+    /// The bot left a server or was removed from it (not an outage).
+    async fn on_guild_removed(&self, _guild_id: String) {}
 }
 
 fn intents() -> Intents {
@@ -117,9 +122,11 @@ fn intents() -> Intents {
         | Intents::MESSAGE_CONTENT
 }
 
-/// Only these are deserialized; everything else the intents deliver (guild
-/// creates with full channel and member lists, above all) is skipped as raw
-/// text, which is most of what keeps the gateway's footprint flat.
+/// Only these are deserialized; everything else the intents deliver is skipped
+/// as raw text. Guild creates are the large ones (full channel, role and
+/// emoji lists) and are wanted for the [`Directory`]: one per server on
+/// connect, kept only as names and newest message ids, then dropped. With
+/// them the portal's resident memory stayed at ~385MB (2026-10-16).
 fn wanted_events() -> EventTypeFlags {
     EventTypeFlags::READY
         | EventTypeFlags::MESSAGE_CREATE
@@ -735,6 +742,16 @@ fn dispatch(adapter: &Arc<DiscordAdapter>, event: Event) {
     update_directory(adapter, &event);
     let events = adapter.events.clone();
     match event {
+        Event::GuildCreate(created) => {
+            if let GuildCreate::Available(guild) = *created {
+                let guild_id = guild.id.to_string();
+                tokio::spawn(async move { events.on_guild_available(guild_id).await });
+            }
+        }
+        Event::GuildDelete(deleted) if deleted.unavailable != Some(true) => {
+            let guild_id = deleted.id.to_string();
+            tokio::spawn(async move { events.on_guild_removed(guild_id).await });
+        }
         Event::MessageCreate(created) => {
             let message = created.0;
             // Guild-scoped bot commands the host intercepts BEFORE any router
