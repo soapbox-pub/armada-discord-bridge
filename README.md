@@ -27,7 +27,9 @@ never bridged without its community's consent.
 - **Live control-plane folds** — role and ban changes on the Armada side take
   effect without a restart, and stream-key rotation re-subscribes.
 - **Catch-up backfill** after downtime, from a per-channel cursor.
-- **The portal** (`crates/portal`): Discord OAuth, a setup wizard, the
+- **The portal** (`crates/portal`): Discord OAuth, one "bridge a server" flow
+  built around a channel map (pair channels, create missing ones on either
+  side, copy history either way), approval by an Armada admin's signature or an
   in-channel confirmation, and a dashboard to pause, resume, and unlink.
 - **Server import**: mint a whole Armada community from a Discord server —
   channels, roles, and grants, with genesis signed by the owner's own key in

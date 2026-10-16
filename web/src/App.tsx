@@ -1,5 +1,5 @@
 import { ArrowLeft } from "lucide-react";
-import { Link, Route, Routes } from "react-router-dom";
+import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
 
 import { AppShell } from "@/components/AppShell";
 import { Crest } from "@/components/brand/marks";
@@ -9,7 +9,7 @@ import { Dashboard } from "@/pages/Dashboard";
 import { ImportFlow } from "@/pages/Import";
 import { ImportProgress } from "@/pages/ImportProgress";
 import { Landing } from "@/pages/Landing";
-import { NewBridge } from "@/pages/NewBridge";
+import { Connect } from "@/pages/Connect";
 import { useSession } from "@/session";
 
 /**
@@ -19,8 +19,9 @@ import { useSession } from "@/session";
  *
  *   /                 dashboard: bridges, grouped by community
  *   /bridges/:id      one bridge: status, live confirm, pause, unlink
- *   /new[/channel|/armada|/pair][?from=<bridge>]   bridge a channel
- *   /import[/review]  import a server (Armada links here)
+ *   /connect[/armada|/map|/done][?from=<bridge>]   bridge a server: the channel map
+ *   /new              the old one-channel wizard; now /connect
+ *   /import[/review][?guild=<id>]  import a server (Armada links here)
  *   /imports/:id      an import's progress and result
  */
 export function App() {
@@ -37,7 +38,8 @@ export function App() {
 
   return (
     <Routes>
-      <Route path="new/*" element={<NewBridge />} />
+      <Route path="connect/*" element={<Connect />} />
+      <Route path="new/*" element={<ToConnect />} />
       <Route path="import/*" element={<ImportFlow />} />
       <Route path="imports/:id" element={<ImportProgress />} />
       <Route element={<AppShell />}>
@@ -47,6 +49,12 @@ export function App() {
       </Route>
     </Routes>
   );
+}
+
+/** Old links into the one-channel wizard land in the channel map instead. */
+function ToConnect() {
+  const { search } = useLocation();
+  return <Navigate to={`/connect${search}`} replace />;
 }
 
 function NotFound() {

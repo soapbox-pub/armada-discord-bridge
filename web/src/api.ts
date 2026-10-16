@@ -11,8 +11,15 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   });
   const body = (await res.json().catch(() => ({}))) as T & { error?: string };
   if (res.status === 401) window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
-  if (!res.ok) throw new Error(body.error ?? `${res.status} ${res.statusText}`);
+  if (!res.ok) throw new ApiError(body.error ?? `${res.status} ${res.statusText}`, res.status, body);
   return body;
+}
+
+/** A refused request, with the whole body for errors that carry more than a message. */
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number, readonly body: unknown) {
+    super(message);
+  }
 }
 
 export interface Guild {

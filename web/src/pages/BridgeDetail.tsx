@@ -177,7 +177,7 @@ function BridgeView({ bridge: b, reload }: { bridge: BridgeSummary; reload: () =
           )}
           {b.community_id && b.discord_guild_id && (
             <Button asChild variant="secondary" className="clip-corner-lg">
-              <Link to={`/new?from=${b.bridge_id}`}><Plus /> Bridge another channel</Link>
+              <Link to={`/connect?from=${b.bridge_id}`}><Plus /> Manage channels</Link>
             </Button>
           )}
           {b.community_id && (

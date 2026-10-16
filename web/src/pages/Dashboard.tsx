@@ -1,4 +1,4 @@
-import { ArrowLeftRight, ChevronRight, History, MoreHorizontal, Plus, ServerCog } from "lucide-react";
+import { ArrowLeftRight, ChevronRight, History, MoreHorizontal, Plus, Settings2 } from "lucide-react";
 import { Link, useNavigate } from "react-router-dom";
 
 import { api, type BridgeSummary } from "@/api";
@@ -66,14 +66,9 @@ export function Dashboard() {
           </p>
         </div>
         {total > 0 && (
-          <div className="flex gap-2">
-            <Button asChild variant="secondary" className="clip-corner-lg">
-              <Link to="/import"><ServerCog /> Import a server</Link>
-            </Button>
-            <Button asChild className="clip-corner-lg">
-              <Link to="/new"><Plus /> New bridge</Link>
-            </Button>
-          </div>
+          <Button asChild className="clip-corner-lg">
+            <Link to="/connect"><Plus /> Bridge a server</Link>
+          </Button>
         )}
       </div>
 
@@ -94,20 +89,13 @@ export function Dashboard() {
 
 function EmptyState() {
   return (
-    <div className="grid gap-3 sm:grid-cols-2">
+    <div className="grid gap-3">
       <StartCard
-        to="/new"
+        to="/connect"
         icon={<ArrowLeftRight className="size-5" />}
-        title="bridge a channel"
-        body="Pair one Discord channel with a channel in an Armada community you're already in. Messages flow both ways."
-        cta="New bridge"
-      />
-      <StartCard
-        to="/import"
-        icon={<DiscordMark className="size-5" />}
-        title="import a server"
-        body="Turn a whole Discord server into a new Armada community you own: channels, roles, emoji and history."
-        cta="Import a server"
+        title="bridge a server"
+        body="Connect a Discord server with an Armada community, whichever side you're starting from: copy one into a new community, fill an empty side from the other, or pair two that already exist. You choose channel by channel, history included."
+        cta="Bridge a server"
       />
     </div>
   );
@@ -159,9 +147,9 @@ function CommunityCard({ community }: { community: Community }) {
               variant="ghost"
               size="sm"
               className="text-muted-foreground hover:text-foreground"
-              onClick={() => navigate(`/new?from=${community.source!.bridge_id}`)}
+              onClick={() => navigate(`/connect?from=${community.source!.bridge_id}`)}
             >
-              <Plus /> <span className="hidden sm:inline">Add channel</span>
+              <Settings2 /> <span className="hidden sm:inline">Manage channels</span>
             </Button>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>

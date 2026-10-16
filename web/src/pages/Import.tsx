@@ -1,6 +1,6 @@
 import { AlertTriangle, Check, ExternalLink, Hash, Loader2, Lock, Plus, RefreshCw, ShieldAlert, Volume2, X } from "lucide-react";
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { Navigate, Route, Routes, useNavigate, useSearchParams } from "react-router-dom";
 import type { NostrEvent } from "nostr-tools/pure";
 
 import { api } from "@/api";
@@ -99,6 +99,13 @@ function ServerStep() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [installUrl, setInstallUrl] = useState("");
+  const [params] = useSearchParams();
+  const preselected = params.get("guild");
+
+  // Arriving from "bridge a server" with the server already chosen.
+  useEffect(() => {
+    if (preselected && guilds.some((g) => g.id === preselected)) update({ guildId: preselected });
+  }, [preselected, guilds, update]);
 
   async function preview() {
     if (!draft.guildId) return;

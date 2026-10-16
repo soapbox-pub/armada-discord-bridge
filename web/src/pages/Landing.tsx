@@ -171,10 +171,14 @@ function Faq() {
         <AccordionContent>
           <ol className="list-decimal space-y-1 pl-5 marker:font-mono marker:text-primary">
             <li>Sign in with Discord.</li>
-            <li>Pick a server and a channel you manage, and add the bridge bot if it isn't there yet.</li>
-            <li>Paste an Armada invite link and pick the channel to pair it with.</li>
+            <li>Pick a Discord server you manage, and add the bridge bot if it isn't there yet.</li>
+            <li>Pick the Armada side: a new community copied from the server, or an existing one.</li>
             <li>
-              An Armada moderator runs <code className="font-mono text-foreground">/bridge confirm</code> in that channel.
+              Map the channels: pair them, create what's missing on either side, and choose which way history is copied.
+            </li>
+            <li>
+              Approve with an Armada key that holds Manage Channels, or have a moderator run{" "}
+              <code className="font-mono text-foreground">/bridge confirm</code> in any of the channels.
             </li>
           </ol>
         </AccordionContent>
@@ -191,7 +195,8 @@ function Faq() {
         <AccordionTrigger>Who can set one up?</AccordionTrigger>
         <AccordionContent>
           You need Manage Server on the Discord side. On the Armada side, a member with Manage
-          Channels has to confirm in the channel. Both communities agree before anything is mirrored.
+          Channels approves, either by signing in the portal or by confirming in the channel. Both
+          communities agree before anything is mirrored.
         </AccordionContent>
       </AccordionItem>
       <AccordionItem value="e2ee">
