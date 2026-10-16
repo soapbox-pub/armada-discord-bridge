@@ -8,7 +8,7 @@
 //! portal cannot bypass it.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -35,7 +35,7 @@ use regex::Regex;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
-use crate::catchup::{CatchUpIo, replay_discord_since};
+use crate::catchup::{CatchUpIo, catch_up_needed, replay_discord_since};
 use crate::discord_rest::{DiscordRest, RestMessage, rest_to_inbound};
 use crate::env::PortalEnv;
 use crate::relay_guard::filter_public_relays;
@@ -129,6 +129,33 @@ const STAGE_DB: Duration = Duration::from_secs(30);
 const STAGE_NAMES: Duration = Duration::from_secs(15);
 /// Backstop over a whole start, past the sum of its stages.
 const START_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+/// How long a boot waits for the gateway to describe every server before
+/// starting bridges anyway; what is missing falls back to REST.
+const DIRECTORY_WAIT: Duration = Duration::from_secs(30);
+
+/// Where a boot's Discord facts came from: the gateway's directory, or REST.
+/// Reported and reset with each `start_all`, so a boot's REST cost is visible.
+#[derive(Default)]
+struct DiscordCalls {
+    names_known: AtomicUsize,
+    names_fetched: AtomicUsize,
+    catch_ups_skipped: AtomicUsize,
+    catch_ups_fetched: AtomicUsize,
+}
+
+impl DiscordCalls {
+    fn take(&self) -> String {
+        let n = |a: &AtomicUsize| a.swap(0, Ordering::Relaxed);
+        format!(
+            "names: {} from the gateway, {} via REST; Discord catch-up: {} skipped, {} fetched",
+            n(&self.names_known),
+            n(&self.names_fetched),
+            n(&self.catch_ups_skipped),
+            n(&self.catch_ups_fetched)
+        )
+    }
+}
 
 /// How long a community that failed to open fails its bridges' starts without
 /// trying again. Its bridges are queued together at boot, and each one
@@ -261,6 +288,7 @@ pub struct BridgeManager {
     /// Set once boot's `start_all` has run, so a LATE gateway connect knows to
     /// bring deferred bridges up rather than double-start them.
     booted: AtomicBool,
+    discord_calls: DiscordCalls,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -282,6 +310,7 @@ impl BridgeManager {
             by_discord_channel: Mutex::default(),
             start_retries: Mutex::default(),
             booted: AtomicBool::new(false),
+            discord_calls: DiscordCalls::default(),
         })
     }
 
@@ -345,8 +374,11 @@ impl BridgeManager {
             let events = Arc::new(ManagerEvents(self.me.clone()));
             match DiscordAdapter::connect(&self.env.discord_bot_token, events).await {
                 Ok(adapter) => {
-                    *self.adapter.write().unwrap_or_else(|e| e.into_inner()) = Some(adapter);
                     tracing::info!("discord gateway up");
+                    // Before any bridge starts, so their names and catch-up
+                    // checks read the directory rather than REST.
+                    adapter.wait_for_directory(DIRECTORY_WAIT).await;
+                    *self.adapter.write().unwrap_or_else(|e| e.into_inner()) = Some(adapter);
                     if self.booted.load(Ordering::SeqCst) {
                         let me = self.arc();
                         tokio::spawn(async move { me.on_adapter_connected().await });
@@ -403,7 +435,7 @@ impl BridgeManager {
         });
         futures_util::future::join_all(workers).await;
         let live = ids.iter().filter(|id| self.is_live(id)).count();
-        tracing::info!("{live}/{total} bridges live in {}s", began.elapsed().as_secs());
+        tracing::info!("{live}/{total} bridges live in {}s; {}", began.elapsed().as_secs(), self.discord_calls.take());
     }
 
     fn active_router_for(&self, discord_channel_id: &str) -> Option<(Arc<Running>, Arc<BridgeRouter>)> {
@@ -625,11 +657,30 @@ impl BridgeManager {
         let adapter = self.adapter();
         let (discord_name, guild_name) = match &adapter {
             Some(a) => {
-                // Cosmetic, so bounded and best-effort: a lookup queued behind
+                let calls = &self.discord_calls;
+                let known = |name: Option<String>| {
+                    let counter = if name.is_some() { &calls.names_known } else { &calls.names_fetched };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    name
+                };
+                // The gateway's directory first. REST is the fallback, and
+                // cosmetic, so bounded and best-effort: a lookup queued behind
                 // Discord's ratelimiter has no deadline of its own, and once
                 // held a boot worker, and every bridge queued behind it, forever.
-                let channel_name = async { tokio::time::timeout(STAGE_NAMES, a.channel_name(row.discord_channel_id.as_deref()?)).await.ok()?.ok() };
-                let guild_name = async { tokio::time::timeout(STAGE_NAMES, a.guild_name(row.discord_guild_id.as_deref()?)).await.ok()?.ok() };
+                let channel_name = async {
+                    let id = row.discord_channel_id.as_deref()?;
+                    match known(a.known_channel_name(id)) {
+                        Some(name) => Some(name),
+                        None => tokio::time::timeout(STAGE_NAMES, a.channel_name(id)).await.ok()?.ok(),
+                    }
+                };
+                let guild_name = async {
+                    let id = row.discord_guild_id.as_deref()?;
+                    match known(a.known_guild_name(id)) {
+                        Some(name) => Some(name),
+                        None => tokio::time::timeout(STAGE_NAMES, a.guild_name(id)).await.ok()?.ok(),
+                    }
+                };
                 tokio::join!(channel_name, guild_name)
             }
             None => (None, None),
@@ -860,6 +911,12 @@ impl BridgeManager {
             .get(0);
         drop(db);
         let Some(anchor) = anchor else { return Ok(()) };
+        let last_known = self.adapter().and_then(|a| a.last_message_id(&rb.link.discord_channel_id));
+        if !catch_up_needed(&anchor, last_known) {
+            self.discord_calls.catch_ups_skipped.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        self.discord_calls.catch_ups_fetched.fetch_add(1, Ordering::Relaxed);
         let io = CatchUp { manager: self, rb };
         let result = replay_discord_since(&anchor, live_from_ms as i64, DISCORD_CATCHUP_MAX, &io).await;
         if result.mirrored > 0 {

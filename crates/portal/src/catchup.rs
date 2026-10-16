@@ -27,6 +27,18 @@ pub struct CatchUpResult {
 
 const PAGE_SIZE: usize = 100;
 
+/// Whether a channel can have said anything after `anchor_id`, given the
+/// newest message id the gateway reports for it. Unknown means yes: only a
+/// known newest id at or before the anchor proves there is nothing to replay.
+/// That proof holds because the gateway raises the id on every message in
+/// every channel, bridged yet or not, from the moment it connects.
+pub fn catch_up_needed(anchor_id: &str, last_known: Option<u64>) -> bool {
+    match (anchor_id.parse::<u64>(), last_known) {
+        (Ok(anchor), Some(last)) => last > anchor,
+        _ => true,
+    }
+}
+
 fn snowflake(id: &str) -> u64 {
     id.parse().unwrap_or(0)
 }
@@ -165,6 +177,15 @@ mod tests {
             self.published.lock().unwrap().push(message.id.clone());
             !self.unpublishable.contains(&message.id)
         }
+    }
+
+    #[test]
+    fn catch_up_is_skipped_only_on_proof_of_nothing_new() {
+        assert!(!catch_up_needed("100", Some(100)));
+        assert!(!catch_up_needed("100", Some(90)));
+        assert!(catch_up_needed("100", Some(101)));
+        assert!(catch_up_needed("100", None));
+        assert!(catch_up_needed("not a snowflake", Some(1)));
     }
 
     #[tokio::test]
