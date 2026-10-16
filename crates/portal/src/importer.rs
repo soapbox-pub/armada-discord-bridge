@@ -1146,11 +1146,16 @@ impl Importer {
             // Scoped to this community: re-importing the same guild elsewhere
             // left rows for the same message id, which made every history
             // message look already imported and silently skipped the backfill.
+            // `tenant_id` leads every index on messages: without it this check
+            // walked the whole primary key, ~0.5s per message (2026-10-16).
             let exists = self
                 .pool
                 .get()
                 .await?
-                .query_opt("SELECT 1 FROM messages WHERE discord_message_id = $1 AND community_id = $2 LIMIT 1", &[&message.id, &link.community_id])
+                .query_opt(
+                    "SELECT 1 FROM messages WHERE tenant_id = 'default' AND discord_message_id = $1 AND community_id = $2 LIMIT 1",
+                    &[&message.id, &link.community_id],
+                )
                 .await?
                 .is_some();
             if !exists {

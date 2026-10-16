@@ -676,6 +676,8 @@ async fn bridges_list(State(st): State<AppState>, headers: HeaderMap) -> Res {
     let session = session_or_401!(st, headers);
     // Shaped in SQL to match what the dashboard has always been sent: the
     // uuid and timestamp as strings, and the count as a decimal string.
+    // `tenant_id` leads every index on messages. Without it the count below
+    // was a sequential scan of the whole table per bridge listed (2026-10-16).
     let rows = st
         .pool
         .get()
@@ -687,7 +689,7 @@ async fn bridges_list(State(st): State<AppState>, headers: HeaderMap) -> Res {
                       b.discord_channel_name, b.concord_channel_name, b.discord_guild_name, b.primary_pk,
                       to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS created_at,
                       (SELECT count(*) FROM messages m
-                        WHERE m.discord_channel_id = b.discord_channel_id
+                        WHERE m.tenant_id = 'default' AND m.discord_channel_id = b.discord_channel_id
                           AND m.concord_channel_id = b.concord_channel_id)::text AS bridged_count
                FROM bridges b
                WHERE b.owner_discord_id = $1 AND b.status <> 'unlinked'
