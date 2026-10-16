@@ -228,6 +228,7 @@ impl RelayTask {
                 }
                 Err(e) => {
                     tracing::warn!(relay = %self.url, error = %e, "relay connection failed");
+                    self.shared.stat(&self.url, |s| s.connect_failures += 1);
                     self.down_until = Some(Instant::now() + jitter(backoff));
                     backoff = (backoff * 2).min(BACKOFF_MAX);
                     self.fail_pending(&format!("connection failed: {e}"));
@@ -296,6 +297,11 @@ impl RelayTask {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
+            // Anything that changes what is open on the wire sends something.
+            if !self.out.is_empty() {
+                let reqs = self.open_reqs();
+                self.shared.stat(&self.url, |s| s.reqs = reqs);
+            }
             for msg in std::mem::take(&mut self.out) {
                 if let Err(e) = ws.send(Message::Text(msg.into())).await {
                     tracing::debug!(relay = %self.url, error = %e, "send failed");
@@ -356,6 +362,10 @@ impl RelayTask {
                 }
             }
         }
+    }
+
+    fn open_reqs(&self) -> usize {
+        self.subs.len() + self.queries.len()
     }
 
     fn has_work(&self) -> bool {
@@ -647,10 +657,12 @@ impl RelayTask {
                 let delay = jitter((RESUBSCRIBE_MIN * 2u32.pow(sub.refusals.min(7))).min(RESUBSCRIBE_MAX));
                 sub.refusals += 1;
                 sub.retry_at = Some(Instant::now() + delay);
+                self.shared.stat(&self.url, |s| s.refused += 1);
                 tracing::warn!(relay = %self.url, sub = %id, %reason, retry_in_s = delay.as_secs(), "subscription closed by relay; will re-send");
                 return;
             } else {
                 tracing::warn!(relay = %self.url, sub = %id, %reason, "subscription closed by relay");
+                self.shared.stat(&self.url, |s| s.closed += 1);
                 self.subs.remove(id.as_str());
                 return;
             }
@@ -682,6 +694,7 @@ impl RelayTask {
             } else {
                 tracing::warn!(relay = %self.url, pubkey = %pk, %reason, "AUTH rejected");
                 conn.rejected.insert(pk);
+                self.shared.stat(&self.url, |s| s.auth_rejected += 1);
             }
             self.check_awaiting();
             return;

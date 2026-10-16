@@ -252,6 +252,9 @@ async fn rate_limited_subscription_is_resent() {
     // The re-sent REQ is answered with EOSE like any other.
     assert!(matches!(next_sub_event(&mut rx, "s").await, PoolEvent::Eose { .. }));
     assert_eq!(relay.reqs_for("s").len(), 2);
+    let stats = pool.stats()[&relay.url].clone();
+    assert_eq!((stats.refused, stats.closed, stats.connects), (1, 0, 1), "{stats:?}");
+    assert!(stats.connected);
     let keys = Keys::generate();
     relay.inject(note(&keys, 1, "after the limiter", 1_700_000_000));
     match next_sub_event(&mut rx, "s").await {

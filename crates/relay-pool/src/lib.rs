@@ -19,7 +19,7 @@
 mod relay;
 mod url;
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -66,6 +66,23 @@ pub struct PublishResult {
     pub rejected: Vec<(String, String)>,
 }
 
+/// What one relay has done since the pool was made: enough to tell a relay
+/// pushing back from one that is down, without reading the log.
+#[derive(Debug, Clone, Default)]
+pub struct RelayStats {
+    pub connected: bool,
+    pub connects: u64,
+    pub connect_failures: u64,
+    /// Subscriptions the relay closed for a transient reason (a rate limiter,
+    /// a full connection), each re-sent later.
+    pub refused: u64,
+    /// Subscriptions the relay closed for good.
+    pub closed: u64,
+    pub auth_rejected: u64,
+    /// REQs open on the connection now, standing and one-shot.
+    pub reqs: usize,
+}
+
 /// A pool of relay connections. Cheap to clone; all clones share the same
 /// connections. Connections are torn down when the last clone is dropped.
 #[derive(Clone)]
@@ -96,6 +113,7 @@ pub(crate) struct State {
     subs: HashMap<String, PoolSub>,
     auth_keys: HashMap<PublicKey, AuthKey>,
     connected: BTreeSet<String>,
+    stats: BTreeMap<String, RelayStats>,
 }
 
 struct PoolSub {
@@ -168,9 +186,20 @@ impl Shared {
         keys
     }
 
+    pub(crate) fn stat(&self, relay: &str, f: impl FnOnce(&mut RelayStats)) {
+        f(self.lock().stats.entry(relay.to_string()).or_default());
+    }
+
     pub(crate) fn set_connected(&self, relay: &str, connected: bool) {
         {
             let mut st = self.lock();
+            let stats = st.stats.entry(relay.to_string()).or_default();
+            stats.connected = connected;
+            if connected {
+                stats.connects += 1;
+            } else {
+                stats.reqs = 0;
+            }
             if connected {
                 st.connected.insert(relay.to_string());
             } else {
@@ -625,5 +654,10 @@ impl Pool {
     /// Relays currently connected.
     pub fn connected(&self) -> Vec<String> {
         self.shared().lock().connected.iter().cloned().collect()
+    }
+
+    /// Per-relay counters, by normalized URL.
+    pub fn stats(&self) -> BTreeMap<String, RelayStats> {
+        self.shared().lock().stats.clone()
     }
 }
