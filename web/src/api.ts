@@ -23,6 +23,7 @@ export interface ImportPlanView {
   guild: { id: string; name: string; description?: string; iconUrl?: string };
   communityName: string;
   memberCount?: number;
+  /** Always true since history stopped being gated on server size; unread. */
   historyAllowed: boolean;
   emojis: Array<{ id: string; name: string }>;
   channels: Array<{

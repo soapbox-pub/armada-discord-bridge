@@ -274,7 +274,7 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
                   <span className="muted">bridge live</span>
                 </label>
               )}
-              {c.bridgeable && plan.historyAllowed && (
+              {c.bridgeable && (
                 <label className="consent">
                   <input
                     type="checkbox"
@@ -287,18 +287,10 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
               )}
             </div>
           ))}
-          {!plan.historyAllowed && (
-            <p className="muted">
-              Message history is not currently available for servers with more than 100
-              members{plan.memberCount ? ` (this server has ~${plan.memberCount})` : ""}.
-            </p>
-          )}
-          {plan.historyAllowed && (
-            <p className="muted">
-              History imports the newest 10,000 messages per channel with their original
-              times and authors.
-            </p>
-          )}
+          <p className="muted">
+            History imports the newest 10,000 messages per channel with their original
+            times and authors.
+          </p>
           {plan.emojis.length > 0 && (
             <p className="muted">
               {plan.emojis.length} custom emoji will be published as an Armada emoji pack.
@@ -424,7 +416,7 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
                 <td className="muted">bridges wired</td>
                 <td className="mono">{wiredCount} / {bridgeCount}</td>
               </tr>
-              {plan?.historyAllowed && plan.channels.some((c) => c.history) && (
+              {plan?.channels.some((c) => c.history) && (
                 <tr>
                   <td className="muted">history messages</td>
                   <td className="mono">
@@ -485,7 +477,7 @@ export function ImportWizard(props: { guilds: GuildOpt[]; onDone: () => void; on
               ))}
             </>
           )}
-          {plan?.historyAllowed && plan.channels.some((c) => c.selected && c.bridge && c.history) && (
+          {plan?.channels.some((c) => c.selected && c.bridge && c.history) && (
             <button className="ghost" onClick={() => void rerunHistory()}>
               Re-run history import
             </button>

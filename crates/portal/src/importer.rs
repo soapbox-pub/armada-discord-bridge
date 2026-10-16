@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use bridge::blossom::BlobPort;
 use bridge::client::now_ms;
 use bridge::markup::discord_emoji_url;
-use bridge::relays::{Hub, RelayLike};
+use bridge::relays::{Hub, PublishRejected, RelayLike};
 use bridge::router::BridgeRouter;
 use bridge::types::ChannelLink;
 use concord::community::Membership;
@@ -370,7 +370,7 @@ impl Importer {
                 channel.bridge = bridge && channel.bridgeable;
             }
             if let Some(history) = toggle.history {
-                channel.history = history && channel.bridgeable && plan.history_allowed;
+                channel.history = history && channel.bridgeable;
             }
             if !channel.selected {
                 channel.bridge = false;
@@ -1012,14 +1012,39 @@ impl Importer {
     }
 }
 
+/// Waits between attempts at one history message while relays refuse it, in
+/// multiples of `ImporterIo::publish_retry`: 1.5s doubling to 48s by default,
+/// about a minute and a half in all.
+const HISTORY_BACKOFF_STEPS: u32 = 6;
+
+/// Run `attempt` until relays stop refusing it, backing off from `base`,
+/// doubling, for `steps` waits. Any other failure returns at once: it will
+/// fail the same way however long we wait. Still refused after the last wait
+/// is an error the caller must not skip past.
+async fn with_relay_backoff<T, F, Fut>(base: Duration, steps: u32, mut attempt: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let mut step = 0;
+    loop {
+        match attempt().await {
+            Err(error) if PublishRejected::in_chain(&error) && step < steps => {
+                let wait = base * 2u32.pow(step);
+                tracing::warn!(wait_s = wait.as_secs_f32(), error = %format!("{error:#}"), "relays refusing history; backing off");
+                tokio::time::sleep(wait).await;
+                step += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 impl Importer {
     /// Backfill the newest HISTORY_MESSAGE_CAP messages of every bridged channel
     /// that opted in, oldest to newest so replies resolve, through the SAME
     /// router the live bridge uses (puppets, transforms, rehosting, mapping).
     async fn import_history(&self, import_id: &str, plan: &mut ImportPlan) -> anyhow::Result<()> {
-        if !plan.history_allowed {
-            return Ok(());
-        }
         let pending: Vec<usize> = (0..plan.channels.len())
             .filter(|&i| {
                 let c = &plan.channels[i];
@@ -1045,9 +1070,6 @@ impl Importer {
             bail!("import is {}; only a finished import can re-run history", row.status);
         }
         let mut plan = row.plan;
-        if !plan.history_allowed {
-            bail!("history is not allowed for this server");
-        }
         let mut any = false;
         for c in plan.channels.iter_mut().filter(|c| c.selected && c.bridge && c.bridgeable && c.history) {
             c.history_done_at = None;
@@ -1133,10 +1155,26 @@ impl Importer {
                 .is_some();
             if !exists {
                 let inbound = rest_to_inbound(&message, &link.discord_guild_id, &discord_id);
-                let rumor = router.on_discord_message(inbound, &link).await.unwrap_or_else(|error| {
-                    tracing::warn!(import = %import_id, message = %message.id, error = %format!("{error:#}"), "history message failed");
-                    None
-                });
+                // Paced by the relays: one message in flight, and when they
+                // refuse it (a rate limiter, an overloaded relay), the same
+                // message again after a wait, never the next one. Skipping on
+                // to a later message moved the resume cursor past the refused
+                // one, so a rate-limited stretch of a large server's history
+                // was lost for good. Before 2026-10-16 only servers of up to
+                // 100 members were offered history, and imports were small.
+                let sent = with_relay_backoff(self.io.publish_retry, HISTORY_BACKOFF_STEPS, || router.on_discord_message(inbound.clone(), &link)).await;
+                let rumor = match sent {
+                    Ok(rumor) => rumor,
+                    Err(error) if PublishRejected::in_chain(&error) => {
+                        // The cursor stays at the last message that landed.
+                        self.save_plan(import_id, plan).await?;
+                        return Err(error.context(format!("relays kept refusing #{name}'s history; re-run history to resume")));
+                    }
+                    Err(error) => {
+                        tracing::warn!(import = %import_id, message = %message.id, error = %format!("{error:#}"), "history message failed");
+                        None
+                    }
+                };
                 if rumor.is_none() {
                     // A skip, not a success: do NOT count it or advance the
                     // cursor past it, or a resume never retries it — that was
@@ -1496,6 +1534,45 @@ mod tests {
         db.execute("DELETE FROM bridges WHERE discord_guild_id = $1", &[&guild_id]).await.unwrap();
         db.execute("DELETE FROM imports WHERE discord_guild_id = $1", &[&guild_id]).await.unwrap();
         db.execute("DELETE FROM guild_community_secrets WHERE discord_guild_id = $1", &[&guild_id]).await.unwrap();
+    }
+
+    fn refused() -> anyhow::Error {
+        PublishRejected { id: EventId::from_byte_array([0; 32]), tried: 1, why: "rate-limited".into() }.into()
+    }
+
+    #[tokio::test]
+    async fn waits_out_relays_refusing_and_tries_the_same_message_again() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let result = with_relay_backoff(Duration::from_millis(1), 6, || async {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 2 { Err(refused().context("router send")) } else { Ok(n) }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_wait_on_a_failure_that_will_repeat() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let result: anyhow::Result<()> = with_relay_backoff(Duration::from_secs(60), 6, || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            bail!("unconvertible message")
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn gives_up_refused_after_the_last_wait_and_says_so() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let result: anyhow::Result<()> = with_relay_backoff(Duration::from_millis(1), 3, || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(refused())
+        })
+        .await;
+        assert!(PublishRejected::in_chain(&result.unwrap_err()));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
     #[test]

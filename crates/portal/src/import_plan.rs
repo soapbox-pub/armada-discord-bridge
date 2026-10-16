@@ -312,8 +312,7 @@ pub struct ImportCheckpoints {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-/// History import gates.
-pub const HISTORY_MEMBER_CAP: u64 = 100;
+/// Newest messages a history import reads per channel.
 pub const HISTORY_MESSAGE_CAP: u64 = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,10 +342,13 @@ pub struct ImportPlan {
     pub guild: PlannedGuild,
     /// Community name (defaults to the guild name, 64-byte capped).
     pub community_name: String,
-    /// approximate_member_count at snapshot time; gates history import.
+    /// approximate_member_count at snapshot time (shown, not enforced).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub member_count: Option<u64>,
-    /// False for servers above HISTORY_MEMBER_CAP members.
+    /// Always true for a plan built since 2026-10-16. History was offered only
+    /// to servers of at most 100 members; nothing technical required that, so
+    /// the gate went. Kept so stored plans and older clients still parse, and
+    /// no longer read.
     #[serde(default)]
     pub history_allowed: bool,
     /// Guild custom emoji, published as a kind 30030 pack.
@@ -617,19 +619,10 @@ pub fn build_import_plan(snapshot: &GuildSnapshot) -> ImportPlan {
     let roles = plan_roles(snapshot, &mut skipped);
 
     let member_count = snapshot.guild.approximate_member_count;
-    let history_allowed = member_count.is_some_and(|n| n <= HISTORY_MEMBER_CAP);
-    if history_allowed {
-        // Follows the bridge default, so a private channel doesn't arrive with
-        // history pre-ticked under an unticked bridge it depends on.
-        for channel in channels.iter_mut().filter(|c| c.bridgeable && c.bridge) {
-            channel.history = true;
-        }
-    } else {
-        skipped.push(SkippedItem::new(
-            SkippedKind::Feature,
-            "Message history",
-            format!("not currently available for servers with more than {HISTORY_MEMBER_CAP} members"),
-        ));
+    // Follows the bridge default, so a private channel doesn't arrive with
+    // history pre-ticked under an unticked bridge it depends on.
+    for channel in channels.iter_mut().filter(|c| c.bridgeable && c.bridge) {
+        channel.history = true;
     }
 
     let emojis = snapshot
@@ -675,7 +668,7 @@ pub fn build_import_plan(snapshot: &GuildSnapshot) -> ImportPlan {
         },
         community_name: cap_name(&guild.name),
         member_count,
-        history_allowed,
+        history_allowed: true,
         emojis,
         channels,
         roles,
@@ -873,12 +866,14 @@ mod tests {
         let plan = build_import_plan(&snapshot(vec![], vec![]));
         assert_eq!(plan.community_name, "Test Fleet");
         assert!(plan.guild.icon_url.as_deref().unwrap().contains("cdn.discordapp.com"));
-        assert!(plan.skipped.iter().any(|s| s.name == "Message history"));
         assert!(plan.skipped.iter().any(|s| s.name == "Members"));
+        // A server of unknown size is offered history like any other.
+        assert!(!plan.skipped.iter().any(|s| s.name == "Message history"));
+        assert!(plan.history_allowed);
     }
 
     #[test]
-    fn ticks_history_for_bridged_channels_under_the_member_cap() {
+    fn ticks_history_for_bridged_channels_whatever_the_server_size() {
         let mut snap = snapshot(
             vec![
                 channel("1", "general", 0),
@@ -886,7 +881,7 @@ mod tests {
             ],
             vec![],
         );
-        snap.guild.approximate_member_count = Some(HISTORY_MEMBER_CAP);
+        snap.guild.approximate_member_count = Some(250_000);
         let plan = build_import_plan(&snap);
         assert!(plan.history_allowed);
         assert_eq!(plan.channels.iter().map(|c| c.history).collect::<Vec<_>>(), [true, false]);
@@ -903,7 +898,7 @@ mod tests {
         ));
         let v = serde_json::to_value(&plan).unwrap();
         assert_eq!(v["communityName"], "Test Fleet");
-        assert_eq!(v["historyAllowed"], false);
+        assert_eq!(v["historyAllowed"], true);
         assert!(v.get("memberCount").is_none());
         assert!(v.get("adminPkHex").is_none());
         assert_eq!(v["checkpoints"], serde_json::json!({}));
