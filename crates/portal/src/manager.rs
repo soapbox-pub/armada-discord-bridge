@@ -138,6 +138,8 @@ const DIRECTORY_WAIT: Duration = Duration::from_secs(30);
 /// Reported and reset with each `start_all`, so a boot's REST cost is visible.
 #[derive(Default)]
 struct DiscordCalls {
+    /// Bridges into servers the bot is no longer in: nothing to fetch.
+    removed: AtomicUsize,
     names_known: AtomicUsize,
     names_fetched: AtomicUsize,
     catch_ups_skipped: AtomicUsize,
@@ -148,7 +150,8 @@ impl DiscordCalls {
     fn take(&self) -> String {
         let n = |a: &AtomicUsize| a.swap(0, Ordering::Relaxed);
         format!(
-            "names: {} from the gateway, {} via REST; Discord catch-up: {} skipped, {} fetched",
+            "{} in servers the bot was removed from; names: {} from the gateway, {} via REST; Discord catch-up: {} skipped, {} fetched",
+            n(&self.removed),
             n(&self.names_known),
             n(&self.names_fetched),
             n(&self.catch_ups_skipped),
@@ -655,7 +658,15 @@ impl BridgeManager {
         // None, and writing None over a correct name blanked the dashboard on
         // one rate-limited boot; keep what we knew unless Discord answered.
         let adapter = self.adapter();
+        let removed = match (&adapter, row.discord_guild_id.as_deref()) {
+            (Some(a), Some(guild)) => a.in_guild(guild) == Some(false),
+            _ => false,
+        };
+        if removed {
+            self.discord_calls.removed.fetch_add(1, Ordering::Relaxed);
+        }
         let (discord_name, guild_name) = match &adapter {
+            Some(_) if removed => (None, None),
             Some(a) => {
                 let calls = &self.discord_calls;
                 let known = |name: Option<String>| {
@@ -923,7 +934,12 @@ impl BridgeManager {
             .get(0);
         drop(db);
         let Some(anchor) = anchor else { return Ok(()) };
-        let last_known = self.adapter().and_then(|a| a.last_message_id(&rb.link.discord_channel_id));
+        let adapter = self.adapter();
+        // The bot was removed from the server: REST can only answer 403.
+        if adapter.as_ref().and_then(|a| a.in_guild(&rb.link.discord_guild_id)) == Some(false) {
+            return Ok(());
+        }
+        let last_known = adapter.and_then(|a| a.last_message_id(&rb.link.discord_channel_id));
         if !catch_up_needed(&anchor, last_known) {
             self.discord_calls.catch_ups_skipped.fetch_add(1, Ordering::Relaxed);
             return Ok(());

@@ -263,6 +263,13 @@ impl DiscordAdapter {
         self.directory().channel_name(channel_id.parse().ok()?).map(str::to_owned)
     }
 
+    /// `Some(false)` when the gateway has described every server the bot is in
+    /// and this is not one of them: the bot was removed, and REST about it
+    /// can only fail. `None` while that is not yet known.
+    pub fn in_guild(&self, guild_id: &str) -> Option<bool> {
+        self.directory().has_guild(guild_id.parse().ok()?)
+    }
+
     pub fn known_guild_name(&self, guild_id: &str) -> Option<String> {
         self.directory().guild_name(guild_id.parse().ok()?).map(str::to_owned)
     }

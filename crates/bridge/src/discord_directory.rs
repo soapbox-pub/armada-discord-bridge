@@ -98,6 +98,15 @@ impl Directory {
         self.channels.get(&channel)?.last_message_id
     }
 
+    /// Whether the bot is in `guild`: known only once every server READY
+    /// listed has been described, since a server not listed is not ours.
+    pub fn has_guild(&self, guild: u64) -> Option<bool> {
+        if self.guilds.contains_key(&guild) {
+            return Some(true);
+        }
+        (self.is_loaded() && !self.guilds.is_empty()).then_some(false)
+    }
+
     /// Whether every server READY listed has been described.
     pub fn is_loaded(&self) -> bool {
         self.pending.is_empty()
@@ -142,6 +151,16 @@ mod tests {
         // A server already described is not waited for again on re-identify.
         d.expect([1]);
         assert!(d.is_loaded());
+    }
+
+    #[test]
+    fn knows_the_bot_is_not_in_a_server_only_once_loaded() {
+        let mut d = loaded();
+        assert_eq!(d.has_guild(1), Some(true));
+        assert_eq!(d.has_guild(3), None, "server 2 is still on its way");
+        d.guild_created(2, "Two".into(), []);
+        assert_eq!(d.has_guild(3), Some(false));
+        assert_eq!(Directory::default().has_guild(3), None, "nothing described yet");
     }
 
     #[test]
