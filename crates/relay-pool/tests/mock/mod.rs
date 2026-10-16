@@ -28,6 +28,7 @@ pub struct MockRelay {
     store: Arc<Mutex<Vec<Event>>>,
     live: broadcast::Sender<Event>,
     kill: watch::Sender<u64>,
+    refuse: Arc<Mutex<(usize, String)>>,
 }
 
 impl MockRelay {
@@ -38,12 +39,14 @@ impl MockRelay {
         let store = Arc::new(Mutex::new(Vec::new()));
         let (live, _) = broadcast::channel(1024);
         let (kill, _) = watch::channel(0);
+        let refuse = Arc::new(Mutex::new((0, String::new())));
         let relay = MockRelay {
             url: url.clone(),
             log: log.clone(),
             store: store.clone(),
             live: live.clone(),
             kill: kill.clone(),
+            refuse: refuse.clone(),
         };
         tokio::spawn(async move {
             loop {
@@ -58,6 +61,7 @@ impl MockRelay {
                     live: live.subscribe(),
                     kill: kill.subscribe(),
                     live_tx: live.clone(),
+                    refuse: refuse.clone(),
                 };
                 tokio::spawn(async move {
                     if let Ok(ws) = tokio_tungstenite::accept_async(tcp).await {
@@ -81,6 +85,12 @@ impl MockRelay {
     pub fn inject(&self, event: Event) {
         self.store(event.clone());
         let _ = self.live.send(event);
+    }
+
+    /// CLOSE the next `n` REQs with `reason`, as a rate limiter or a full
+    /// connection does.
+    pub fn refuse_next_reqs(&self, n: usize, reason: &str) {
+        *self.refuse.lock().unwrap() = (n, reason.to_string());
     }
 
     /// Drop every open connection.
@@ -116,6 +126,7 @@ struct Ctx {
     live: broadcast::Receiver<Event>,
     live_tx: broadcast::Sender<Event>,
     kill: watch::Receiver<u64>,
+    refuse: Arc<Mutex<(usize, String)>>,
 }
 
 fn matches(filters: &[Filter], event: &Event) -> bool {
@@ -182,6 +193,18 @@ impl Ctx {
                             let id = subscription_id.to_string();
                             let filters: Vec<Filter> = filters.into_iter().map(|f| f.into_owned()).collect();
                             self.log.lock().unwrap().reqs.push((id.clone(), filters.clone()));
+                            let refusal = {
+                                let mut refuse = self.refuse.lock().unwrap();
+                                (refuse.0 > 0).then(|| {
+                                    refuse.0 -= 1;
+                                    refuse.1.clone()
+                                })
+                            };
+                            if let Some(reason) = refusal {
+                                subs.remove(&id);
+                                send(RelayMessage::closed(SubscriptionId::new(&id), &reason));
+                                continue;
+                            }
                             if self.require_auth {
                                 let all_authed = filters.iter().all(|f| {
                                     f.authors.as_ref().is_none_or(|a| a.iter().all(|pk| authed.contains(pk)))

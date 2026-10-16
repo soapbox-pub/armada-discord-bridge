@@ -28,6 +28,10 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// A connection that lived at least this long resets the backoff.
 const STABLE_CONNECTION: Duration = Duration::from_secs(10);
+/// Backoff for re-sending a subscription a relay closed for a transient
+/// reason, doubling per refusal in a row.
+const RESUBSCRIBE_MIN: Duration = Duration::from_secs(5);
+const RESUBSCRIBE_MAX: Duration = Duration::from_secs(600);
 /// How far before the newest seen event a resubscription starts.
 const SINCE_OVERLAP_SECS: u64 = 60;
 
@@ -70,6 +74,10 @@ struct RelaySub {
     newest: Option<Timestamp>,
     sent_epoch: u64,
     awaiting_auth: bool,
+    /// Closed by the relay for a transient reason: re-sent at this time.
+    retry_at: Option<Instant>,
+    /// Transient refusals in a row, for the backoff.
+    refusals: u32,
 }
 
 struct PendingQuery {
@@ -136,6 +144,14 @@ pub(crate) async fn run(shared: Arc<Shared>, url: String, rx: mpsc::UnboundedRec
     }
     .run()
     .await
+}
+
+/// Whether a CLOSED reason is worth asking again later: NIP-01's
+/// `rate-limited:` and `error:` prefixes. `blocked:`, `restricted:`,
+/// `invalid:` and the rest will say the same thing next time.
+fn is_transient(reason: &str) -> bool {
+    let reason = reason.trim_start().to_ascii_lowercase();
+    reason.starts_with("rate-limited:") || reason.starts_with("error:")
 }
 
 /// Whether a relay's OK/CLOSED reason asks for authentication. Accepts
@@ -260,6 +276,7 @@ impl RelayTask {
             Cmd(Option<Cmd>),
             Ws(Option<Result<Message, tokio_tungstenite::tungstenite::Error>>),
             Tick,
+            Resubscribe,
         }
 
         tracing::debug!(relay = %self.url, "connected");
@@ -277,10 +294,12 @@ impl RelayTask {
                 }
             }
 
+            let next_retry = self.subs.values().filter_map(|s| s.retry_at).min();
             let ev = tokio::select! {
                 cmd = self.rx.recv() => Ev::Cmd(cmd),
                 msg = ws.next() => Ev::Ws(msg),
                 _ = tick.tick() => Ev::Tick,
+                _ = tokio::time::sleep_until(next_retry.unwrap_or_else(Instant::now)), if next_retry.is_some() => Ev::Resubscribe,
             };
 
             match ev {
@@ -302,6 +321,13 @@ impl RelayTask {
                     return Outcome::Disconnected;
                 }
                 Ev::Ws(None) => return Outcome::Disconnected,
+                Ev::Resubscribe => {
+                    let now = Instant::now();
+                    let due: Vec<String> = self.subs.iter().filter(|(_, s)| s.retry_at.is_some_and(|t| t <= now)).map(|(id, _)| id.clone()).collect();
+                    for id in due {
+                        self.send_sub(&id);
+                    }
+                }
                 Ev::Tick => {
                     if last_rx.elapsed() >= DEAD_AFTER {
                         tracing::warn!(relay = %self.url, "relay silent, reconnecting");
@@ -406,6 +432,7 @@ impl RelayTask {
             return;
         };
         sub.sent_epoch = epoch;
+        sub.retry_at = None;
         let filters = match sub.newest {
             None => sub.filters.clone(),
             Some(newest) => {
@@ -462,6 +489,8 @@ impl RelayTask {
                     newest: None,
                     sent_epoch: 0,
                     awaiting_auth: false,
+                    retry_at: None,
+                    refusals: 0,
                 });
                 if sub.filters != filters {
                     sub.filters = filters;
@@ -581,7 +610,8 @@ impl RelayTask {
     }
 
     fn on_eose(&mut self, id: &SubscriptionId) {
-        if self.subs.contains_key(id.as_str()) {
+        if let Some(sub) = self.subs.get_mut(id.as_str()) {
+            sub.refusals = 0;
             self.shared.emit(crate::PoolEvent::Eose {
                 relay: self.url.clone(),
                 sub_id: id.to_string(),
@@ -598,6 +628,18 @@ impl RelayTask {
             if auth {
                 tracing::debug!(relay = %self.url, sub = %id, %reason, "subscription needs auth");
                 sub.awaiting_auth = true;
+            } else if is_transient(reason) {
+                // Kept and re-sent, never dropped: a rate limiter or a full
+                // connection says nothing about the subscription, and a
+                // dropped one was not even re-sent on reconnect, so the relay
+                // stayed silent for it for the life of the process. A
+                // community boot meeting relay.dreamith.to's limiter cost it
+                // its live chat on that relay this way (2026-10-16).
+                let delay = jitter((RESUBSCRIBE_MIN * 2u32.pow(sub.refusals.min(7))).min(RESUBSCRIBE_MAX));
+                sub.refusals += 1;
+                sub.retry_at = Some(Instant::now() + delay);
+                tracing::warn!(relay = %self.url, sub = %id, %reason, retry_in_s = delay.as_secs(), "subscription closed by relay; will re-send");
+                return;
             } else {
                 tracing::warn!(relay = %self.url, sub = %id, %reason, "subscription closed by relay");
                 self.subs.remove(id.as_str());

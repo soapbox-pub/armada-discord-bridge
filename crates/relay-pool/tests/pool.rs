@@ -240,6 +240,36 @@ async fn refused_relay_is_not_redialed_per_query() {
     assert_eq!(dials.load(Ordering::SeqCst), 1);
 }
 
+/// A subscription a relay closes for a transient reason is re-sent on a
+/// backoff, and delivers once the relay takes it; one it closes for good is
+/// left closed.
+#[tokio::test]
+async fn rate_limited_subscription_is_resent() {
+    let relay = MockRelay::start(false).await;
+    let (pool, mut rx) = Pool::new(Keys::generate());
+    relay.refuse_next_reqs(1, "rate-limited: too many subscriptions");
+    pool.subscribe("s", &relay.urls(), vec![Filter::new().kind(Kind::TextNote)]);
+    // The re-sent REQ is answered with EOSE like any other.
+    assert!(matches!(next_sub_event(&mut rx, "s").await, PoolEvent::Eose { .. }));
+    assert_eq!(relay.reqs_for("s").len(), 2);
+    let keys = Keys::generate();
+    relay.inject(note(&keys, 1, "after the limiter", 1_700_000_000));
+    match next_sub_event(&mut rx, "s").await {
+        PoolEvent::Event { event, .. } => assert_eq!(event.content, "after the limiter"),
+        other => panic!("expected the event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn blocked_subscription_is_not_resent() {
+    let relay = MockRelay::start(false).await;
+    let (pool, mut rx) = Pool::new(Keys::generate());
+    relay.refuse_next_reqs(1, "blocked: not here");
+    pool.subscribe("s", &relay.urls(), vec![Filter::new().kind(Kind::TextNote)]);
+    assert_quiet(&mut rx, "s", Duration::from_secs(9)).await;
+    assert_eq!(relay.reqs_for("s").len(), 1);
+}
+
 #[tokio::test]
 async fn publish_accepted_and_rejected() {
     let relay = MockRelay::start(false).await;
