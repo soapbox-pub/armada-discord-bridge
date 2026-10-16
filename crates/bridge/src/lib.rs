@@ -7,6 +7,7 @@ pub mod config;
 pub mod db;
 pub mod fdlimit;
 pub mod discord;
+pub mod discord_directory;
 pub mod gif;
 pub mod imeta;
 pub mod key_intake;

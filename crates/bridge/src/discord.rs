@@ -18,7 +18,9 @@
 //! history from a cache: display names come from the event payload itself
 //! (`member.nick`, `author.global_name`, `author.name`), and the one event
 //! that lacks them (reaction remove) fetches the user over REST. Do not add
-//! twilight-cache-inmemory back without bounding it.
+//! twilight-cache-inmemory back without bounding it. The one thing kept is
+//! [`Directory`]: server and text-channel names and each channel's newest
+//! message id, one entry per server and channel, removed when they go.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -38,7 +40,8 @@ use twilight_http::error::ErrorType;
 use twilight_http::request::AuditLogReason as _;
 use twilight_http::request::channel::reaction::RequestReactionType;
 use twilight_model::channel::message::{AllowedMentions, Embed, EmojiReactionType, Mention};
-use twilight_model::channel::{ChannelType, Message};
+use twilight_model::channel::{Channel, ChannelType, Message};
+use twilight_model::gateway::payload::incoming::GuildCreate;
 use twilight_model::gateway::GatewayReaction;
 use twilight_model::http::attachment::Attachment;
 use twilight_model::id::Id;
@@ -46,6 +49,7 @@ use twilight_model::id::marker::{ChannelMarker, MessageMarker, UserMarker, Webho
 use twilight_model::user::User;
 use twilight_model::util::ImageHash;
 
+use crate::discord_directory::Directory;
 use crate::router::{MissingPermissions, WebhookMessage, WebhookSender};
 use crate::transform::sanitize_username;
 use crate::types::{
@@ -124,6 +128,12 @@ fn wanted_events() -> EventTypeFlags {
         | EventTypeFlags::REACTION_ADD
         | EventTypeFlags::REACTION_REMOVE
         | EventTypeFlags::TYPING_START
+        | EventTypeFlags::GUILD_CREATE
+        | EventTypeFlags::GUILD_UPDATE
+        | EventTypeFlags::GUILD_DELETE
+        | EventTypeFlags::CHANNEL_CREATE
+        | EventTypeFlags::CHANNEL_UPDATE
+        | EventTypeFlags::CHANNEL_DELETE
 }
 
 /// No pings, ever: bridged text quotes `@everyone` and user mentions verbatim.
@@ -161,6 +171,7 @@ pub struct DiscordAdapter {
     /// Serialises webhook lookup-or-create so two first sends into one
     /// channel cannot each create a webhook.
     webhook_create: tokio::sync::Mutex<()>,
+    directory: Mutex<Directory>,
 }
 
 impl DiscordAdapter {
@@ -195,6 +206,7 @@ impl DiscordAdapter {
             own_webhook_ids: Arc::default(),
             webhooks: Mutex::default(),
             webhook_create: tokio::sync::Mutex::new(()),
+            directory: Mutex::default(),
         });
 
         let pending = shards.len();
@@ -226,6 +238,39 @@ impl DiscordAdapter {
             _ = sender.close(CloseFrame::NORMAL);
         }
         _ = self.stop_tx.send(true);
+    }
+
+    fn directory(&self) -> std::sync::MutexGuard<'_, Directory> {
+        self.directory.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Wait (up to `limit`) for a GUILD_CREATE from every server READY listed,
+    /// so the boot that follows reads names and newest message ids from the
+    /// gateway instead of REST. Returns how many never arrived.
+    pub async fn wait_for_directory(&self, limit: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + limit;
+        while !self.directory().is_loaded() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let d = self.directory();
+        let (guilds, channels) = d.len();
+        tracing::info!(guilds, channels, missing = d.pending(), "discord directory loaded");
+        d.pending()
+    }
+
+    /// A text channel's name as the gateway last described it.
+    pub fn known_channel_name(&self, channel_id: &str) -> Option<String> {
+        self.directory().channel_name(channel_id.parse().ok()?).map(str::to_owned)
+    }
+
+    pub fn known_guild_name(&self, guild_id: &str) -> Option<String> {
+        self.directory().guild_name(guild_id.parse().ok()?).map(str::to_owned)
+    }
+
+    /// The channel's newest message id as far as the gateway has said; `None`
+    /// when it has not described the channel (or it never had a message).
+    pub fn last_message_id(&self, channel_id: &str) -> Option<u64> {
+        self.directory().last_message_id(channel_id.parse().ok()?)
     }
 
     pub fn application_id(&self) -> String {
@@ -617,6 +662,7 @@ async fn run_shard(
         };
         match event {
             Event::Ready(r) => {
+                adapter.directory().expect(r.guilds.iter().map(|g| g.id.get()));
                 *adapter.application_id.write().unwrap_or_else(|e| e.into_inner()) = r.application.id.to_string();
                 *adapter.bot.write().unwrap_or_else(|e| e.into_inner()) =
                     Some(BotUser { id: r.user.id, avatar: r.user.avatar, discriminator: r.user.discriminator });
@@ -645,7 +691,41 @@ async fn run_shard(
 
 /// Hand an event to the host. Every handler runs as its own task so one slow
 /// handler cannot stall the shard's heartbeat and event loop.
+/// A text channel as the directory keeps it, or `None` for anything else.
+fn text_channel(channel: &Channel) -> Option<(u64, String, Option<u64>)> {
+    (channel.kind == ChannelType::GuildText)
+        .then(|| (channel.id.get(), channel.name.clone().unwrap_or_default(), channel.last_message_id.map(|m| m.get())))
+}
+
+fn channel_changed(d: &mut Directory, c: &Channel) {
+    match (text_channel(c), c.guild_id) {
+        (Some((id, name, last)), Some(guild)) => d.channel_upserted(guild.get(), id, name, last),
+        _ => d.channel_removed(c.id.get()),
+    }
+}
+
+fn update_directory(adapter: &DiscordAdapter, event: &Event) {
+    let mut d = adapter.directory();
+    match event {
+        Event::GuildCreate(created) => match created.as_ref() {
+            GuildCreate::Available(guild) => d.guild_created(guild.id.get(), guild.name.clone(), guild.channels.iter().filter_map(text_channel)),
+            GuildCreate::Unavailable(guild) => d.guild_unavailable(guild.id.get()),
+        },
+        Event::GuildUpdate(updated) => d.guild_renamed(updated.id.get(), updated.name.clone()),
+        // An outage (unavailable) keeps what we knew; leaving or deletion does not.
+        Event::GuildDelete(deleted) if deleted.unavailable != Some(true) => d.guild_removed(deleted.id.get()),
+        Event::ChannelCreate(c) => channel_changed(&mut d, &c.0),
+        Event::ChannelUpdate(c) => channel_changed(&mut d, &c.0),
+        Event::ChannelDelete(c) => d.channel_removed(c.id.get()),
+        // Every message raises its channel's newest id, bridged yet or not:
+        // that is what makes skipping a catch-up on it safe.
+        Event::MessageCreate(created) => d.message_created(created.channel_id.get(), created.id.get()),
+        _ => {}
+    }
+}
+
 fn dispatch(adapter: &Arc<DiscordAdapter>, event: Event) {
+    update_directory(adapter, &event);
     let events = adapter.events.clone();
     match event {
         Event::MessageCreate(created) => {
