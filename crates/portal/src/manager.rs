@@ -116,6 +116,26 @@ const START_CONCURRENCY: usize = 12;
 /// old anchor — a bridge down for weeks — to a burst the channel can absorb.
 const DISCORD_CATCHUP_MAX: usize = 500;
 
+/// Deadlines for each stage of a bridge start. Every relay call carries its own
+/// timeout, but not everything a start awaits does, and one start that never
+/// returns holds a boot worker for good: with START_CONCURRENCY of them stuck,
+/// every bridge still queued stays dark (2026-10-16, 20 bridges). A stage that
+/// overruns is a start failure like any other — retried with backoff, never a
+/// sever on its own — and its error names the stage.
+const STAGE_RELAY: Duration = Duration::from_secs(90);
+const STAGE_DNS: Duration = Duration::from_secs(30);
+const STAGE_DB: Duration = Duration::from_secs(30);
+const STAGE_NAMES: Duration = Duration::from_secs(15);
+/// Backstop over a whole start, past the sum of its stages.
+const START_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+async fn stage<T>(name: &str, limit: Duration, fut: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    match tokio::time::timeout(limit, fut).await {
+        Ok(result) => result,
+        Err(_) => bail!("{name} timed out after {}s", limit.as_secs()),
+    }
+}
+
 /// Raised when an active bridge is asked to start while the shared Discord
 /// gateway is down. Deliberately its OWN error, not a start failure: the
 /// gateway being unreachable is process-wide and transient and says NOTHING
@@ -498,7 +518,7 @@ impl BridgeManager {
     }
 
     fn start<'a>(&'a self, row: &'a BridgeRow) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
-        Box::pin(self.start_inner(row))
+        Box::pin(stage("starting the bridge", START_DEADLINE, self.start_inner(row)))
     }
 
     async fn start_inner(&self, row: &BridgeRow) -> anyhow::Result<()> {
@@ -516,12 +536,13 @@ impl BridgeManager {
             bail!("bridge is missing sealed key material");
         };
         let invite_url = unseal(&self.env.seal_key_hex, invite_sealed)?;
-        let joined = resolve_invite(&invite_url, &self.bootstrap_relays(&invite_url).await?).await?;
+        let bootstrap = stage("vetting bootstrap relays", STAGE_DNS, self.bootstrap_relays(&invite_url)).await?;
+        let joined = stage("resolving the invite", STAGE_RELAY, resolve_invite(&invite_url, &bootstrap)).await?;
         let membership = joined.membership;
 
         let primary = Keys::new(SecretKey::from_hex(&unseal(&self.env.seal_key_hex, primary_sealed)?)?);
         let hub = self.hubs.get(&membership.community_id);
-        let relays = self.guarded(&hub, &membership.relays).await;
+        let relays = stage("vetting community relays", STAGE_DNS, async { Ok(self.guarded(&hub, &membership.relays).await) }).await?;
         // NIP-42 as the bridge's own npub too: relays that gate kind 1059 serve
         // a giftwrap only to the pubkey it is addressed to, and the Direct
         // Invites carrying private-channel keys are addressed to this npub.
@@ -534,19 +555,22 @@ impl BridgeManager {
         // carried, so the roster — and with it, who may vend a channel key — is
         // knowable before we accept any. The intake refuses anyone else.
         let preflight = ConcordClient::new(membership.clone(), Arc::new(relays.clone()), primary.clone());
-        let folded = preflight.sync_control().await?;
+        let folded = stage("folding the control plane", STAGE_RELAY, preflight.sync_control()).await?;
         let floor = relays.with_urls(invite_delivery_relays(&[]));
         floor.register_auth_keys(vec![primary.clone()]);
         let owner = membership.owner.clone();
-        let intake = intake_direct_invite_keys(&[&relays, &floor], &primary, &membership, |pk| {
-            folded.roster.is_authorized(pk, &owner, perm::MANAGE_CHANNELS)
+        let intake = stage("scanning for direct invites", STAGE_RELAY, async {
+            Ok(intake_direct_invite_keys(&[&relays, &floor], &primary, &membership, |pk| {
+                folded.roster.is_authorized(pk, &owner, perm::MANAGE_CHANNELS)
+            })
+            .await)
         })
-        .await;
+        .await?;
         let client = if intake.learned.is_empty() {
             preflight
         } else {
             let client = ConcordClient::new(intake.community, Arc::new(relays.clone()), primary.clone());
-            client.sync_control().await?;
+            stage("re-folding the control plane", STAGE_RELAY, client.sync_control()).await?;
             client
         };
 
@@ -562,14 +586,16 @@ impl BridgeManager {
         let adapter = self.adapter();
         let (discord_name, guild_name) = match &adapter {
             Some(a) => {
-                let channel_name = async { a.channel_name(row.discord_channel_id.as_deref()?).await.ok() };
-                let guild_name = async { a.guild_name(row.discord_guild_id.as_deref()?).await.ok() };
+                // Cosmetic, so bounded and best-effort: a lookup queued behind
+                // Discord's ratelimiter has no deadline of its own, and once
+                // held a boot worker, and every bridge queued behind it, forever.
+                let channel_name = async { tokio::time::timeout(STAGE_NAMES, a.channel_name(row.discord_channel_id.as_deref()?)).await.ok()?.ok() };
+                let guild_name = async { tokio::time::timeout(STAGE_NAMES, a.guild_name(row.discord_guild_id.as_deref()?)).await.ok()?.ok() };
                 tokio::join!(channel_name, guild_name)
             }
             None => (None, None),
         };
-        self.pool
-            .get()
+        stage("waiting for a database connection", STAGE_DB, async { Ok(self.pool.get().await?) })
             .await?
             .execute(
                 "UPDATE bridges SET concord_channel_name = $2,
@@ -658,7 +684,7 @@ impl BridgeManager {
                  mirrored to Discord in plaintext. A member with Manage Channels can enable it by replying:\n/bridge confirm {}",
                 rb.confirm_code
             );
-            client.send_chat(&channel, SendChat::message(rb.primary(), content)).await?;
+            stage("posting the confirm request", STAGE_RELAY, client.send_chat(&channel, SendChat::message(rb.primary(), content))).await?;
         }
         lock(&self.running).insert(rb.id.clone(), rb);
         Ok(())
