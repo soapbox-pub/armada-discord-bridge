@@ -1,12 +1,14 @@
 //! The open-file limit.
 //!
-//! Every bridge holds its own socket per relay (see relays.rs), so the portal
-//! needs thousands of descriptors. systemd starts services with a soft limit of
-//! 1024 under a much higher hard one, and expects a process that needs more to
-//! raise it itself — which Bun and Node do on startup, and Rust does not. The
-//! first Rust boot with per-bridge connections hit EMFILE at about 250 bridges,
-//! failing the other 1100 starts and the CA-store reads under them (2026-10-16).
-//! Every binary calls [`raise`] before opening anything.
+//! systemd starts services with a soft limit of 1024 under a much higher hard
+//! one, and expects a process that needs more to raise it itself — which Bun
+//! and Node do on startup, and Rust does not. A Rust boot with a socket per
+//! relay per bridge hit EMFILE at about 250 bridges, failing the other 1100
+//! starts and the CA-store reads under them (2026-10-16). Connections are per
+//! community now (~450 descriptors for 1340 bridges), but one community's
+//! worth of relays, a burst of Discord REST, or the next design should not
+//! meet a limit chosen for interactive shells. Every binary calls [`raise`]
+//! before opening anything.
 
 /// Raise the soft limit to the hard limit; returns the new soft limit.
 #[cfg(unix)]
