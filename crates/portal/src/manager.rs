@@ -14,17 +14,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use bridge::client::{BotCommand, BotCommandArg, ConcordClient, OpenedChat, SendChat, TaskGuard, now_ms, resolve_invite};
+use bridge::client::{BotCommand, BotCommandArg, ConcordClient, OpenedChat, SendChat, now_ms, resolve_invite};
+use bridge::community::{Attachment, CommunityRuntime};
 use bridge::discord::{CommandMessage, DiscordAdapter, DiscordEvents, TypingEvent};
 use bridge::key_intake::intake_direct_invite_keys;
 use bridge::profiles::Kind0ProfileResolver;
 use bridge::puppets::PuppetCache;
-use bridge::relays::{Hub, HubRegistry, RelayLike};
+use bridge::relays::{Hub, RelayLike, Relays};
 use bridge::router::{BridgeRouter, RouterOptions, SelfIds, WebhookMessage, is_missing_permissions};
 use bridge::store::{MappingStore, PgMappingStore};
 use bridge::transform::parse_bot_command;
 use bridge::types::{ChannelLink, DiscordInboundMessage, DiscordMessageDelete, DiscordReaction};
-use concord::community::ChannelView;
+use concord::community::{ChannelView, Membership};
 use concord::invite::{invite_delivery_relays, parse_invite_link, stock_relays};
 use concord::roles::perm;
 use deadpool_postgres::Pool;
@@ -129,6 +130,12 @@ const STAGE_NAMES: Duration = Duration::from_secs(15);
 /// Backstop over a whole start, past the sum of its stages.
 const START_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
+/// How long a community that failed to open fails its bridges' starts without
+/// trying again. Its bridges are queued together at boot, and each one
+/// re-running a fold that just timed out would hold a boot worker for the
+/// whole relay deadline, one bridge after another.
+const COMMUNITY_REOPEN_AFTER: Duration = Duration::from_secs(60);
+
 async fn stage<T>(name: &str, limit: Duration, fut: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
     match tokio::time::timeout(limit, fut).await {
         Ok(result) => result,
@@ -167,16 +174,40 @@ enum LiveStatus {
     Active,
 }
 
+/// A community's shared runtime, and the connections it runs on.
+struct Community {
+    runtime: Arc<CommunityRuntime>,
+    relays: Relays,
+}
+
+/// Where a community is, or was, opened. Bridges of one community start
+/// concurrently at boot; the lock makes the first open it and the rest wait.
+#[derive(Default)]
+struct CommunitySlot {
+    live: Weak<Community>,
+    failed: Option<(Instant, String)>,
+}
+
+/// Which bridges can share a runtime: those whose memberships agree on
+/// everything the control fold and the connections depend on. Holds the root,
+/// so it lives only in memory and is never logged.
+fn community_key(m: &Membership) -> String {
+    let mut relays = m.relays.clone();
+    relays.sort();
+    format!("{}|{}|{}|{}|{}", m.community_id, m.root_epoch, m.root, m.control_pk.as_deref().unwrap_or(""), relays.join(" "))
+}
+
 struct Running {
     id: String,
     client: Arc<ConcordClient>,
+    community: Arc<Community>,
     link: ChannelLink,
     confirm_code: String,
+    /// The channel as first started; the attachment tracks rekeys after that.
     channel: Mutex<ChannelView>,
     status: Mutex<LiveStatus>,
     router: RwLock<Option<Arc<BridgeRouter>>>,
-    chat_sub: Mutex<Option<TaskGuard>>,
-    control_sub: Mutex<Option<TaskGuard>>,
+    attachment: Mutex<Option<Attachment>>,
 }
 
 impl Running {
@@ -187,15 +218,16 @@ impl Running {
         *self.status.lock().unwrap_or_else(|e| e.into_inner())
     }
     fn channel(&self) -> ChannelView {
-        self.channel.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        let current = self.attachment.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(Attachment::channel);
+        current.unwrap_or_else(|| self.channel.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
     fn primary(&self) -> &Keys {
         self.client.primary()
     }
-    /// Drop both subscriptions, ending their tasks.
+    /// Stop receiving chat. The community's runtime, connections and
+    /// subscriptions go with its last bridge.
     fn halt(&self) {
-        self.chat_sub.lock().unwrap_or_else(|e| e.into_inner()).take();
-        self.control_sub.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.attachment.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 }
 
@@ -215,7 +247,12 @@ pub struct BridgeManager {
     rest: DiscordRest,
     /// One shared store: mapping rows for every router, plus catch-up cursors.
     store: Arc<PgMappingStore>,
-    hubs: HubRegistry,
+    communities: Mutex<HashMap<String, Arc<tokio::sync::Mutex<CommunitySlot>>>>,
+    /// Resolves the invites of starting bridges. One hub, not one per start:
+    /// that was a burst of fresh connections per bridge at every boot, and
+    /// relays that limit connection rate answer a burst with 429s. Connections
+    /// close on their own once idle.
+    bootstrap: Arc<Hub>,
     adapter: RwLock<Option<Arc<DiscordAdapter>>>,
     running: Mutex<HashMap<String, Arc<Running>>>,
     by_discord_channel: Mutex<HashMap<String, String>>,
@@ -238,7 +275,8 @@ impl BridgeManager {
             pool,
             env,
             rest: DiscordRest::new(),
-            hubs: HubRegistry::default(),
+            communities: Mutex::default(),
+            bootstrap: Hub::new(Keys::generate()),
             adapter: RwLock::new(None),
             running: Mutex::default(),
             by_discord_channel: Mutex::default(),
@@ -259,9 +297,9 @@ impl BridgeManager {
         &self.store
     }
 
-    /// Bridges with live relay connections (operational visibility).
-    pub fn relay_hubs(&self) -> usize {
-        self.hubs.len()
+    /// Communities with a live runtime (operational visibility).
+    pub fn communities(&self) -> usize {
+        lock(&self.communities).values().filter(|s| s.try_lock().is_ok_and(|s| s.live.strong_count() > 0)).count()
     }
 
     pub async fn init(&self) -> anyhow::Result<()> {
@@ -430,15 +468,16 @@ impl BridgeManager {
         hub.relays(filter_public_relays(relays, &stock_relays()).await)
     }
 
-    async fn bootstrap_relays(&self, invite_url: &str) -> anyhow::Result<bridge::relays::Relays> {
+    async fn bootstrap_relays(&self, hub: &Arc<Hub>, invite_url: &str) -> anyhow::Result<Relays> {
         let link = parse_invite_link(invite_url).context("not a valid Armada invite URL")?;
         let relays = if link.bootstrap_relays.is_empty() { stock_relays() } else { link.bootstrap_relays };
-        Ok(self.guarded(&Hub::new(Keys::generate()), &relays).await)
+        Ok(self.guarded(hub, &relays).await)
     }
 
-    /// Resolve and fold a community for the wizard's pairing step (transient).
+    /// Resolve and fold a community for the wizard's pairing step (transient,
+    /// and on its own connections: the link is whatever was pasted).
     pub async fn inspect_invite(&self, invite_url: &str) -> anyhow::Result<InspectedInvite> {
-        let bootstrap = self.bootstrap_relays(invite_url).await?;
+        let bootstrap = self.bootstrap_relays(&Hub::new(Keys::generate()), invite_url).await?;
         let joined = resolve_invite(invite_url, &bootstrap).await?;
         let m = joined.membership;
         let relays = self.guarded(&Hub::new(Keys::generate()), &m.relays).await;
@@ -536,14 +575,16 @@ impl BridgeManager {
             bail!("bridge is missing sealed key material");
         };
         let invite_url = unseal(&self.env.seal_key_hex, invite_sealed)?;
-        let bootstrap = stage("vetting bootstrap relays", STAGE_DNS, self.bootstrap_relays(&invite_url)).await?;
+        let bootstrap = stage("vetting bootstrap relays", STAGE_DNS, self.bootstrap_relays(&self.bootstrap, &invite_url)).await?;
         let joined = stage("resolving the invite", STAGE_RELAY, resolve_invite(&invite_url, &bootstrap)).await?;
         let membership = joined.membership;
 
         let primary = Keys::new(SecretKey::from_hex(&unseal(&self.env.seal_key_hex, primary_sealed)?)?);
-        // One hub per bridge: relays cap subscriptions per connection (relays.rs).
-        let hub = self.hubs.get(&row.bridge_id);
-        let relays = stage("vetting community relays", STAGE_DNS, async { Ok(self.guarded(&hub, &membership.relays).await) }).await?;
+        // The Control Plane is folded once per community, before any key is
+        // accepted: it reads from the root the invite carried, so the roster —
+        // and with it, who may vend a channel key — is knowable first.
+        let community = self.community(&membership).await?;
+        let relays = &community.relays;
         // NIP-42 as the bridge's own npub too: relays that gate kind 1059 serve
         // a giftwrap only to the pubkey it is addressed to, and the Direct
         // Invites carrying private-channel keys are addressed to this npub.
@@ -551,35 +592,32 @@ impl BridgeManager {
         // deliveries — every private channel an import admitted it to failed
         // "concord channel not found" on every start (2026-09-24).
         relays.register_auth_keys(vec![primary.clone()]);
-
-        // Fold the Control Plane first: it reads from the root the invite
-        // carried, so the roster — and with it, who may vend a channel key — is
-        // knowable before we accept any. The intake refuses anyone else.
-        let preflight = ConcordClient::new(membership.clone(), Arc::new(relays.clone()), primary.clone());
-        let folded = stage("folding the control plane", STAGE_RELAY, preflight.sync_control()).await?;
+        let folded = community.runtime.folded().context("community has no fold")?;
         let floor = relays.with_urls(invite_delivery_relays(&[]));
         floor.register_auth_keys(vec![primary.clone()]);
         let owner = membership.owner.clone();
         let intake = stage("scanning for direct invites", STAGE_RELAY, async {
-            Ok(intake_direct_invite_keys(&[&relays, &floor], &primary, &membership, |pk| {
+            Ok(intake_direct_invite_keys(&[relays, &floor], &primary, &membership, |pk| {
                 folded.roster.is_authorized(pk, &owner, perm::MANAGE_CHANNELS)
             })
             .await)
         })
         .await?;
-        let client = if intake.learned.is_empty() {
-            preflight
-        } else {
-            let client = ConcordClient::new(intake.community, Arc::new(relays.clone()), primary.clone());
-            stage("re-folding the control plane", STAGE_RELAY, client.sync_control()).await?;
-            client
-        };
+        // This bridge's keys only: see bridge::community on why they are never pooled.
+        let client = community.runtime.client_for(intake.community, primary.clone());
 
-        let channel = row
-            .concord_channel_id
-            .as_deref()
-            .and_then(|id| client.channel(id))
-            .context("concord channel not found (deleted, or key not held)")?;
+        let channel_id = row.concord_channel_id.as_deref().context("bridge has no concord channel")?;
+        // The shared fold is live, but only as live as the last edition to
+        // arrive: an import publishes a channel and starts its bridge moments
+        // later. A miss earns one fresh fold (shared with the community) first.
+        let channel = match client.channel(channel_id) {
+            Some(channel) => Some(channel),
+            None => {
+                stage("re-folding the control plane", STAGE_RELAY, client.sync_control()).await?;
+                client.channel(channel_id)
+            }
+        }
+        .context("concord channel not found (deleted, or key not held)")?;
 
         // Refresh display names each start, so renames heal. A failed lookup is
         // None, and writing None over a correct name blanked the dashboard on
@@ -646,25 +684,15 @@ impl BridgeManager {
         let rb = Arc::new(Running {
             id: row.bridge_id.clone(),
             client: client.clone(),
+            community,
             link,
             confirm_code: row.confirm_code.clone().unwrap_or_default(),
             channel: Mutex::new(channel.clone()),
             status: Mutex::new(status),
             router: RwLock::new(None),
-            chat_sub: Mutex::new(None),
-            control_sub: Mutex::new(None),
+            attachment: Mutex::new(None),
         });
-        self.subscribe_chat(&rb, &channel, true);
-        // A rekey mints new stream keys; a REQ pinned to the old ones goes
-        // silent while publishes (fresh channel lookup) keep working, so
-        // re-subscribe whenever the fold changes the channel's stream set.
-        let (me, weak_rb) = (self.me.clone(), Arc::downgrade(&rb));
-        let control = client.subscribe_control(Some(Arc::new(move |_| {
-            if let (Some(me), Some(rb)) = (me.upgrade(), weak_rb.upgrade()) {
-                me.refresh_chat_subscription(&rb);
-            }
-        })));
-        *lock(&rb.control_sub) = Some(control);
+        self.attach_chat(&rb, &channel);
 
         if status == LiveStatus::Active {
             let live_from_ms = now_ms();
@@ -691,7 +719,59 @@ impl BridgeManager {
         Ok(())
     }
 
-    fn subscribe_chat(&self, rb: &Arc<Running>, channel: &ChannelView, with_cursor: bool) {
+    /// The runtime for `membership`'s community, opened if no bridge holds it.
+    async fn community(&self, membership: &Membership) -> anyhow::Result<Arc<Community>> {
+        let slot = {
+            let mut slots = lock(&self.communities);
+            slots.retain(|_, slot| Arc::strong_count(slot) > 1 || slot.try_lock().map_or(true, |s| s.live.strong_count() > 0));
+            slots.entry(community_key(membership)).or_default().clone()
+        };
+        let mut slot = slot.lock().await;
+        if let Some(live) = slot.live.upgrade() {
+            return Ok(live);
+        }
+        if let Some((at, error)) = &slot.failed
+            && at.elapsed() < COMMUNITY_REOPEN_AFTER
+        {
+            bail!("opening the community failed {}s ago: {error}", at.elapsed().as_secs());
+        }
+        let opened = async {
+            let hub = Hub::new(Keys::generate());
+            let relays = stage("vetting community relays", STAGE_DNS, async { Ok(self.guarded(&hub, &membership.relays).await) }).await?;
+            let store = self.store.clone();
+            let community_id = membership.community_id.clone();
+            let on_cursor: bridge::client::CursorHandler = Arc::new(move |stream_pk: String, at: u64| {
+                let (store, community_id) = (store.clone(), community_id.clone());
+                tokio::spawn(async move {
+                    let _ = store.cursor_set(&community_id, &stream_pk, at).await;
+                });
+            });
+            let runtime =
+                stage("folding the control plane", STAGE_RELAY, CommunityRuntime::open(membership.clone(), Arc::new(relays.clone()), Some(on_cursor))).await?;
+            // A fold with no channels is no relay having answered, not a
+            // community without channels: one has a bridge into it. Kept, it
+            // would fail every bridge of the community "channel not found"
+            // until the live fold caught up.
+            if runtime.folded().is_none_or(|f| f.channels.is_empty()) {
+                bail!("the control plane came back empty");
+            }
+            Ok(Arc::new(Community { runtime, relays }))
+        };
+        match opened.await {
+            Ok(community) => {
+                *slot = CommunitySlot { live: Arc::downgrade(&community), failed: None };
+                Ok(community)
+            }
+            Err(error) => {
+                slot.failed = Some((Instant::now(), format!("{error:#}")));
+                Err(error)
+            }
+        }
+    }
+
+    /// Deliver the bridge's channel chat to its handler, over its community's
+    /// shared subscription (which also follows rekeys).
+    fn attach_chat(&self, rb: &Arc<Running>, channel: &ChannelView) {
         let (me, weak_rb) = (self.me.clone(), Arc::downgrade(rb));
         let on_chat = Arc::new(move |chat: OpenedChat| {
             let (Some(me), Some(rb)) = (me.upgrade(), weak_rb.upgrade()) else { return };
@@ -701,30 +781,7 @@ impl BridgeManager {
                 }
             });
         });
-        let on_cursor: Option<bridge::client::CursorHandler> = with_cursor.then(|| {
-            let store = self.store.clone();
-            let community = rb.link.community_id.clone();
-            Arc::new(move |stream_pk: String, at: u64| {
-                let (store, community) = (store.clone(), community.clone());
-                tokio::spawn(async move {
-                    let _ = store.cursor_set(&community, &stream_pk, at).await;
-                });
-            }) as bridge::client::CursorHandler
-        });
-        *lock(&rb.chat_sub) = Some(rb.client.subscribe_channel(channel, on_chat, on_cursor));
-    }
-
-    /// Tear down and rebuild the chat REQ when the channel's stream set changes.
-    fn refresh_chat_subscription(&self, rb: &Arc<Running>) {
-        // Channel left the fold: severance detection is separate work.
-        let Some(fresh) = rb.client.channel(&rb.link.concord_channel_id_hex) else { return };
-        let keys = |c: &ChannelView| c.streams.iter().map(|s| s.key.pk_hex()).collect::<Vec<_>>();
-        if keys(&fresh) == keys(&rb.channel()) {
-            return;
-        }
-        *lock(&rb.channel) = fresh.clone();
-        self.subscribe_chat(rb, &fresh, true);
-        tracing::info!(bridge = %rb.id, "stream keys rotated; chat subscription refreshed");
+        *lock(&rb.attachment) = Some(rb.community.runtime.attach(&rb.id, rb.client.clone(), channel.clone(), on_chat));
     }
 
     /// Bounded catch-up after downtime: replay wraps newer than the stored

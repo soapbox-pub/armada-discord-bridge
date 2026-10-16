@@ -21,11 +21,11 @@ fn rss_mb() -> u64 {
 
 fn memory_line(manager: &BridgeManager, importer: &Importer) -> String {
     format!(
-        "memory rss={}MB bridges={} imports={} relay_hubs={}",
+        "memory rss={}MB bridges={} imports={} communities={}",
         rss_mb(),
         manager.live_count(),
         importer.active_count(),
-        manager.relay_hubs()
+        manager.communities()
     )
 }
 

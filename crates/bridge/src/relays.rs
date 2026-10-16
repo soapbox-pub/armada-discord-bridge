@@ -2,18 +2,20 @@
 //! community relay, and a publish succeeds when ANY relay accepts (Armada's
 //! `broadcast`).
 //!
-//! Each bridge gets its own [`Hub`] — its own set of relay connections — as
-//! the TypeScript bridge gave each its own pool. Sharing one hub across a
-//! community's bridges was tried and failed on the first boot it was live
-//! (2026-10-16): relays cap concurrent subscriptions per connection, and a
-//! community of 63 bridges put ~130 standing REQs on one socket. The stock
-//! relays answered with "too many concurrent REQs" (a NOTICE, the REQ silently
-//! dropped) and "too many subscriptions" by the thousand, so bridges started
-//! without live chat or control, and the boot-time folds of the largest
-//! communities came back empty. A hub's pool authenticates only as the keys
-//! its own bridge registers, so per-bridge hubs keep the AUTH fan-out linear —
-//! the quadratic cost that hurt the TypeScript came from a process-wide key
-//! registry, not from the number of pools.
+//! Relays cap concurrent subscriptions per connection, and that cap is what
+//! every design here has to fit under. A [`Hub`] — one set of connections —
+//! serves one community (see the portal's `CommunityRuntime`), holding two
+//! standing REQs whatever the community's size: one for the Control Plane and
+//! one whose authors are every bridged channel's stream keys. Its one-shot
+//! queries are bounded by [`HUB_QUERY_CONCURRENCY`].
+//!
+//! Both alternatives failed in production on 2026-10-16. A hub per community
+//! with a REQ per bridge put ~130 standing REQs on one socket for a community
+//! of 63 bridged channels; the stock relays answered "too many concurrent REQs"
+//! (a NOTICE, the REQ silently dropped) and "too many subscriptions" by the
+//! thousand. A hub per bridge, as the TypeScript ran, is ~5,000 sockets for
+//! 1340 channels: it ran out of file descriptors at 250 bridges, and opening
+//! that many at once draws 429s from relays that limit connection rate.
 //!
 //! NIP-42: relays that gate kind 1059 serve a REQ only to a connection that has
 //! authenticated as every pubkey in its `authors`. Stream addresses are derived
@@ -34,6 +36,12 @@ use tokio::sync::mpsc;
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// One-shot queries in flight per hub. Each is a REQ on every relay of the
+/// hub, on top of its standing subscriptions: unbounded, a community's boot
+/// (fold, Direct Invite scans, catch-up per bridge) put dozens on one socket
+/// and met the same per-connection cap the standing REQs did.
+pub const HUB_QUERY_CONCURRENCY: usize = 8;
 
 /// Bound on the process-wide verified-signature memo.
 const VERIFIED_MAX: usize = 200_000;
@@ -90,6 +98,7 @@ impl Subscription {
 pub struct Hub {
     pool: Pool,
     routes: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Event>>>>,
+    queries: tokio::sync::Semaphore,
 }
 
 impl Hub {
@@ -99,7 +108,7 @@ impl Hub {
         let (pool, rx) = Pool::new(auth);
         let routes: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Event>>>> = Arc::default();
         tokio::spawn(dispatch(rx, Arc::downgrade(&routes)));
-        Arc::new(Hub { pool, routes })
+        Arc::new(Hub { pool, routes, queries: tokio::sync::Semaphore::new(HUB_QUERY_CONCURRENCY) })
     }
 
     /// A handle reading and writing `urls` over this hub's connections.
@@ -183,11 +192,13 @@ fn newest_first(mut events: Vec<Event>) -> Vec<Event> {
 #[async_trait]
 impl RelayLike for Relays {
     async fn query(&self, filters: Vec<Filter>) -> anyhow::Result<Vec<Event>> {
+        let _slot = self.hub.queries.acquire().await?;
         let events = self.hub.pool.query(&self.urls, filters, QUERY_TIMEOUT).await;
         Ok(newest_first(events.into_iter().filter(verify_once).collect()))
     }
 
     async fn query_race(&self, filters: Vec<Filter>) -> Vec<Event> {
+        let Ok(_slot) = self.hub.queries.acquire().await else { return vec![] };
         let events = self.hub.pool.query_race(&self.urls, filters, QUERY_TIMEOUT).await;
         newest_first(events.into_iter().filter(verify_once).collect())
     }
@@ -224,35 +235,6 @@ impl Drop for Unsubscribe {
     fn drop(&mut self) {
         self.hub.pool.unsubscribe(&self.sub_id);
         self.hub.routes.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.sub_id);
-    }
-}
-
-/// Hubs by owner key (one per bridge; see the module docs for why never per
-/// community). A hub lives exactly as long as its holder keeps it.
-#[derive(Default)]
-pub struct HubRegistry {
-    hubs: Mutex<HashMap<String, Weak<Hub>>>,
-}
-
-impl HubRegistry {
-    pub fn get(&self, key: &str) -> Arc<Hub> {
-        let mut hubs = self.hubs.lock().unwrap_or_else(|e| e.into_inner());
-        hubs.retain(|_, h| h.strong_count() > 0);
-        if let Some(hub) = hubs.get(key).and_then(Weak::upgrade) {
-            return hub;
-        }
-        let hub = Hub::new(Keys::generate());
-        hubs.insert(key.to_owned(), Arc::downgrade(&hub));
-        hub
-    }
-
-    /// Hubs with live connections (operational visibility).
-    pub fn len(&self) -> usize {
-        self.hubs.lock().unwrap_or_else(|e| e.into_inner()).values().filter(|h| h.strong_count() > 0).count()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
