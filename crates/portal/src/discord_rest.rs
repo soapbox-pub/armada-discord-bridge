@@ -15,6 +15,12 @@ pub const API: &str = "https://discord.com/api/v10";
 /// Manage Webhooks + View Channel + Send Messages + Read History + Add Reactions + Manage Messages.
 pub const BOT_PERMISSIONS: &str = "536947776";
 
+/// [`BOT_PERMISSIONS`] plus Manage Channels, asked for only when the channel
+/// map is told to create channels on Discord. Not the default: most servers
+/// never need it, and a bridge that can delete any channel is not one to hand
+/// out by habit.
+pub const BOT_PERMISSIONS_CREATE: &str = "536947792";
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscordUser {
     pub id: String,
@@ -61,8 +67,40 @@ pub fn oauth_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
 }
 
 pub fn bot_install_url(client_id: &str, guild_id: &str) -> String {
-    let q = query(&[("client_id", client_id), ("scope", "bot"), ("permissions", BOT_PERMISSIONS), ("guild_id", guild_id)]);
+    install_url(client_id, guild_id, BOT_PERMISSIONS)
+}
+
+/// The install link that also grants Manage Channels. Re-authorising an
+/// installed bot through it updates the bot's role in place.
+pub fn bot_install_url_create(client_id: &str, guild_id: &str) -> String {
+    install_url(client_id, guild_id, BOT_PERMISSIONS_CREATE)
+}
+
+fn install_url(client_id: &str, guild_id: &str, permissions: &str) -> String {
+    let q = query(&[("client_id", client_id), ("scope", "bot"), ("permissions", permissions), ("guild_id", guild_id)]);
     format!("https://discord.com/oauth2/authorize?{q}")
+}
+
+/// Raised when the bot may not create a channel: the server granted it the
+/// default permissions, without Manage Channels.
+#[derive(Debug, thiserror::Error)]
+#[error("the bot is missing Manage Channels in this Discord server")]
+pub struct CannotCreateChannels;
+
+/// A name Discord accepts for a text channel, as close to `name` as it gets:
+/// Discord lowercases and hyphenates names itself, but refuses some
+/// characters outright rather than dropping them.
+pub fn discord_channel_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.trim().chars().flat_map(char::to_lowercase) {
+        if c.is_alphanumeric() || c == '_' || c == '-' {
+            out.push(c);
+        } else if (c.is_whitespace() || c == '.' || c == '/') && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out: String = out.trim_matches('-').chars().take(100).collect();
+    if out.is_empty() { "channel".into() } else { out }
 }
 
 /// Longest single 429 wait we honor; Discord's global bans can claim hours.
@@ -79,6 +117,12 @@ pub struct GuildChannel {
     pub kind: u32,
     #[serde(default)]
     pub position: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// None for a channel that has never had a message: the map offers to
+    /// copy Armada history only into a Discord channel that is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_id: Option<String>,
 }
 
 // ── Full-guild snapshot (server import) ─────────────────────────────────────
@@ -332,15 +376,24 @@ impl DiscordRest {
     /// backfill pages one route hundreds of times, so rate limits here are
     /// routine, and imports used to die on the first one.
     async fn discord_fetch(&self, path: &str, query: &[(&str, &str)], authorization: &str) -> anyhow::Result<Fetched> {
+        self.discord_request(reqwest::Method::GET, path, query, None, authorization).await
+    }
+
+    async fn discord_request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, &str)],
+        body: Option<&serde_json::Value>,
+        authorization: &str,
+    ) -> anyhow::Result<Fetched> {
         let mut waited_ms = 0.0;
         loop {
-            let res = self
-                .http
-                .get(format!("{}{path}", self.api))
-                .query(query)
-                .header(reqwest::header::AUTHORIZATION, authorization)
-                .send()
-                .await?;
+            let mut req = self.http.request(method.clone(), format!("{}{path}", self.api)).query(query).header(reqwest::header::AUTHORIZATION, authorization);
+            if let Some(body) = body {
+                req = req.json(body);
+            }
+            let res = req.send().await?;
             let status = res.status();
             let header_secs = res
                 .headers()
@@ -424,6 +477,38 @@ impl DiscordRest {
         let mut text: Vec<GuildChannel> = channels.into_iter().filter(|c| c.kind == 0).collect();
         text.sort_by_key(|c| c.position);
         Ok(Some(text))
+    }
+
+    /// Every channel of a guild the bot can see, categories included, or None
+    /// when the bot is not a member.
+    pub async fn bot_guild_channels(&self, bot_token: &str, guild_id: &str) -> anyhow::Result<Option<Vec<GuildChannel>>> {
+        let path = format!("/guilds/{}/channels", snowflake(guild_id)?);
+        self.bot_get(bot_token, &path, &[]).await
+    }
+
+    /// Create a channel: a text channel (type 0), optionally under a
+    /// category, or a category (type 4). A 403 is [`CannotCreateChannels`].
+    pub async fn bot_create_channel(
+        &self,
+        bot_token: &str,
+        guild_id: &str,
+        name: &str,
+        kind: u32,
+        parent_id: Option<&str>,
+    ) -> anyhow::Result<GuildChannel> {
+        let path = format!("/guilds/{}/channels", snowflake(guild_id)?);
+        let mut body = serde_json::json!({ "name": name, "type": kind });
+        if let Some(parent) = parent_id {
+            body["parent_id"] = serde_json::json!(snowflake(parent)?);
+        }
+        let res = self.discord_request(reqwest::Method::POST, &path, &[], Some(&body), &format!("Bot {bot_token}")).await?;
+        if res.status == StatusCode::FORBIDDEN {
+            return Err(CannotCreateChannels.into());
+        }
+        if !res.status.is_success() {
+            bail!("discord bot {path} failed: {}", res.status.as_u16());
+        }
+        res.json(&path)
     }
 
     /// Read a guild's full structure (settings, roles, channels with overwrites)
@@ -756,6 +841,34 @@ mod tests {
         assert_eq!(text.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["e", "a"]);
         assert!(!rest.bot_can_manage_webhooks("t", "5").await.unwrap());
         assert!(rest.bot_can_manage_webhooks("t", "6").await.unwrap());
+    }
+
+    #[test]
+    fn channel_names_are_ones_discord_accepts() {
+        assert_eq!(discord_channel_name("General Chat"), "general-chat");
+        assert_eq!(discord_channel_name("  dev / ops!! "), "dev-ops");
+        assert_eq!(discord_channel_name("café_talk"), "café_talk");
+        assert_eq!(discord_channel_name("!!!"), "channel");
+        assert_eq!(discord_channel_name(&"x".repeat(150)).len(), 100);
+    }
+
+    #[tokio::test]
+    async fn creating_a_channel_without_manage_channels_says_so() {
+        use axum::routing::post;
+        let router = Router::new()
+            .route("/guilds/1/channels", post(|| async { AxStatus::FORBIDDEN }))
+            .route(
+                "/guilds/2/channels",
+                post(|axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    assert_eq!(body["parent_id"], "9");
+                    format!(r#"{{"id":"77","name":{},"type":0,"parent_id":"9"}}"#, body["name"])
+                }),
+            );
+        let rest = serve(router).await;
+        let refused = rest.bot_create_channel("t", "1", "general", 0, None).await.unwrap_err();
+        assert!(refused.is::<CannotCreateChannels>());
+        let made = rest.bot_create_channel("t", "2", "general", 0, Some("9")).await.unwrap();
+        assert_eq!((made.id.as_str(), made.name.as_str(), made.last_message_id), ("77", "general", None));
     }
 
     #[tokio::test]
