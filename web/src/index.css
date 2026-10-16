@@ -1,0 +1,222 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Armada "Corsair", dark. These are the static values deriveTokensFromCore()
+   produces for the client's default theme (armada/src/themes.ts), so the
+   portal reads as the same ship: near-black violet hull, rose-magenta blade
+   (--primary), phosphor-cyan wake (--accent2) reserved for live state. The
+   client injects these at runtime per theme; the portal has the one. */
+@layer base {
+  :root {
+    --background: 260 22% 9%;
+    --foreground: 42 38% 90%;
+    --card: 260 22% 11%;
+    --card-foreground: 42 38% 90%;
+    --popover: 260 22% 11%;
+    --popover-foreground: 42 38% 90%;
+    --primary: 330 90% 62%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 260 22% 17%;
+    --secondary-foreground: 42 38% 90%;
+    --muted: 260 22% 17%;
+    --muted-foreground: 42 26.6% 60%;
+    --accent: 260 22% 17%;
+    --accent-foreground: 42 38% 90%;
+    --accent2: 180 90% 55%;
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 95%;
+    --success: 142 60% 35%;
+    --success-foreground: 138 60% 94%;
+    --warning: 43 96% 56%;
+    --warning-foreground: 26 83% 14%;
+    --border: 330 36% 30%;
+    --input: 330 36% 30%;
+    --ring: 330 90% 62%;
+    --chrome: 257.1 21.2% 6.5%;
+    --chrome-deep: 260 21.4% 5.5%;
+    --chrome-divider: 253.3 9.7% 18.2%;
+
+    /* Two radii: soft for content ("the people"), near-sharp for structural
+       chrome ("the hull"). */
+    --radius: 0.75rem;
+    --radius-chrome: 0.1875rem;
+    color-scheme: dark;
+  }
+
+  * {
+    @apply border-border;
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--muted-foreground) / 0.4) transparent;
+  }
+  *::-webkit-scrollbar { width: 12px; height: 12px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb {
+    background-color: hsl(var(--muted-foreground) / 0.35);
+    border-radius: 9999px;
+    border: 3px solid transparent;
+    background-clip: padding-box;
+  }
+  *::-webkit-scrollbar-thumb:hover { background-color: hsl(var(--muted-foreground) / 0.6); }
+
+  html, body, #root { min-height: 100%; }
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+  ::selection { background: hsl(var(--primary) / 0.35); }
+}
+
+@layer utilities {
+  .neon-glow {
+    box-shadow: 0 0 0 1px hsl(var(--primary) / 0.5), 0 0 12px -2px hsl(var(--primary) / 0.45);
+  }
+  .wake-glow {
+    box-shadow: 0 0 0 1px hsl(var(--accent2) / 0.5), 0 0 12px -2px hsl(var(--accent2) / 0.5);
+  }
+  .wake-text {
+    color: hsl(var(--accent2));
+    text-shadow: 0 0 8px hsl(var(--accent2) / 0.5);
+  }
+
+  /* Armada's chamfered corners: top-left and bottom-right cut at 45°. A
+     border would be sliced off by the clip, so these surfaces are fill-only;
+     .clip-hairline-lg draws its edge as a 1px inset of a second fill. */
+  .clip-corner-lg {
+    --cut: 0.7rem;
+    border-radius: 0.55rem;
+    clip-path: polygon(var(--cut) 0, 100% 0, 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, 0 100%, 0 var(--cut));
+  }
+  .clip-corner {
+    --cut: 0.375rem;
+    border-radius: 0.3rem;
+    clip-path: polygon(var(--cut) 0, 100% 0, 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, 0 100%, 0 var(--cut));
+  }
+  .clip-hairline-lg {
+    --cut: 0.7rem;
+    --fill: var(--background) / 0.4;
+    --fill-hover: var(--background) / 0.6;
+    --edge: var(--border) / 0.6;
+    --fill-base: var(--background);
+    position: relative;
+    isolation: isolate;
+    border-radius: 0.55rem;
+    clip-path: polygon(var(--cut) 0, 100% 0, 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, 0 100%, 0 var(--cut));
+    background: hsl(var(--edge));
+  }
+  .clip-hairline-lg::before {
+    content: "";
+    position: absolute;
+    inset: 1px;
+    z-index: -1;
+    border-radius: calc(0.55rem - 1px);
+    clip-path: polygon(var(--cut) 0, 100% 0, 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, 0 100%, 0 var(--cut));
+    background-color: hsl(var(--fill-base));
+    background-image: linear-gradient(hsl(var(--fill)), hsl(var(--fill)));
+    transition: background-image 120ms ease;
+  }
+  a.clip-hairline-lg:hover::before,
+  button.clip-hairline-lg:hover::before {
+    background-image: linear-gradient(hsl(var(--fill-hover)), hsl(var(--fill-hover)));
+  }
+  .bg-chrome .clip-hairline-lg { --fill-base: var(--chrome); }
+
+  /* A floating cut-corner panel with a hairline edge (menus, toasts). The
+     chamfers get their edge from diagonal gradients, since a clip slices off
+     any real border there. */
+  .vessel {
+    --cut: var(--vessel-cut, 0.6rem);
+    border-radius: 0.5rem;
+    clip-path: polygon(var(--cut) 0, 100% 0, 100% calc(100% - var(--cut)), calc(100% - var(--cut)) 100%, 0 100%, 0 var(--cut));
+    background:
+      linear-gradient(135deg, transparent calc(50% - 1px), var(--vessel-edge, hsl(var(--border) / 0.45)) calc(50% - 1px) calc(50% + 1px), transparent calc(50% + 1px)) top left / var(--cut) var(--cut) no-repeat,
+      linear-gradient(135deg, transparent calc(50% - 1px), var(--vessel-edge, hsl(var(--border) / 0.45)) calc(50% - 1px) calc(50% + 1px), transparent calc(50% + 1px)) bottom right / var(--cut) var(--cut) no-repeat,
+      var(--vessel-fill, hsl(var(--popover)));
+    box-shadow: inset 0 0 0 1px var(--vessel-edge, hsl(var(--border) / 0.45));
+  }
+  [data-radix-popper-content-wrapper]:has(> .vessel) {
+    filter: drop-shadow(0 10px 22px rgb(0 0 0 / 0.32)) drop-shadow(0 2px 5px rgb(0 0 0 / 0.22));
+  }
+  .menu-row {
+    --cut: calc(var(--vessel-cut, 0.6rem) - 0.15rem);
+    border-radius: 0.25rem;
+  }
+  .menu-row::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 50%;
+    width: 2px;
+    height: 0;
+    border-radius: 2px;
+    transform: translateY(-50%);
+    background: hsl(var(--primary));
+    box-shadow: 0 0 8px hsl(var(--primary) / 0.7);
+    opacity: 0;
+    transition: height 120ms ease, opacity 120ms ease;
+  }
+  .menu-row[data-highlighted]::before { height: 55%; opacity: 1; }
+
+  /* Left-edge rose tick that lights on hover/selection (Armada's menu rows). */
+  .gutter-tick { position: relative; }
+  .gutter-tick::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    height: 0;
+    width: 2px;
+    border-radius: 2px;
+    background: hsl(var(--primary));
+    opacity: 0;
+    transition: height 120ms ease, opacity 120ms ease, box-shadow 120ms ease;
+  }
+  .gutter-tick:hover::before { height: 45%; opacity: 0.6; }
+  .gutter-tick.is-active::before {
+    height: 70%;
+    opacity: 1;
+    box-shadow: 0 0 8px hsl(var(--primary) / 0.7);
+  }
+}
+
+/* The crest's one-shot draw and the terminal caret (armada's
+   ArmadaCrestKeyframes). Kept in the stylesheet rather than an inline <style>
+   so the bundle stays inside the CSP's assumptions. */
+@keyframes armada-trace {
+  0% { opacity: 1; stroke-dashoffset: 1; }
+  76% { opacity: 1; stroke-dashoffset: 0; }
+  100% { opacity: 0; stroke-dashoffset: 0; }
+}
+@keyframes armada-ink {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes armada-sheen {
+  0%, 100% { opacity: 0; }
+  45% { opacity: 1; }
+}
+@keyframes armada-sweep {
+  from { opacity: 0; transform: scaleX(0.15); }
+  to { opacity: 1; transform: scaleX(1); }
+}
+@keyframes armada-wake {
+  0%, 100% { transform: scaleX(1); }
+  50% { transform: scaleX(0.78); }
+}
+@keyframes armada-caret {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+@keyframes armada-bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(3px); }
+}
+/* The link between two bridged panes: a packet of light running the wire. */
+@keyframes bridge-flow {
+  from { transform: translateY(-100%); }
+  to { transform: translateY(300%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  [class*="animate-[armada-"],
+  [class*="animate-[bridge-"] { animation: none !important; }
+}
