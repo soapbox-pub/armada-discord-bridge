@@ -238,6 +238,8 @@ pub struct Importer {
     rest: DiscordRest,
     /// Imports with a pipeline running in this process.
     running: Mutex<HashSet<String>>,
+    /// History messages published by this process, for throughput.
+    history_published: std::sync::atomic::AtomicU64,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -265,11 +267,15 @@ fn overlay_progress(plan: &mut ImportPlan, progress: &Value) {
 
 impl Importer {
     pub fn new(pool: Pool, env: crate::env::PortalEnv, host: Arc<dyn BridgeHost>, io: ImporterIo) -> Arc<Importer> {
-        Arc::new(Importer { pool, env, host, io, rest: DiscordRest::new(), running: Mutex::default() })
+        Arc::new(Importer { pool, env, host, io, rest: DiscordRest::new(), running: Mutex::default(), history_published: Default::default() })
     }
 
     pub fn active_count(&self) -> usize {
         lock(&self.running).len()
+    }
+
+    pub fn history_published(&self) -> u64 {
+        self.history_published.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn row(&self, import_id: &str, owner: Option<&str>) -> anyhow::Result<Option<ImportRow>> {
@@ -1224,6 +1230,7 @@ impl Importer {
                     skipped += 1;
                     continue;
                 }
+                self.history_published.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(25)).await; // relay pacing
             }
             published += 1;

@@ -147,6 +147,10 @@ impl Hub {
     pub fn connected(&self) -> Vec<String> {
         self.pool.connected()
     }
+
+    pub fn stats(&self) -> std::collections::BTreeMap<String, relay_pool::RelayStats> {
+        self.pool.stats()
+    }
 }
 
 /// Route pool events to their subscriptions until the pool goes away.
@@ -204,6 +208,10 @@ pub struct Relays {
 impl Relays {
     pub fn urls(&self) -> &[String] {
         &self.urls
+    }
+
+    pub fn hub(&self) -> &Arc<Hub> {
+        &self.hub
     }
 
     /// The same connections aimed at a different relay list.

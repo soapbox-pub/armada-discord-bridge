@@ -21,12 +21,30 @@ fn rss_mb() -> u64 {
 
 fn memory_line(manager: &BridgeManager, importer: &Importer) -> String {
     format!(
-        "memory rss={}MB bridges={} imports={} communities={}",
+        "memory rss={}MB bridges={} imports={} history_published={} communities={}",
         rss_mb(),
         manager.live_count(),
         importer.active_count(),
+        importer.history_published(),
         manager.communities()
     )
+}
+
+/// One line on every relay: sockets open, REQs on them, and how it has
+/// pushed back since boot. A relay refusing subscriptions was only visible
+/// as thousands of warnings in the journal (2026-10-16).
+fn relays_line(manager: &BridgeManager) -> String {
+    let relays: Vec<String> = manager
+        .relay_stats()
+        .iter()
+        .map(|(url, (sockets, s))| {
+            format!(
+                "{url} sockets={sockets} reqs={} refused={} closed={} auth_rejected={} connects={} connect_failures={}",
+                s.reqs, s.refused, s.closed, s.auth_rejected, s.connects, s.connect_failures
+            )
+        })
+        .collect();
+    format!("relays: {}", relays.join("; "))
 }
 
 #[tokio::main]
@@ -81,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::select! { _ = tick.tick() => {}, _ = usr2.recv() => {} }
                 tracing::info!("{}", memory_line(&manager, &importer));
+                tracing::info!("{}", relays_line(&manager));
             }
         });
     }

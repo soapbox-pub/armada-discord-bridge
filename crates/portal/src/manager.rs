@@ -349,6 +349,33 @@ impl BridgeManager {
         lock(&self.communities).values().filter(|s| s.try_lock().is_ok_and(|s| s.live.strong_count() > 0)).count()
     }
 
+    /// Relay counters summed over every connection set in use, with how many
+    /// sockets are open to each relay.
+    pub fn relay_stats(&self) -> std::collections::BTreeMap<String, (usize, relay_pool::RelayStats)> {
+        let mut hubs: Vec<Arc<Hub>> = vec![self.bootstrap.clone()];
+        for slot in lock(&self.communities).values() {
+            if let Ok(slot) = slot.try_lock()
+                && let Some(community) = slot.live.upgrade()
+                && !hubs.iter().any(|h| Arc::ptr_eq(h, community.relays.hub()))
+            {
+                hubs.push(community.relays.hub().clone());
+            }
+        }
+        let mut out: std::collections::BTreeMap<String, (usize, relay_pool::RelayStats)> = Default::default();
+        for (url, s) in hubs.iter().flat_map(|h| h.stats()) {
+            let (sockets, t) = out.entry(url).or_default();
+            *sockets += usize::from(s.connected);
+            t.connected |= s.connected;
+            t.connects += s.connects;
+            t.connect_failures += s.connect_failures;
+            t.refused += s.refused;
+            t.closed += s.closed;
+            t.auth_rejected += s.auth_rejected;
+            t.reqs += s.reqs;
+        }
+        out
+    }
+
     pub async fn init(&self) -> anyhow::Result<()> {
         if self.env.discord_bot_token.is_empty() {
             tracing::warn!("DISCORD_TOKEN not set; bridges cannot go live");
