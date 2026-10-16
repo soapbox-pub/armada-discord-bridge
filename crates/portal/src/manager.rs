@@ -138,7 +138,7 @@ const DIRECTORY_WAIT: Duration = Duration::from_secs(30);
 /// Reported and reset with each `start_all`, so a boot's REST cost is visible.
 #[derive(Default)]
 struct DiscordCalls {
-    /// Bridges into servers the bot is no longer in: nothing to fetch.
+    /// Bridges paused because the bot is no longer in their server.
     removed: AtomicUsize,
     names_known: AtomicUsize,
     names_fetched: AtomicUsize,
@@ -150,7 +150,7 @@ impl DiscordCalls {
     fn take(&self) -> String {
         let n = |a: &AtomicUsize| a.swap(0, Ordering::Relaxed);
         format!(
-            "{} in servers the bot was removed from; names: {} from the gateway, {} via REST; Discord catch-up: {} skipped, {} fetched",
+            "{} paused (bot removed from their server); names: {} from the gateway, {} via REST; Discord catch-up: {} skipped, {} fetched",
             n(&self.removed),
             n(&self.names_known),
             n(&self.names_fetched),
@@ -182,6 +182,21 @@ async fn stage<T>(name: &str, limit: Duration, fut: impl std::future::Future<Out
 #[derive(Debug, thiserror::Error)]
 #[error("Discord gateway not connected; deferring bridge start")]
 pub struct GatewayUnavailable;
+
+/// Raised when a bridge's Discord server is one the bot is no longer in. Not a
+/// start failure: nothing about the community is wrong, and retrying cannot
+/// help until someone re-adds the bot. The bridge is paused instead, marked so
+/// that re-adding the bot resumes it (see `pause_bot_removed`).
+#[derive(Debug, thiserror::Error)]
+#[error("the bot was removed from this Discord server")]
+pub struct BotRemoved;
+
+/// `options` keys marking a pause the portal made, not a person. Only such a
+/// pause is ever lifted automatically; any other stop clears them.
+const PAUSED_FOR: &str = "pausedFor";
+const RESUME_TO: &str = "resumeTo";
+const BOT_REMOVED: &str = "bot-removed";
+const BOT_REMOVED_DETAIL: &str = "The bot was removed from this Discord server. Add it back and the bridge resumes on its own.";
 
 /// The kind-10304 command manifest every bridge primary advertises.
 pub fn bridge_commands() -> Vec<BotCommand> {
@@ -339,6 +354,14 @@ impl BridgeManager {
             tracing::warn!("DISCORD_TOKEN not set; bridges cannot go live");
         } else {
             self.connect_adapter(0).await;
+        }
+        if let Some(adapter) = self.adapter() {
+            // The bot may have been re-added while the portal was down.
+            for guild in self.bot_removed_guilds().await? {
+                if adapter.in_guild(&guild) == Some(true) {
+                    self.resume_bot_removed(&guild).await?;
+                }
+            }
         }
         self.start_all(self.bridges_to_start().await?).await;
         self.booted.store(true, Ordering::SeqCst);
@@ -604,6 +627,12 @@ impl BridgeManager {
         if row.status == "active" && self.adapter().is_none() {
             return Err(GatewayUnavailable.into());
         }
+        // Before any relay work: nothing it brings up could reach Discord.
+        if let (Some(adapter), Some(guild)) = (self.adapter(), row.discord_guild_id.as_deref())
+            && adapter.in_guild(guild) == Some(false)
+        {
+            return Err(BotRemoved.into());
+        }
         let (Some(invite_sealed), Some(master_sealed), Some(primary_sealed)) =
             (&row.invite_url_sealed, &row.master_secret_sealed, &row.primary_sk_sealed)
         else {
@@ -658,15 +687,7 @@ impl BridgeManager {
         // None, and writing None over a correct name blanked the dashboard on
         // one rate-limited boot; keep what we knew unless Discord answered.
         let adapter = self.adapter();
-        let removed = match (&adapter, row.discord_guild_id.as_deref()) {
-            (Some(a), Some(guild)) => a.in_guild(guild) == Some(false),
-            _ => false,
-        };
-        if removed {
-            self.discord_calls.removed.fetch_add(1, Ordering::Relaxed);
-        }
         let (discord_name, guild_name) = match &adapter {
-            Some(_) if removed => (None, None),
             Some(a) => {
                 let calls = &self.discord_calls;
                 let known = |name: Option<String>| {
@@ -1147,14 +1168,15 @@ impl BridgeManager {
         if status == "unlinked" {
             db.execute(
                 "UPDATE bridges SET status = 'unlinked', status_detail = $2, invite_url_sealed = NULL,
-                   master_secret_sealed = NULL, primary_sk_sealed = NULL, updated_at = now()
+                   master_secret_sealed = NULL, primary_sk_sealed = NULL, options = options - 'pausedFor' - 'resumeTo', updated_at = now()
                  WHERE bridge_id = ($1::text)::uuid",
                 &[&bridge_id, &detail],
             )
             .await?;
         } else {
             db.execute(
-                "UPDATE bridges SET status = $2, status_detail = $3, updated_at = now() WHERE bridge_id = ($1::text)::uuid",
+                "UPDATE bridges SET status = $2, status_detail = $3, options = options - 'pausedFor' - 'resumeTo', updated_at = now()
+                 WHERE bridge_id = ($1::text)::uuid",
                 &[&bridge_id, &status, &detail],
             )
             .await?;
@@ -1164,7 +1186,12 @@ impl BridgeManager {
 
     pub async fn resume(&self, bridge_id: &str) -> anyhow::Result<()> {
         let row = bridge_by_id(&self.pool, bridge_id).await?.context("no such bridge")?;
-        let next = if row.status == "paused" {
+        // A pause the portal made records what it paused, so a pending link
+        // stays pending (still owed its in-channel confirm) when resumed by hand.
+        let resume_to = row.options.get(RESUME_TO).and_then(Value::as_str);
+        let next = if row.status == "paused" && resume_to == Some("pending_confirm") {
+            "pending_confirm"
+        } else if row.status == "paused" {
             "active"
         } else if row.confirm_code.is_some() && !self.is_live(bridge_id) {
             "pending_confirm"
@@ -1174,7 +1201,10 @@ impl BridgeManager {
         self.pool
             .get()
             .await?
-            .execute("UPDATE bridges SET status = $2, updated_at = now() WHERE bridge_id = ($1::text)::uuid", &[&bridge_id, &next])
+            .execute(
+                "UPDATE bridges SET status = $2, options = options - 'pausedFor' - 'resumeTo', updated_at = now() WHERE bridge_id = ($1::text)::uuid",
+                &[&bridge_id, &next],
+            )
             .await?;
         let fresh = bridge_by_id(&self.pool, bridge_id).await?.context("no such bridge")?;
         self.start_tracked(fresh, 0).await;
@@ -1200,6 +1230,11 @@ impl BridgeManager {
                         tracing::warn!(bridge = %row.bridge_id, error = %format!("{error:#}"), "could not clear start-failure marker");
                     }
                 }
+                Err(error) if error.is::<BotRemoved>() => {
+                    if let Err(error) = self.pause_bot_removed(&row.bridge_id, &row.status).await {
+                        tracing::error!(bridge = %row.bridge_id, error = %format!("{error:#}"), "could not pause a bridge whose server removed the bot");
+                    }
+                }
                 Err(error) if error.is::<GatewayUnavailable>() => {
                     // Not a start failure: the community is fine, the local
                     // gateway is down. Retry without touching the sever streak.
@@ -1216,6 +1251,90 @@ impl BridgeManager {
                 }
             }
         })
+    }
+
+    /// Pause a bridge whose Discord server the bot is no longer in, marked as
+    /// the portal's pause so `resume_bot_removed` can lift it. A person's pause
+    /// carries no mark and is never lifted for them.
+    async fn pause_bot_removed(&self, bridge_id: &str, was: &str) -> anyhow::Result<()> {
+        self.stop(bridge_id, "paused", Some(BOT_REMOVED_DETAIL)).await?;
+        self.pool
+            .get()
+            .await?
+            .execute(
+                "UPDATE bridges SET options = (options - 'startFailedAt') || jsonb_build_object($2::text, $3::text, $4::text, $5::text)
+                 WHERE bridge_id = ($1::text)::uuid",
+                &[&bridge_id, &PAUSED_FOR, &BOT_REMOVED, &RESUME_TO, &was],
+            )
+            .await?;
+        self.discord_calls.removed.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(bridge = %bridge_id, "paused: the bot was removed from its Discord server");
+        Ok(())
+    }
+
+    /// Servers holding bridges the portal paused because the bot was removed.
+    async fn bot_removed_guilds(&self) -> anyhow::Result<Vec<String>> {
+        let rows = self
+            .pool
+            .get()
+            .await?
+            .query(
+                "SELECT DISTINCT discord_guild_id FROM bridges
+                 WHERE status = 'paused' AND options->>'pausedFor' = $1 AND discord_guild_id IS NOT NULL",
+                &[&BOT_REMOVED],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    /// The bot is in `guild_id` again: put back every bridge there the portal
+    /// paused for its absence, as it was, and return them to start. One whose
+    /// channel has since been linked by another bridge stays paused: the
+    /// one-bridge-per-channel index would refuse it, and the newer link wins.
+    async fn resume_bot_removed(&self, guild_id: &str) -> anyhow::Result<Vec<BridgeRow>> {
+        let sql = format!(
+            "UPDATE bridges b SET status = CASE WHEN b.options->>'resumeTo' = 'pending_confirm' THEN 'pending_confirm' ELSE 'active' END,
+               status_detail = NULL, options = b.options - 'pausedFor' - 'resumeTo', updated_at = now()
+             WHERE b.status = 'paused' AND b.options->>'pausedFor' = $2 AND b.discord_guild_id = $1
+               AND NOT EXISTS (
+                 SELECT 1 FROM bridges o WHERE o.discord_channel_id = b.discord_channel_id
+                   AND o.status IN ('pending_confirm', 'active') AND o.bridge_id <> b.bridge_id)
+             RETURNING {}",
+            BRIDGE_COLUMNS.replace("bridge_id::text", "b.bridge_id::text")
+        );
+        let rows: Vec<BridgeRow> = self.pool.get().await?.query(&sql, &[&guild_id, &BOT_REMOVED]).await?.iter().map(BridgeRow::from_row).collect();
+        if !rows.is_empty() {
+            tracing::info!(guild = guild_id, count = rows.len(), "bot is back in a Discord server; resuming its bridges");
+        }
+        Ok(rows)
+    }
+
+    /// GUILD_DELETE for a server the bot was removed from: pause what runs there.
+    async fn on_guild_removed(&self, guild_id: &str) {
+        let affected: Vec<(String, LiveStatus)> =
+            lock(&self.running).values().filter(|rb| rb.link.discord_guild_id == guild_id).map(|rb| (rb.id.clone(), rb.status())).collect();
+        for (id, status) in affected {
+            let was = if status == LiveStatus::PendingConfirm { "pending_confirm" } else { "active" };
+            if let Err(error) = self.pause_bot_removed(&id, was).await {
+                tracing::error!(bridge = %id, error = %format!("{error:#}"), "could not pause a bridge whose server removed the bot");
+            }
+        }
+    }
+
+    /// GUILD_CREATE: on connect for every server, and when the bot is added to
+    /// one. Boot handles the first kind itself; after it, this resumes.
+    async fn on_guild_available(&self, guild_id: &str) {
+        if !self.booted.load(Ordering::SeqCst) {
+            return;
+        }
+        match self.resume_bot_removed(guild_id).await {
+            Ok(rows) => {
+                for row in rows {
+                    self.start_tracked(row, 0).await;
+                }
+            }
+            Err(error) => tracing::error!(guild = guild_id, error = %format!("{error:#}"), "could not resume bridges for a server the bot rejoined"),
+        }
     }
 
     async fn handle_start_failure(&self, row: &BridgeRow, detail: &str, attempt: u32) -> anyhow::Result<()> {
@@ -1394,6 +1513,16 @@ impl DiscordEvents for ManagerEvents {
     async fn on_reaction_remove(&self, r: DiscordReaction) {
         route!(self, &r.channel_id, |router, link| router.on_discord_reaction_remove(&r, link).await)
     }
+    async fn on_guild_available(&self, guild_id: String) {
+        if let Some(manager) = self.0.upgrade() {
+            manager.on_guild_available(&guild_id).await;
+        }
+    }
+    async fn on_guild_removed(&self, guild_id: String) {
+        if let Some(manager) = self.0.upgrade() {
+            manager.on_guild_removed(&guild_id).await;
+        }
+    }
     async fn on_typing(&self, t: TypingEvent) {
         if t.bot {
             return;
@@ -1441,6 +1570,63 @@ mod tests {
         let other = unseal(SEAL_KEY, &mgr.shared_master_secret(&community, "100000000000000009").await.unwrap()).unwrap();
         assert_ne!(first, other);
         pool.get().await.unwrap().execute("DELETE FROM guild_community_secrets WHERE community_id = $1", &[&community]).await.unwrap();
+    }
+
+    async fn insert_bridge(pool: &Pool, guild: &str, channel: &str, status: &str) -> String {
+        let id: String = pool
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "INSERT INTO bridges (bridge_id, owner_discord_id, status, discord_guild_id, discord_channel_id, options)
+                 VALUES (gen_random_uuid(), 'owner', $3, $1, $2, '{}') RETURNING bridge_id::text",
+                &[&guild, &channel, &status],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        id
+    }
+
+    async fn status_of(pool: &Pool, id: &str) -> (String, Value) {
+        let row = bridge_by_id(pool, id).await.unwrap().unwrap();
+        (row.status, row.options)
+    }
+
+    #[tokio::test]
+    async fn a_bot_removed_pause_is_lifted_when_the_bot_returns_and_a_persons_never_is() {
+        let Some(pool) = test_pool().await else { return };
+        let mgr = BridgeManager::new(pool.clone(), env());
+        let guild = format!("9{}", std::process::id());
+        let ch = |n: u32| format!("{guild}{n}");
+        let active = insert_bridge(&pool, &guild, &ch(1), "active").await;
+        let pending = insert_bridge(&pool, &guild, &ch(2), "pending_confirm").await;
+        let by_hand = insert_bridge(&pool, &guild, &ch(3), "active").await;
+        let taken = insert_bridge(&pool, &guild, &ch(4), "active").await;
+
+        mgr.pause_bot_removed(&active, "active").await.unwrap();
+        mgr.pause_bot_removed(&pending, "pending_confirm").await.unwrap();
+        mgr.pause_bot_removed(&taken, "active").await.unwrap();
+        mgr.pause_bot_removed(&by_hand, "active").await.unwrap();
+        let (status, options) = status_of(&pool, &active).await;
+        assert_eq!((status.as_str(), options[PAUSED_FOR].as_str()), ("paused", Some(BOT_REMOVED)));
+        // A person pausing it themselves takes the pause over: no mark.
+        mgr.stop(&by_hand, "paused", None).await.unwrap();
+        assert!(status_of(&pool, &by_hand).await.1.get(PAUSED_FOR).is_none());
+        // Meanwhile someone linked another bridge to one of the channels.
+        insert_bridge(&pool, &guild, &ch(4), "active").await;
+
+        assert!(mgr.bot_removed_guilds().await.unwrap().contains(&guild));
+        let resumed: Vec<String> = mgr.resume_bot_removed(&guild).await.unwrap().into_iter().map(|r| r.bridge_id).collect();
+        assert_eq!(resumed.len(), 2);
+        assert_eq!(status_of(&pool, &active).await.0, "active");
+        // Still owed its in-channel confirm.
+        assert_eq!(status_of(&pool, &pending).await.0, "pending_confirm");
+        assert!(status_of(&pool, &pending).await.1.get(RESUME_TO).is_none());
+        assert_eq!(status_of(&pool, &by_hand).await.0, "paused");
+        assert_eq!(status_of(&pool, &taken).await.0, "paused", "the newer link keeps the channel");
+
+        pool.get().await.unwrap().execute("DELETE FROM bridges WHERE discord_guild_id = $1", &[&guild]).await.unwrap();
     }
 
     #[test]
