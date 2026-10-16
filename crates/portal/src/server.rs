@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::auth::{SessionData, SessionGuild, SessionUser, Sessions, require_session};
-use crate::discord_rest::{DiscordRest, OAuthGuild, bot_install_url, can_manage, oauth_url};
+use crate::discord_rest::{CannotCreateChannels, DiscordRest, OAuthGuild, bot_install_url, bot_install_url_create, can_manage, discord_channel_name, oauth_url};
 use crate::env::PortalEnv;
 use crate::importer::{ConfirmBody, Importer, PrepareBody, Preview};
 use crate::manager::{BRIDGE_COLUMNS, BridgeManager, BridgeRow};
@@ -456,10 +456,37 @@ async fn guild_channels(State(st): State<AppState>, headers: HeaderMap, Path(gui
     if st.env.discord_bot_token.is_empty() {
         return Ok(err(StatusCode::NOT_IMPLEMENTED, "bot token not configured"));
     }
-    Ok(match st.rest.bot_guild_text_channels(&st.env.discord_bot_token, &guild_id).await? {
-        None => Json(json!({ "present": false, "installUrl": bot_install_url(&st.env.discord_client_id, &guild_id) })).into_response(),
-        Some(channels) => Json(json!({ "present": true, "channels": channels })).into_response(),
-    })
+    let Some(all) = st.rest.bot_guild_channels(&st.env.discord_bot_token, &guild_id).await? else {
+        return Ok(Json(json!({ "present": false, "installUrl": bot_install_url(&st.env.discord_client_id, &guild_id) })).into_response());
+    };
+    let mut text: Vec<_> = all.iter().filter(|c| c.kind == 0).collect();
+    text.sort_by_key(|c| c.position);
+    let ids: Vec<String> = text.iter().map(|c| c.id.clone()).collect();
+    let bridged: Vec<String> = st
+        .pool
+        .get()
+        .await?
+        .query("SELECT discord_channel_id FROM bridges WHERE discord_channel_id = ANY($1) AND status IN ('pending_confirm', 'active')", &[&ids])
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let category = |id: &Option<String>| id.as_ref().and_then(|id| all.iter().find(|c| &c.id == id && c.kind == 4)).map(|c| c.name.clone());
+    let channels: Vec<Value> = text
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.id, "name": c.name, "position": c.position, "category": category(&c.parent_id),
+                "empty": c.last_message_id.is_none(), "bridged": bridged.contains(&c.id),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "present": true,
+        "channels": channels,
+        "createInstallUrl": bot_install_url_create(&st.env.discord_client_id, &guild_id),
+    }))
+    .into_response())
 }
 
 // ── Server import ────────────────────────────────────────────────────────────
@@ -599,11 +626,36 @@ async fn bridge_create(State(st): State<AppState>, headers: HeaderMap, body: Opt
             &[&session.user.id, &seal(&st.env.seal_key_hex, &invite)?, &inspected.community_id, &inspected.name],
         )
         .await?;
-    let channels: Vec<Value> = inspected.channels.iter().map(|(id, name)| json!({ "idHex": id, "name": name })).collect();
+    let ids: Vec<String> = inspected.channels.iter().map(|c| c.id_hex.clone()).collect();
+    let bridged: Vec<String> = st
+        .pool
+        .get()
+        .await?
+        .query(
+            "SELECT concord_channel_id FROM bridges WHERE community_id = $1 AND concord_channel_id = ANY($2) AND status IN ('pending_confirm', 'active')",
+            &[&inspected.community_id, &ids],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let channels: Vec<Value> = inspected
+        .channels
+        .iter()
+        .map(|c| {
+            json!({
+                "idHex": c.id_hex, "name": c.name, "category": c.category, "private": c.private, "forum": c.forum,
+                "position": c.position, "bridged": bridged.contains(&c.id_hex),
+            })
+        })
+        .collect();
+    let can_create = st.importer.import_for_community(&inspected.community_id, &session.user.id).await?.is_some();
     Ok(Json(json!({
         "bridgeId": row.get::<_, String>(0),
         "community": { "idHex": inspected.community_id, "name": inspected.name, "relays": inspected.relays },
         "channels": channels,
+        "canCreateChannels": can_create,
+        "approvalUrl": approval_url(&st, &row.get::<_, String>(0)),
     }))
     .into_response())
 }
@@ -683,6 +735,341 @@ async fn bridge_link(State(st): State<AppState>, headers: HeaderMap, Path(id): P
     Ok(Json(json!({ "ok": true, "status": "pending_confirm" })).into_response())
 }
 
+/// Most channels one request links.
+const MAX_LINKED: usize = 100;
+
+/// NIP-98 HTTP auth, the shape an approval is signed in.
+const HTTP_AUTH_KIND: u16 = 27235;
+
+/// How far an approval's `created_at` may sit from now. Replaying one inside
+/// the window links nothing new: its channels are bridged by then.
+const APPROVAL_WINDOW_SECS: u64 = 120;
+
+/// One row of the channel map: a Discord side and an Armada side, each an
+/// existing channel or one to create, and an optional history copy.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MapPair {
+    discord_channel_id: Option<String>,
+    create_discord: Option<String>,
+    concord_channel_id: Option<String>,
+    create_concord: Option<String>,
+    /// The category a created channel goes under, on whichever side creates it.
+    category: Option<String>,
+    /// `discord` copies Discord's past messages into Armada, `armada` the reverse.
+    history: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LinkMany {
+    guild_id: String,
+    consent: bool,
+    pairs: Vec<MapPair>,
+}
+
+#[derive(Deserialize)]
+struct LinkManyBody {
+    /// The `LinkMany`, as the JSON string the browser sent: an approval signs
+    /// its hash, so it is parsed from these exact bytes and never re-encoded.
+    request: String,
+    /// A NIP-98 event over `request`, by an Armada key that holds Manage
+    /// Channels in the community. Present, it stands in for the in-channel
+    /// confirm.
+    approval: Option<Value>,
+}
+
+/// The URL an approval for this draft names.
+fn approval_url(st: &AppState, draft_id: &str) -> String {
+    format!("{}/api/bridges/{draft_id}/link-many", st.env.base_url.trim_end_matches('/'))
+}
+
+/// The key that signed `approval`, if it is a fresh NIP-98 authorization of
+/// exactly this request at exactly this URL.
+///
+/// Every binding matters. Without the payload hash, an approval for two
+/// channels would authorise any channels at all; without the URL, one for a
+/// different community's draft; without the time window, one leaked from any
+/// earlier session, forever.
+fn approval_signer(approval: &Value, url: &str, request: &str) -> Result<String, &'static str> {
+    use nostr::prelude::*;
+    let event = Event::from_json(approval.to_string()).map_err(|_| "the approval is not a Nostr event")?;
+    event.verify().map_err(|_| "the approval's signature does not verify")?;
+    if event.kind != Kind::Custom(HTTP_AUTH_KIND) {
+        return Err("the approval is not an HTTP authorization (kind 27235)");
+    }
+    let tag = |name: &str| event.tags.iter().find(|t| t.as_slice().first().is_some_and(|n| n == name)).and_then(|t| t.as_slice().get(1).cloned());
+    if tag("u").as_deref() != Some(url) || !tag("method").is_some_and(|m| m.eq_ignore_ascii_case("POST")) {
+        return Err("the approval is for a different request");
+    }
+    if tag("payload").as_deref() != Some(hex::encode(Sha256::digest(request.as_bytes())).as_str()) {
+        return Err("the approval does not match these channels");
+    }
+    let now = (now_ms() / 1000) as u64;
+    if event.created_at.as_secs().abs_diff(now) > APPROVAL_WINDOW_SECS {
+        return Err("the approval has expired; sign it again");
+    }
+    Ok(event.pubkey.to_hex())
+}
+
+fn is_unique_violation(error: &anyhow::Error) -> bool {
+    error.chain().any(|e| e.downcast_ref::<tokio_postgres::Error>().and_then(|e| e.code()) == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION))
+}
+
+/// The channel map: link many channels of one Discord server and one Armada
+/// community at once, creating what is missing on either side, with history.
+///
+/// Everything is checked before anything is created, in the order a failure
+/// is likeliest, and creation goes Discord first: a Discord channel the bot
+/// made is one click to delete, while an Armada channel edition is permanent.
+async fn bridge_link_many(State(st): State<AppState>, headers: HeaderMap, Path(id): Path<String>, Json(body): Json<LinkManyBody>) -> Res {
+    let session = session_or_401!(st, headers);
+    let Some(draft) = owned_bridge(&st, &id, &session.user.id).await? else { return Ok(err(StatusCode::NOT_FOUND, "not found")) };
+    if draft.status != "draft" {
+        return Ok(err(StatusCode::CONFLICT, format!("bridge is {}, not draft", draft.status)));
+    }
+    let Ok(req) = serde_json::from_str::<LinkMany>(&body.request) else { return Ok(err(StatusCode::BAD_REQUEST, "the request does not parse")) };
+    if !req.consent {
+        return Ok(err(StatusCode::BAD_REQUEST, "the encryption disclosure must be explicitly accepted"));
+    }
+    if req.pairs.is_empty() || req.pairs.len() > MAX_LINKED {
+        return Ok(err(StatusCode::BAD_REQUEST, format!("link between 1 and {MAX_LINKED} channels at a time")));
+    }
+    check!(guild_authority(&st, &headers, &session, &req.guild_id).await?);
+    let token = st.env.discord_bot_token.clone();
+    if token.is_empty() {
+        return Ok(err(StatusCode::NOT_IMPLEMENTED, "bot token not configured"));
+    }
+    // The same tie as `bridge_link`: authority over the guild says nothing
+    // about a channel id that merely arrived beside it.
+    let Some(guild_channels) = st.rest.bot_guild_channels(&token, &req.guild_id).await? else {
+        return Ok(err(StatusCode::CONFLICT, "the bot is not in that guild"));
+    };
+    let invite = unseal(&st.env.seal_key_hex, draft.invite_url_sealed.as_deref().ok_or_else(|| anyhow::anyhow!("draft has no invite"))?)?;
+    let community_id = draft.community_id.clone().unwrap_or_default();
+    let community = match st.manager.inspect_invite(&invite).await {
+        Ok(c) if c.community_id == community_id => c,
+        Ok(_) => return Ok(err(StatusCode::CONFLICT, "the invite now resolves to a different community; start over")),
+        Err(error) => return Ok(err(StatusCode::BAD_GATEWAY, format!("could not read the community: {error:#}"))),
+    };
+
+    let mut discord_seen = std::collections::HashSet::new();
+    let mut concord_seen = std::collections::HashSet::new();
+    for (i, p) in req.pairs.iter().enumerate() {
+        let row = i + 1;
+        let blank = |s: &Option<String>| s.as_deref().is_none_or(|s| s.trim().is_empty());
+        match (&p.discord_channel_id, blank(&p.create_discord)) {
+            (Some(d), true) => {
+                if !guild_channels.iter().any(|c| &c.id == d && c.kind == 0) {
+                    return Ok(err(StatusCode::FORBIDDEN, format!("row {row}: that channel is not in that guild")));
+                }
+                if !discord_seen.insert(d.clone()) {
+                    return Ok(err(StatusCode::BAD_REQUEST, format!("row {row}: a Discord channel can be linked only once")));
+                }
+            }
+            (None, false) => {}
+            _ => return Ok(err(StatusCode::BAD_REQUEST, format!("row {row}: pick one Discord channel, or one to create"))),
+        }
+        match (&p.concord_channel_id, blank(&p.create_concord)) {
+            (Some(c), true) => {
+                if !community.channels.iter().any(|x| &x.id_hex == c) {
+                    return Ok(err(StatusCode::BAD_REQUEST, format!("row {row}: that channel is not in the community")));
+                }
+                if !concord_seen.insert(c.clone()) {
+                    return Ok(err(StatusCode::BAD_REQUEST, format!("row {row}: an Armada channel can be linked only once")));
+                }
+            }
+            (None, false) => {}
+            _ => return Ok(err(StatusCode::BAD_REQUEST, format!("row {row}: pick one Armada channel, or one to create"))),
+        }
+        if p.discord_channel_id.is_none() && p.concord_channel_id.is_none() {
+            return Ok(err(StatusCode::BAD_REQUEST, format!("row {row}: one side has to exist already")));
+        }
+        match p.history.as_deref() {
+            None | Some("none") => {}
+            Some("discord") if p.discord_channel_id.is_some() => {}
+            Some("armada") if p.concord_channel_id.is_some() => {}
+            _ => return Ok(err(StatusCode::BAD_REQUEST, format!("row {row}: history can only come from a channel that exists"))),
+        }
+    }
+
+    let db = st.pool.get().await?;
+    let discord_ids: Vec<String> = discord_seen.iter().cloned().collect();
+    let concord_ids: Vec<String> = concord_seen.iter().cloned().collect();
+    let taken = db
+        .query_opt(
+            "SELECT 1 FROM bridges WHERE status IN ('pending_confirm', 'active')
+               AND (discord_channel_id = ANY($1) OR (community_id = $2 AND concord_channel_id = ANY($3))) LIMIT 1",
+            &[&discord_ids, &community_id, &concord_ids],
+        )
+        .await?;
+    drop(db);
+    if taken.is_some() {
+        return Ok(err(StatusCode::CONFLICT, "one of those channels is already bridged; reload the map"));
+    }
+    // Discord cannot place a message before ones already there, so Armada's
+    // history goes only into an empty channel, or it would read as new.
+    for p in req.pairs.iter().filter(|p| p.history.as_deref() == Some("armada")) {
+        let Some(d) = &p.discord_channel_id else { continue };
+        if st.rest.bot_channel_messages_before(&token, d, None, 1).await?.is_some_and(|page| !page.is_empty()) {
+            let name = guild_channels.iter().find(|c| &c.id == d).map_or("", |c| c.name.as_str());
+            return Ok(err(
+                StatusCode::CONFLICT,
+                format!("#{name} has messages, so Armada's history can't go into it: Discord would show it as newer than they are"),
+            ));
+        }
+    }
+
+    let approved = match &body.approval {
+        None => false,
+        Some(approval) => {
+            let signer = match approval_signer(approval, &approval_url(&st, &id), &body.request) {
+                Ok(pk) => pk,
+                Err(why) => return Ok(err(StatusCode::BAD_REQUEST, why)),
+            };
+            match st.manager.authorizes(&invite, &signer, concord::roles::perm::MANAGE_CHANNELS).await {
+                Ok(true) => true,
+                Ok(false) => {
+                    return Ok(err(StatusCode::FORBIDDEN, format!("that Armada key does not hold Manage Channels in {}", community.name)));
+                }
+                Err(error) => return Ok(err(StatusCode::BAD_GATEWAY, format!("could not check the key's roles: {error:#}"))),
+            }
+        }
+    };
+    let import_id = if req.pairs.iter().any(|p| p.create_concord.is_some()) {
+        match st.importer.import_for_community(&community_id, &session.user.id).await? {
+            Some(import_id) => Some(import_id),
+            None => {
+                return Ok(err(
+                    StatusCode::BAD_REQUEST,
+                    "the bridge can only create Armada channels in a community it imported for you; create them in Armada, then reload the map",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Discord first (see above). A refusal partway leaves what was made: the
+    // map shows them as existing channels on the next try.
+    let mut categories: std::collections::HashMap<String, String> =
+        guild_channels.iter().filter(|c| c.kind == 4).map(|c| (c.name.to_lowercase(), c.id.clone())).collect();
+    let mut discord_side = Vec::with_capacity(req.pairs.len());
+    for p in &req.pairs {
+        let Some(name) = p.create_discord.as_deref().filter(|_| p.discord_channel_id.is_none()) else {
+            discord_side.push(p.discord_channel_id.clone().unwrap_or_default());
+            continue;
+        };
+        let created = async {
+            let parent = match p.category.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+                Some(category) => match categories.get(&category.to_lowercase()) {
+                    Some(id) => Some(id.clone()),
+                    None => {
+                        let label: String = category.chars().take(100).collect();
+                        let made = st.rest.bot_create_channel(&token, &req.guild_id, &label, 4, None).await?;
+                        categories.insert(category.to_lowercase(), made.id.clone());
+                        Some(made.id)
+                    }
+                },
+                None => None,
+            };
+            st.rest.bot_create_channel(&token, &req.guild_id, &discord_channel_name(name), 0, parent.as_deref()).await
+        };
+        match created.await {
+            Ok(channel) => discord_side.push(channel.id),
+            Err(error) if error.is::<CannotCreateChannels>() => {
+                return Ok((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "the bot needs Manage Channels to create Discord channels; re-authorize it, then try again",
+                        "installUrl": bot_install_url_create(&st.env.discord_client_id, &req.guild_id),
+                    })),
+                )
+                    .into_response());
+            }
+            Err(error) => return Ok(err(StatusCode::BAD_GATEWAY, format!("could not create #{name} on Discord: {error:#}"))),
+        }
+    }
+    let wanted: Vec<(String, Option<String>)> = req
+        .pairs
+        .iter()
+        .filter(|p| p.concord_channel_id.is_none())
+        .filter_map(|p| Some((p.create_concord.as_deref()?.trim().to_owned(), p.category.clone().filter(|c| !c.trim().is_empty()))))
+        .collect();
+    let mut made = match &import_id {
+        Some(import_id) => match st.importer.create_channels(import_id, &wanted).await {
+            Ok(made) => made.into_iter(),
+            Err(error) => return Ok(err(StatusCode::BAD_GATEWAY, format!("could not create the Armada channels: {error:#}"))),
+        },
+        None => Vec::new().into_iter(),
+    };
+
+    let code = random_hex(4);
+    let mut db = st.pool.get().await?;
+    let tx = db.transaction().await?;
+    let group: String = tx.query_one("SELECT gen_random_uuid()::text", &[]).await?.get(0);
+    let mut rows = Vec::with_capacity(req.pairs.len());
+    for (i, p) in req.pairs.iter().enumerate() {
+        let concord = match &p.concord_channel_id {
+            Some(c) => c.clone(),
+            None => made.next().ok_or_else(|| anyhow::anyhow!("created fewer Armada channels than asked"))?,
+        };
+        let history = match p.history.as_deref() {
+            Some(direction @ ("discord" | "armada")) => json!({ "direction": direction, "state": "pending", "imported": 0 }),
+            _ => json!({}),
+        };
+        // The draft carries the sealed invite; it becomes the first row.
+        let sql = if i == 0 {
+            format!(
+                "UPDATE bridges SET discord_guild_id = $2, discord_channel_id = $3, concord_channel_id = $4, link_group = ($5::text)::uuid,
+                   history = $6, updated_at = now() WHERE bridge_id = ($1::text)::uuid RETURNING {BRIDGE_COLUMNS}"
+            )
+        } else {
+            format!(
+                "INSERT INTO bridges (owner_discord_id, status, invite_url_sealed, community_id, community_name,
+                   discord_guild_id, discord_channel_id, concord_channel_id, link_group, history)
+                 SELECT owner_discord_id, 'draft', invite_url_sealed, community_id, community_name, $2, $3, $4, ($5::text)::uuid, $6
+                   FROM bridges WHERE bridge_id = ($1::text)::uuid
+                 RETURNING {BRIDGE_COLUMNS}"
+            )
+        };
+        let row = tx.query_one(&sql, &[&draft.bridge_id, &req.guild_id, &discord_side[i], &concord, &group, &history]).await?;
+        rows.push(BridgeRow::from_row(&row));
+    }
+    tx.commit().await?;
+    drop(db);
+
+    if let Err(error) = st.manager.activate_group(&rows, (!approved).then_some(code.as_str())).await {
+        // A race with another link for one of these channels: the unique
+        // indexes refused the provision. Nothing has started yet (the group
+        // starts only once all of it is provisioned), so unlink all of it
+        // rather than leave part of a map to come up on the next boot.
+        let ids: Vec<String> = rows.iter().map(|r| r.bridge_id.clone()).collect();
+        st.pool
+            .get()
+            .await?
+            .execute(
+                "UPDATE bridges SET status = 'unlinked', status_detail = 'link interrupted', invite_url_sealed = NULL,
+                   master_secret_sealed = NULL, primary_sk_sealed = NULL, updated_at = now()
+                 WHERE bridge_id::text = ANY($1)",
+                &[&ids],
+            )
+            .await?;
+        if is_unique_violation(&error) {
+            return Ok(err(StatusCode::CONFLICT, "one of those channels was bridged meanwhile; reload the map"));
+        }
+        return Err(error.into());
+    }
+    tracing::info!(group = %group, channels = rows.len(), approved, "linked a channel map");
+    Ok(Json(json!({
+        "ok": true,
+        "status": if approved { "active" } else { "pending_confirm" },
+        "bridgeIds": rows.iter().map(|r| r.bridge_id.clone()).collect::<Vec<_>>(),
+        "confirmCode": (!approved).then_some(code),
+    }))
+    .into_response())
+}
+
 async fn bridges_list(State(st): State<AppState>, headers: HeaderMap) -> Res {
     let session = session_or_401!(st, headers);
     // Shaped in SQL to match what the dashboard has always been sent: the
@@ -695,7 +1082,7 @@ async fn bridges_list(State(st): State<AppState>, headers: HeaderMap) -> Res {
         .await?
         .query(
             "SELECT row_to_json(x) FROM (
-               SELECT b.bridge_id, b.status, b.status_detail, b.community_name, b.community_id,
+               SELECT b.bridge_id, b.status, b.status_detail, b.community_name, b.community_id, b.history, b.link_group,
                       b.discord_guild_id, b.discord_channel_id, b.concord_channel_id, b.confirm_code,
                       b.discord_channel_name, b.concord_channel_name, b.discord_guild_name, b.primary_pk,
                       to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS created_at,
@@ -810,6 +1197,7 @@ pub fn app(st: AppState, web_dir: &str) -> anyhow::Result<Router> {
         .route("/communities/{community_id}/rerun-history", post(community_rerun_history))
         .route("/bridges", post(bridge_create).get(bridges_list))
         .route("/bridges/{id}/link", post(bridge_link))
+        .route("/bridges/{id}/link-many", post(bridge_link_many))
         .route("/bridges/{id}/pause", post(bridge_pause))
         .route("/bridges/{id}/resume", post(bridge_resume))
         .route("/bridges/{id}/unlink", post(bridge_unlink))
@@ -824,4 +1212,41 @@ pub fn app(st: AppState, web_dir: &str) -> anyhow::Result<Router> {
         .nest("/api", api)
         .fallback_service(spa)
         .layer(middleware::from_fn_with_state(over_https, security_headers)))
+}
+
+#[cfg(test)]
+mod tests {
+    use nostr::prelude::*;
+
+    use super::*;
+
+    const URL: &str = "https://portal.example/api/bridges/x/link-many";
+
+    fn approval(keys: &Keys, kind: u16, url: &str, request: &str, at: u64) -> Value {
+        let tags = [
+            Tag::parse(["u", url]).unwrap(),
+            Tag::parse(["method", "POST"]).unwrap(),
+            Tag::parse(["payload".to_string(), hex::encode(Sha256::digest(request.as_bytes()))]).unwrap(),
+        ];
+        let event = EventBuilder::new(Kind::Custom(kind), "").tags(tags).custom_created_at(Timestamp::from(at)).finalize(keys).unwrap();
+        serde_json::from_str(&event.as_json()).unwrap()
+    }
+
+    #[test]
+    fn an_approval_binds_the_signer_to_exactly_this_request() {
+        let keys = Keys::generate();
+        let now = (now_ms() / 1000) as u64;
+        let request = r#"{"guildId":"1","consent":true,"pairs":[]}"#;
+        let good = approval(&keys, HTTP_AUTH_KIND, URL, request, now);
+        assert_eq!(approval_signer(&good, URL, request), Ok(keys.public_key().to_hex()));
+
+        assert!(approval_signer(&good, URL, r#"{"guildId":"2","consent":true,"pairs":[]}"#).is_err(), "other channels");
+        assert!(approval_signer(&good, "https://portal.example/api/bridges/y/link-many", request).is_err(), "another draft");
+        assert!(approval_signer(&approval(&keys, 1, URL, request, now), URL, request).is_err(), "not NIP-98");
+        assert!(approval_signer(&approval(&keys, HTTP_AUTH_KIND, URL, request, now - 600), URL, request).is_err(), "stale");
+
+        let mut forged = good.clone();
+        forged["pubkey"] = json!(Keys::generate().public_key().to_hex());
+        assert!(approval_signer(&forged, URL, request).is_err(), "someone else's name on it");
+    }
 }

@@ -550,8 +550,7 @@ pub struct InspectedInvite {
     pub community_id: String,
     pub name: String,
     pub relays: Vec<String>,
-    /// (channel id hex, name)
-    pub channels: Vec<(String, String)>,
+    pub channels: Vec<ChannelView>,
 }
 
 fn random_hex(bytes: usize) -> String {
@@ -588,7 +587,7 @@ impl BridgeManager {
             community_id: m.community_id.clone(),
             name: m.name.clone(),
             relays: m.relays.clone(),
-            channels: client.channels().into_iter().map(|c| (c.id_hex, c.name)).collect(),
+            channels: client.channels(),
         })
     }
 
@@ -638,23 +637,36 @@ impl BridgeManager {
 
     /// Mint per-bridge secrets and move draft -> pending_confirm.
     pub async fn activate(&self, row: &BridgeRow) -> anyhow::Result<()> {
-        self.activate_with_code(row, &random_hex(4)).await
-    }
-
-    /// `activate`, under a code the caller chose: bridges linked together
-    /// share one, and confirming any of them confirms the group.
-    pub async fn activate_with_code(&self, row: &BridgeRow, code: &str) -> anyhow::Result<()> {
-        let fresh = self.provision(row, "pending_confirm", Some(code.to_owned())).await?;
+        let fresh = self.provision(row, "pending_confirm", Some(random_hex(4))).await?;
         self.start(&fresh).await
     }
 
-    /// Mint a bridge's identity and start it live, skipping the in-channel
-    /// confirm. Only for a link whose consent was already proven: a request
-    /// signed by a key that holds Manage Channels in the community, checked
-    /// against the same fold the confirm would be (see `authorizes`).
-    pub async fn activate_approved(&self, row: &BridgeRow) -> anyhow::Result<()> {
-        let fresh = self.provision(row, "active", None).await?;
-        self.start(&fresh).await
+    /// Provision every bridge of a group linked together, then start them
+    /// in the background, retried like any start.
+    ///
+    /// `code: Some` leaves them pending under that one code, so confirming
+    /// any of them confirms all. `None` starts them live with no in-channel
+    /// confirm, which is only for a link whose consent was already proven: a
+    /// request signed by a key that holds Manage Channels in the community,
+    /// checked against the same fold the confirm would be (see `authorizes`).
+    ///
+    /// Every row is provisioned before any starts, so the first request
+    /// posted already names the whole group.
+    pub async fn activate_group(&self, rows: &[BridgeRow], code: Option<&str>) -> anyhow::Result<()> {
+        let mut provisioned = Vec::with_capacity(rows.len());
+        for row in rows {
+            provisioned.push(match code {
+                Some(code) => self.provision(row, "pending_confirm", Some(code.to_owned())).await?,
+                None => self.provision(row, "active", None).await?,
+            });
+        }
+        let me = self.arc();
+        tokio::spawn(async move {
+            for row in provisioned {
+                me.start_tracked(row, 0).await;
+            }
+        });
+        Ok(())
     }
 
     /// Whether `pubkey` holds `bits` (or owns the community) in the community
