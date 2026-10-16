@@ -49,6 +49,24 @@ pub const HUB_QUERY_CONCURRENCY: usize = 8;
 /// Bound on the process-wide verified-signature memo.
 const VERIFIED_MAX: usize = 200_000;
 
+/// Every relay refused a publish (or none answered in time). Its own type so a
+/// caller can tell relays pushing back, which is worth waiting out, from a
+/// failure that will repeat however long it waits.
+#[derive(Debug, thiserror::Error)]
+#[error("no relay accepted event {id} ({tried} tried: {why})")]
+pub struct PublishRejected {
+    pub id: EventId,
+    pub tried: usize,
+    pub why: String,
+}
+
+impl PublishRejected {
+    /// Whether `error`, anywhere in its chain, is a refused publish.
+    pub fn in_chain(error: &anyhow::Error) -> bool {
+        error.chain().any(|e| e.is::<PublishRejected>())
+    }
+}
+
 /// The relay surface the Concord client needs. A trait so the router and
 /// client tests can run against an in-memory wire.
 #[async_trait]
@@ -224,7 +242,7 @@ impl RelayLike for Relays {
             Ok(_) => Ok(()),
             Err(rejected) => {
                 let why = rejected.iter().map(|(r, e)| format!("{r}: {e}")).collect::<Vec<_>>().join("; ");
-                anyhow::bail!("no relay accepted event {} ({} tried: {why})", event.id, self.urls.len())
+                Err(PublishRejected { id: event.id, tried: self.urls.len(), why }.into())
             }
         }
     }
@@ -356,7 +374,7 @@ impl RelayLike for MemoryRelay {
 
     async fn publish(&self, event: &Event) -> anyhow::Result<()> {
         if self.inner.lock().unwrap().refuse {
-            anyhow::bail!("no relay accepted event {}", event.id);
+            return Err(PublishRejected { id: event.id, tried: 1, why: "refusing".into() }.into());
         }
         self.inject(event.clone());
         Ok(())
