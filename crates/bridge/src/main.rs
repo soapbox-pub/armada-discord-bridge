@@ -88,7 +88,12 @@ impl DiscordEvents for Single {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     bridge::tls::install();
+    let fd_limit = bridge::fdlimit::raise();
     tracing_subscriber::fmt().with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout())).with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,tokio_postgres=warn".into())).init();
+    match fd_limit {
+        Ok(n) => tracing::info!(open_files = n, "file descriptor limit"),
+        Err(error) => tracing::warn!(%error, "could not raise the file descriptor limit"),
+    }
     let config = BridgeConfig::from_process_env()?;
     let pool = bridge::db::connect(&config.database_url, 8)?;
     let applied = bridge::db::migrate(&pool).await?;

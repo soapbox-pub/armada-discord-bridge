@@ -16,6 +16,7 @@ deadpool-postgres = "0.14"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 hex.workspace = true
 hkdf.workspace = true
+libc = "0.2"
 nostr.workspace = true
 rand.workspace = true
 regex = "1"

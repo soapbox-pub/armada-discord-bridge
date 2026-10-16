@@ -306,6 +306,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hkdf",
+ "libc",
  "nostr",
  "rand 0.8.8",
  "regex",
