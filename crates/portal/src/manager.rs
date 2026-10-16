@@ -41,11 +41,13 @@ use crate::env::PortalEnv;
 use crate::relay_guard::filter_public_relays;
 use crate::seal::{seal, unseal};
 
+mod history_jobs;
+
 /// Every column a bridge row is read with. `bridge_id` is read as text and
 /// compared as `($1::text)::uuid`, so no uuid type crosses the driver.
 pub const BRIDGE_COLUMNS: &str = "bridge_id::text AS bridge_id, owner_discord_id, status, status_detail, invite_url_sealed, \
      master_secret_sealed, primary_sk_sealed, primary_pk, community_id, community_name, discord_guild_id, \
-     discord_channel_id, concord_channel_id, confirm_code, options";
+     discord_channel_id, concord_channel_id, confirm_code, options, link_group::text AS link_group, history";
 
 #[derive(Clone, Debug, Default)]
 pub struct BridgeRow {
@@ -64,6 +66,10 @@ pub struct BridgeRow {
     pub concord_channel_id: Option<String>,
     pub confirm_code: Option<String>,
     pub options: Value,
+    /// Bridges linked in one request share a group and its confirm code.
+    pub link_group: Option<String>,
+    /// History requested for this bridge, and its progress (migration 019).
+    pub history: Value,
 }
 
 impl BridgeRow {
@@ -84,6 +90,8 @@ impl BridgeRow {
             concord_channel_id: r.get("concord_channel_id"),
             confirm_code: r.get("confirm_code"),
             options: r.get("options"),
+            link_group: r.get("link_group"),
+            history: r.get("history"),
         }
     }
 }
@@ -311,6 +319,8 @@ pub struct BridgeManager {
     /// bring deferred bridges up rather than double-start them.
     booted: AtomicBool,
     discord_calls: DiscordCalls,
+    /// Bridges with a history copy running in this process.
+    history_running: Mutex<std::collections::HashSet<String>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -334,6 +344,7 @@ impl BridgeManager {
             start_retries: Mutex::default(),
             booted: AtomicBool::new(false),
             discord_calls: DiscordCalls::default(),
+            history_running: Mutex::default(),
         })
     }
 
@@ -960,6 +971,18 @@ impl BridgeManager {
         if importing.is_some() {
             return Ok(());
         }
+        // The same for history the channel map asked for: the copy reads the
+        // channel up to now, so what a catch-up would replay is in it anyway.
+        let copying = db
+            .query_opt(
+                "SELECT 1 FROM bridges WHERE bridge_id = ($1::text)::uuid
+                   AND history->>'direction' = 'discord' AND history->>'state' IN ('pending', 'running')",
+                &[&rb.id],
+            )
+            .await?;
+        if copying.is_some() {
+            return Ok(());
+        }
         // The anchor is the largest snowflake mirrored, never the newest row:
         // created_at is when WE wrote a row, and a history import writes old
         // messages now. The snowflake is Discord's own clock.
@@ -1156,7 +1179,11 @@ impl BridgeManager {
         *rb.router.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(router));
         lock(&self.by_discord_channel).insert(rb.link.discord_channel_id.clone(), rb.id.clone());
         let (me, rb) = (self.arc(), rb.clone());
-        tokio::spawn(async move { me.announce_bridge(&rb).await });
+        tokio::spawn(async move {
+            me.announce_bridge(&rb).await;
+            // After the welcome, so a copy of Armada history lands below it.
+            me.resume_history(&rb).await;
+        });
         Ok(())
     }
 
