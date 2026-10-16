@@ -10,9 +10,9 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useBridges } from "@/hooks";
-import type { ArmadaChannel } from "@/lib/channelMap";
+import type { ArmadaChannel, DiscordChannel, MapState, Preset } from "@/lib/channelMap";
 import { errText, plural } from "@/lib/utils";
-import { ChannelMapStep } from "@/pages/ChannelMapStep";
+import { ChannelMapStep, ConfirmStep } from "@/pages/ChannelMapStep";
 import { useMe } from "@/session";
 import { useNostrLogin } from "@/useNostrLogin";
 
@@ -35,6 +35,12 @@ export interface ConnectDraft {
   armada?: ArmadaChannel[];
   canCreateArmada?: boolean;
   approvalUrl?: string;
+  /** The Discord side as last read, and the map drawn over both. */
+  discordChannels?: DiscordChannel[];
+  createInstallUrl?: string;
+  plan?: Preset;
+  map?: MapState;
+  copyHistory?: boolean;
   result?: { status: string; confirmCode?: string; count: number };
 }
 
@@ -60,8 +66,8 @@ export interface ConnectFlow {
 const FlowContext = createContext<ConnectFlow | null>(null);
 export const useConnect = () => useContext(FlowContext)!;
 
-const STEPS = ["/connect", "/connect/armada", "/connect/map"];
-const FROM_STEPS = ["/connect/map"];
+const STEPS = ["/connect", "/connect/armada", "/connect/map", "/connect/confirm"];
+const FROM_STEPS = ["/connect/map", "/connect/confirm"];
 
 /** What `POST /api/bridges` answers: a draft holding the community's sealed invite. */
 interface DraftResponse {
@@ -79,6 +85,7 @@ function draftPatch(res: DraftResponse): Partial<ConnectDraft> {
     armada: res.channels,
     canCreateArmada: res.canCreateChannels,
     approvalUrl: res.approvalUrl,
+    map: undefined,
     result: undefined,
   };
 }
@@ -121,6 +128,7 @@ export function Connect() {
         <Route index element={<ServerStep />} />
         <Route path="armada" element={<ArmadaStep />} />
         <Route path="map" element={<ChannelMapStep />} />
+        <Route path="confirm" element={<ConfirmStep />} />
         <Route path="done" element={<DoneStep />} />
         <Route path="*" element={<Navigate to="/connect" replace />} />
       </Routes>
@@ -210,7 +218,7 @@ function ServerStep() {
       <WizardStepBody
         glyph={<DiscordMark className="size-14 text-discord" />}
         title="bridge a server"
-        description="Start with the Discord side. Whether the server is busy or brand new, the next steps fit what's on each side."
+        description="Which Discord server?"
       >
         <div className="space-y-3">
           <div className="space-y-1.5">
@@ -239,11 +247,9 @@ function ServerStep() {
             <Alert>
               <AlertDescription className="space-y-3 text-left text-xs leading-relaxed">
                 <p>
-                  Bots can't create servers, so make an empty one in Discord: the <strong>+</strong> at the bottom of the
-                  server list, then "Create My Own". Leave it empty; the bridge can create the channels to match your Armada
-                  community.
+                  In Discord, click <strong>+</strong> in the server list and make an empty server. The bridge fills it in.
                 </p>
-                <p>Then sign in again so the new server shows up here.</p>
+                <p>Then sign in again so it shows up here.</p>
                 <Button asChild size="sm" variant="secondary" className="clip-corner">
                   <a href="/api/auth/discord">
                     <DiscordMark /> Sign in again
@@ -256,7 +262,7 @@ function ServerStep() {
               Continue
             </Button>
           )}
-          <p className="text-xs text-muted-foreground">Only servers where you hold Manage Server are listed.</p>
+          <p className="text-xs text-muted-foreground">Only servers you manage are listed.</p>
         </div>
       </WizardStepBody>
     </ConnectShell>
@@ -319,11 +325,7 @@ function ArmadaStep() {
       <WizardStepBody
         glyph={<Crest className="size-14" />}
         title="pick the armada side"
-        description={
-          <>
-            Which Armada community should <span className="text-foreground">{guild?.name ?? "the server"}</span> bridge with?
-          </>
-        }
+        description={<>Bridge <span className="text-foreground">{guild?.name ?? "the server"}</span> with…</>}
       >
         <div className="space-y-5 text-left">
           <PickRow selected={false} onClick={() => navigate(`/import?guild=${draft.guildId}`)}>
@@ -331,14 +333,14 @@ function ArmadaStep() {
               <Server className="size-4" />
             </span>
             <span className="min-w-0 flex-1">
-              <span className="block text-sm font-medium">A new community, copied from this server</span>
-              <span className="block text-xs text-muted-foreground">Channels, roles, emoji and history. You own it.</span>
+              <span className="block text-sm font-medium">A new community</span>
+              <span className="block text-xs text-muted-foreground">Copied from this server. You own it.</span>
             </span>
           </PickRow>
 
           {known.length > 0 && (
             <div className="space-y-1.5">
-              <p className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">Communities you already bridge</p>
+              <p className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">Yours</p>
               {known.map((c) => (
                 <PickRow key={c.id} selected={false} onClick={() => void open({ fromBridgeId: c.source.bridge_id }, c.id)}>
                   <Crest className="size-9 shrink-0" />
@@ -359,7 +361,7 @@ function ArmadaStep() {
               if (invite.trim() && !busy) void open({ inviteUrl: invite.trim() }, "invite");
             }}
           >
-            <p className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">Another community</p>
+            <p className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground">Another one</p>
             <div className="relative">
               <Link2 className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
               <Input
@@ -376,8 +378,7 @@ function ArmadaStep() {
               {busy === "invite" ? <><Loader2 className="animate-spin" /> Reading the community…</> : "Use this invite"}
             </Button>
             <p className="text-xs text-muted-foreground">
-              In Armada, open the community's menu and choose <span className="text-foreground">Invite people</span>. Mint one
-              just for the bridge, so the community can revoke it on its own later.
+              Get one in Armada: community menu → <span className="text-foreground">Invite people</span>.
             </p>
           </form>
         </div>
@@ -400,12 +401,9 @@ function DoneStep() {
         title={live ? "bridged" : "almost there"}
         description={
           live ? (
-            <>{plural(result.count, "channel")} now mirror both ways. Any history you chose is being copied.</>
+            <>{plural(result.count, "channel")} now mirror both ways.</>
           ) : (
-            <>
-              The bridge posted a request in each of the {plural(result.count, "Armada channel")}. A member with{" "}
-              <span className="text-foreground">Manage Channels</span> replies in any one of them to enable them all:
-            </>
+            <>An Armada moderator sends this in any of the channels:</>
           )
         }
       >
@@ -415,7 +413,6 @@ function DoneStep() {
               /bridge confirm {result.confirmCode}
             </code>
           )}
-          {!live && <p className="text-xs text-muted-foreground">History starts copying once it's confirmed.</p>}
           <Button size="lg" className="w-full clip-corner-lg" onClick={close}>
             See your bridges
           </Button>

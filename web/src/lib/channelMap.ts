@@ -188,6 +188,27 @@ export function suggestPreset(discord: DiscordChannel[], armada: ArmadaChannel[]
   return canCreateArmada ? "toArmada" : "merge";
 }
 
+/**
+ * The way history naturally flows for a row: out of a Discord channel that
+ * has messages into Armada (which interleaves by time), otherwise out of
+ * Armada into a Discord channel that is empty or new.
+ */
+export function naturalHistory(row: Row): History {
+  const options = historyOptions(row);
+  if (row.discord?.kind === "existing" && !row.discord.channel.empty && options.includes("discord")) return "discord";
+  if (options.includes("armada")) return "armada";
+  return "none";
+}
+
+/** The map with history on (each row's natural direction) or off for every linked row. */
+export function withHistory(state: MapState, discord: DiscordChannel[], armada: ArmadaChannel[], on: boolean): MapState {
+  const history: Record<string, History> = {};
+  for (const row of rows(state, discord, armada)) {
+    if (isLinked(row)) history[row.key] = on ? naturalHistory(row) : "none";
+  }
+  return { ...state, history };
+}
+
 export function toPairs(list: Row[]): MapPair[] {
   return list.filter(isLinked).map((row) => {
     const pair: MapPair = {};
