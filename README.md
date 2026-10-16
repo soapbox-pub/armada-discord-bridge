@@ -145,9 +145,13 @@ material — every bridge included — so treat it as permanent.
 
 `crates/portal/examples/load_probe.rs` rehearses a portal boot read-only:
 every bridge that would start is started on the relay side, on the same
-community runtimes the portal uses, and nothing is published, written, or sent
-to Discord. It reports sockets, descriptors and memory, then listens and checks
-that every rumor the running portal recorded meanwhile reached its bridge.
+community runtimes and shared connections the portal uses, and nothing is
+published, written, or sent to Discord. It reports sockets, descriptors,
+memory and each relay's REQs and refusals, then listens and checks that every
+rumor the running portal recorded meanwhile reached its bridge.
+
+The running portal logs the same relay counters every ten minutes, and on
+`SIGUSR2`, beside its memory line.
 
 ```sh
 cargo build --release -p portal --example load_probe
