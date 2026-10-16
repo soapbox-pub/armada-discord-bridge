@@ -259,7 +259,7 @@ impl BridgeManager {
         &self.store
     }
 
-    /// Communities with live relay connections (operational visibility).
+    /// Bridges with live relay connections (operational visibility).
     pub fn relay_hubs(&self) -> usize {
         self.hubs.len()
     }
@@ -541,7 +541,8 @@ impl BridgeManager {
         let membership = joined.membership;
 
         let primary = Keys::new(SecretKey::from_hex(&unseal(&self.env.seal_key_hex, primary_sealed)?)?);
-        let hub = self.hubs.get(&membership.community_id);
+        // One hub per bridge: relays cap subscriptions per connection (relays.rs).
+        let hub = self.hubs.get(&row.bridge_id);
         let relays = stage("vetting community relays", STAGE_DNS, async { Ok(self.guarded(&hub, &membership.relays).await) }).await?;
         // NIP-42 as the bridge's own npub too: relays that gate kind 1059 serve
         // a giftwrap only to the pubkey it is addressed to, and the Direct

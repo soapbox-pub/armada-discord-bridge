@@ -2,13 +2,18 @@
 //! community relay, and a publish succeeds when ANY relay accepts (Armada's
 //! `broadcast`).
 //!
-//! One [`Hub`] — one set of relay connections — serves every bridge of a
-//! community. The TypeScript bridge gave each bridge its own pool, and with
-//! ~1100 pools on the same four stock relays that was a socket and an AUTH
-//! fan-out per bridge per relay, quadratic in bridges (56% of boot CPU,
-//! 2026-09-24). Bridges of one community read the same streams, so they share
-//! the connections and the NIP-42 identities that unlock them, and a relay sees
-//! one socket per community rather than one per channel.
+//! Each bridge gets its own [`Hub`] — its own set of relay connections — as
+//! the TypeScript bridge gave each its own pool. Sharing one hub across a
+//! community's bridges was tried and failed on the first boot it was live
+//! (2026-10-16): relays cap concurrent subscriptions per connection, and a
+//! community of 63 bridges put ~130 standing REQs on one socket. The stock
+//! relays answered with "too many concurrent REQs" (a NOTICE, the REQ silently
+//! dropped) and "too many subscriptions" by the thousand, so bridges started
+//! without live chat or control, and the boot-time folds of the largest
+//! communities came back empty. A hub's pool authenticates only as the keys
+//! its own bridge registers, so per-bridge hubs keep the AUTH fan-out linear —
+//! the quadratic cost that hurt the TypeScript came from a process-wide key
+//! registry, not from the number of pools.
 //!
 //! NIP-42: relays that gate kind 1059 serve a REQ only to a connection that has
 //! authenticated as every pubkey in its `authors`. Stream addresses are derived
@@ -222,26 +227,26 @@ impl Drop for Unsubscribe {
     }
 }
 
-/// Hubs by community, so every bridge of one community shares connections. A
-/// hub lives exactly as long as some bridge holds it.
+/// Hubs by owner key (one per bridge; see the module docs for why never per
+/// community). A hub lives exactly as long as its holder keeps it.
 #[derive(Default)]
 pub struct HubRegistry {
     hubs: Mutex<HashMap<String, Weak<Hub>>>,
 }
 
 impl HubRegistry {
-    pub fn get(&self, community_id: &str) -> Arc<Hub> {
+    pub fn get(&self, key: &str) -> Arc<Hub> {
         let mut hubs = self.hubs.lock().unwrap_or_else(|e| e.into_inner());
         hubs.retain(|_, h| h.strong_count() > 0);
-        if let Some(hub) = hubs.get(community_id).and_then(Weak::upgrade) {
+        if let Some(hub) = hubs.get(key).and_then(Weak::upgrade) {
             return hub;
         }
         let hub = Hub::new(Keys::generate());
-        hubs.insert(community_id.to_owned(), Arc::downgrade(&hub));
+        hubs.insert(key.to_owned(), Arc::downgrade(&hub));
         hub
     }
 
-    /// Communities with live connections (operational visibility).
+    /// Hubs with live connections (operational visibility).
     pub fn len(&self) -> usize {
         self.hubs.lock().unwrap_or_else(|e| e.into_inner()).values().filter(|h| h.strong_count() > 0).count()
     }
