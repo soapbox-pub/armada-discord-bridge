@@ -660,6 +660,17 @@ async fn bridge_link(State(st): State<AppState>, headers: HeaderMap, Path(id): P
     if taken.is_some() {
         return Ok(err(StatusCode::CONFLICT, "that channel is already bridged"));
     }
+    // The same for the Armada side (migration 019).
+    let taken = db
+        .query_opt(
+            "SELECT 1 FROM bridges WHERE community_id = $1 AND concord_channel_id = $2 AND status IN ('pending_confirm', 'active')
+               AND bridge_id::text <> $3",
+            &[&row.community_id, &concord_id, &row.bridge_id],
+        )
+        .await?;
+    if taken.is_some() {
+        return Ok(err(StatusCode::CONFLICT, "that Armada channel is already bridged"));
+    }
     db.execute(
         "UPDATE bridges SET discord_guild_id = $2, discord_channel_id = $3, concord_channel_id = $4, updated_at = now()
          WHERE bridge_id::text = $1",

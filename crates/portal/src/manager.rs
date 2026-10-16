@@ -1329,7 +1329,8 @@ impl BridgeManager {
                status_detail = NULL, options = b.options - 'pausedFor' - 'resumeTo', updated_at = now()
              WHERE b.status = 'paused' AND b.options->>'pausedFor' = $2 AND b.discord_guild_id = $1
                AND NOT EXISTS (
-                 SELECT 1 FROM bridges o WHERE o.discord_channel_id = b.discord_channel_id
+                 SELECT 1 FROM bridges o WHERE (o.discord_channel_id = b.discord_channel_id
+                     OR (o.community_id = b.community_id AND o.concord_channel_id = b.concord_channel_id))
                    AND o.status IN ('pending_confirm', 'active') AND o.bridge_id <> b.bridge_id)
              RETURNING {}",
             BRIDGE_COLUMNS.replace("bridge_id::text", "b.bridge_id::text")

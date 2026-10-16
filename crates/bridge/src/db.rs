@@ -32,6 +32,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("migrations/016_popup_handoff_approval.sql", include_str!("../db/migrations/016_popup_handoff_approval.sql")),
     ("migrations/017_one_bridge_per_discord_channel.sql", include_str!("../db/migrations/017_one_bridge_per_discord_channel.sql")),
     ("migrations/018_import_history_progress.sql", include_str!("../db/migrations/018_import_history_progress.sql")),
+    ("migrations/019_bridge_groups_and_history.sql", include_str!("../db/migrations/019_bridge_groups_and_history.sql")),
 ];
 
 pub fn connect(database_url: &str, max_size: usize) -> anyhow::Result<Pool> {
