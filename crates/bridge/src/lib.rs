@@ -16,6 +16,7 @@ pub mod markup;
 pub mod net;
 pub mod profiles;
 pub mod puppets;
+pub mod recent;
 pub mod relays;
 pub mod router;
 pub mod store;

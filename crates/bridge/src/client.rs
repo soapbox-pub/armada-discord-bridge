@@ -6,7 +6,7 @@
 //! a `proxy` tag naming its Discord origin, and the router refuses to bridge any
 //! incoming rumor that has one.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -24,6 +24,7 @@ use nostr::prelude::*;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
+use crate::recent::RecentIds;
 use crate::relays::RelayLike;
 
 /// NIP-48 tag stamped on every bridge-published rumor:
@@ -33,9 +34,6 @@ pub const TAG_PROXY: &str = "proxy";
 
 /// How long `subscribe_control` gathers arriving control wraps before re-folding.
 pub const CONTROL_REFOLD: Duration = Duration::from_millis(250);
-
-/// Rumor ids remembered per channel subscription for deduplication.
-const SEEN_RUMORS_MAX: usize = 65_536;
 
 pub fn proxy_tag(guild_id: &str, channel_id: &str, message_id: &str) -> Vec<String> {
     vec![TAG_PROXY.into(), format!("https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"), "web".into()]
@@ -370,7 +368,7 @@ impl ConcordClient {
         let mut sub = self.relays.subscribe(vec![filter]);
         let channel = channel.clone();
         TaskGuard(tokio::spawn(async move {
-            let mut seen: HashSet<String> = HashSet::new();
+            let mut seen = RecentIds::default();
             while let Some(wrap) = sub.recv().await {
                 let Some(chat) = open_chat(&wrap, &channel) else { continue };
                 if wrap.kind == Kind::Custom(kinds::WRAP)
@@ -378,10 +376,7 @@ impl ConcordClient {
                 {
                     cursor(wrap.pubkey.to_hex(), wrap.created_at.as_secs());
                 }
-                if seen.len() >= SEEN_RUMORS_MAX {
-                    seen.clear();
-                }
-                if !seen.insert(chat.rumor.id.clone()) {
+                if !seen.insert(&chat.rumor.id) {
                     continue;
                 }
                 on_chat(chat);

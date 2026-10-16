@@ -14,7 +14,7 @@
 //! opened against the view of each bridge that holds that stream, and no
 //! other.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
@@ -25,6 +25,7 @@ use nostr::prelude::*;
 use tokio::sync::Notify;
 
 use crate::client::{ChatHandler, ConcordClient, CursorHandler, OpenedChat, TaskGuard, now_ms, open_chat};
+use crate::recent::RecentIds;
 use crate::relays::RelayLike;
 
 /// How long attach/detach/rekey changes are gathered before the chat REQ is
@@ -37,16 +38,13 @@ pub const RESUBSCRIBE_SETTLE: Duration = Duration::from_millis(500);
 /// resource that standing REQs are.
 const AUTHORS_PER_FILTER: usize = 100;
 
-/// Rumor ids remembered per bridge for deduplication.
-const SEEN_RUMORS_MAX: usize = 65_536;
-
 struct Member {
     token: u64,
     client: Arc<ConcordClient>,
     channel_id: String,
     view: ChannelView,
     /// Outlives any one REQ: every replacement replays the last minute.
-    seen: HashSet<String>,
+    seen: RecentIds,
     on_chat: ChatHandler,
 }
 
@@ -133,7 +131,7 @@ impl CommunityRuntime {
             *next += 1;
             *next
         };
-        let member = Member { token, client, channel_id: channel.id_hex.clone(), view: channel, seen: HashSet::new(), on_chat };
+        let member = Member { token, client, channel_id: channel.id_hex.clone(), view: channel, seen: RecentIds::default(), on_chat };
         lock(&self.members).insert(bridge_id.to_owned(), member);
         self.resubscribe.notify_one();
         Attachment { runtime: self.clone(), bridge_id: bridge_id.to_owned(), token }
@@ -200,10 +198,7 @@ impl CommunityRuntime {
             }
             let Some(chat) = open_chat(wrap, &m.view) else { continue };
             opened = true;
-            if m.seen.len() >= SEEN_RUMORS_MAX {
-                m.seen.clear();
-            }
-            if m.seen.insert(chat.rumor.id.clone()) {
+            if m.seen.insert(&chat.rumor.id) {
                 out.push((m.on_chat.clone(), chat));
             }
         }
