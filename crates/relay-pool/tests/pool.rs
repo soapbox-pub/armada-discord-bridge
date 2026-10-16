@@ -270,6 +270,49 @@ async fn blocked_subscription_is_not_resent() {
     assert_eq!(relay.reqs_for("s").len(), 1);
 }
 
+/// A relay that accepts TCP and never completes the websocket handshake.
+async fn silent_relay() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn settled_query_does_not_wait_for_a_silent_relay() {
+    let relay = MockRelay::start(false).await;
+    relay.store(note(&Keys::generate(), 1, "here", 1_700_000_000));
+    let (pool, _rx) = Pool::new(Keys::generate());
+    let start = Instant::now();
+    let events = pool
+        .query_settled(&[relay.url.clone(), silent_relay().await], vec![Filter::new()], Duration::from_secs(10), Duration::from_millis(500))
+        .await;
+    assert_eq!(events.len(), 1);
+    assert!(start.elapsed() < Duration::from_secs(3), "waited {:?}", start.elapsed());
+}
+
+/// A relay that fails at once is not an answer: it must not start the grace
+/// period and cut off a slower relay that does answer.
+#[tokio::test]
+async fn a_failing_relay_does_not_start_the_settle_clock() {
+    let slow = MockRelay::start(false).await;
+    slow.store(note(&Keys::generate(), 1, "slow but here", 1_700_000_000));
+    slow.answer_after(Duration::from_millis(1500));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead = format!("ws://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let (pool, _rx) = Pool::new(Keys::generate());
+    let events = pool
+        .query_settled(&[dead, slow.url.clone()], vec![Filter::new()], Duration::from_secs(10), Duration::from_millis(200))
+        .await;
+    assert_eq!(events.len(), 1);
+}
+
 #[tokio::test]
 async fn publish_accepted_and_rejected() {
     let relay = MockRelay::start(false).await;

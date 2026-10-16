@@ -343,7 +343,37 @@ impl Pool {
         filters: Vec<Filter>,
         timeout: Duration,
     ) -> Vec<Event> {
-        let deadline = Instant::now() + timeout;
+        self.query_inner(relays, filters, timeout, None).await
+    }
+
+    /// [`Pool::query`] that stops waiting `grace` after the first relay
+    /// ANSWERS (EOSE), rather than for every relay or the timeout.
+    ///
+    /// For a caller that a slow relay must not hold up, and that will hear
+    /// what it missed some other way (a live subscription replaying the same
+    /// filter, a retry). A relay that fails or refuses does not start the
+    /// clock: it is often the first to finish, and must not cut short the wait
+    /// for the ones that will answer. With one relay at 7.7s and the rest
+    /// under one, every bridge start waited out the slow one several times
+    /// over, and a portal boot took ~40 minutes instead of ~2 (2026-10-16).
+    pub async fn query_settled(
+        &self,
+        relays: &[String],
+        filters: Vec<Filter>,
+        timeout: Duration,
+        grace: Duration,
+    ) -> Vec<Event> {
+        self.query_inner(relays, filters, timeout, Some(grace)).await
+    }
+
+    async fn query_inner(
+        &self,
+        relays: &[String],
+        filters: Vec<Filter>,
+        timeout: Duration,
+        grace: Option<Duration>,
+    ) -> Vec<Event> {
+        let mut deadline = Instant::now() + timeout;
         let relays = normalize_all(relays);
         if relays.is_empty() {
             return Vec::new();
@@ -372,11 +402,19 @@ impl Pool {
         let mut remaining = relays.len();
         let mut seen = HashSet::new();
         let mut events = Vec::new();
+        let mut settling = false;
         while remaining > 0 {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some(QueryMsg::Event(event))) => {
                     if seen.insert(event.id) {
                         events.push(*event);
+                    }
+                }
+                Ok(Some(QueryMsg::Eose)) => {
+                    remaining -= 1;
+                    if let Some(grace) = grace.filter(|_| !settling) {
+                        settling = true;
+                        deadline = deadline.min(Instant::now() + grace);
                     }
                 }
                 Ok(Some(QueryMsg::Done)) => remaining -= 1,
@@ -535,11 +573,11 @@ impl Pool {
             for (i, r) in relays.iter().enumerate() {
                 let id = SubscriptionId::generate();
                 ids.push((r.clone(), id.clone()));
-                let (qtx, mut qrx) = mpsc::unbounded_channel();
+                let (qtx, mut qrx) = mpsc::unbounded_channel::<QueryMsg>();
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     while let Some(msg) = qrx.recv().await {
-                        let done = matches!(msg, QueryMsg::Done);
+                        let done = msg.is_final();
                         if tx.send((i, msg)).is_err() || done {
                             break;
                         }
@@ -564,7 +602,7 @@ impl Pool {
         while remaining > 0 {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
                 Ok(Some((i, QueryMsg::Event(event)))) => per_relay[i].push(*event),
-                Ok(Some((i, QueryMsg::Done))) => {
+                Ok(Some((i, QueryMsg::Done | QueryMsg::Eose))) => {
                     remaining -= 1;
                     if !per_relay[i].is_empty() {
                         winner = std::mem::take(&mut per_relay[i]);

@@ -29,6 +29,7 @@ pub struct MockRelay {
     live: broadcast::Sender<Event>,
     kill: watch::Sender<u64>,
     refuse: Arc<Mutex<(usize, String)>>,
+    delay: Arc<Mutex<std::time::Duration>>,
 }
 
 impl MockRelay {
@@ -40,6 +41,7 @@ impl MockRelay {
         let (live, _) = broadcast::channel(1024);
         let (kill, _) = watch::channel(0);
         let refuse = Arc::new(Mutex::new((0, String::new())));
+        let delay = Arc::new(Mutex::new(std::time::Duration::ZERO));
         let relay = MockRelay {
             url: url.clone(),
             log: log.clone(),
@@ -47,6 +49,7 @@ impl MockRelay {
             live: live.clone(),
             kill: kill.clone(),
             refuse: refuse.clone(),
+            delay: delay.clone(),
         };
         tokio::spawn(async move {
             loop {
@@ -62,6 +65,7 @@ impl MockRelay {
                     kill: kill.subscribe(),
                     live_tx: live.clone(),
                     refuse: refuse.clone(),
+                    delay: delay.clone(),
                 };
                 tokio::spawn(async move {
                     if let Ok(ws) = tokio_tungstenite::accept_async(tcp).await {
@@ -91,6 +95,11 @@ impl MockRelay {
     /// connection does.
     pub fn refuse_next_reqs(&self, n: usize, reason: &str) {
         *self.refuse.lock().unwrap() = (n, reason.to_string());
+    }
+
+    /// Answer every REQ only after `delay`, like a relay under load.
+    pub fn answer_after(&self, delay: std::time::Duration) {
+        *self.delay.lock().unwrap() = delay;
     }
 
     /// Drop every open connection.
@@ -127,6 +136,7 @@ struct Ctx {
     live_tx: broadcast::Sender<Event>,
     kill: watch::Receiver<u64>,
     refuse: Arc<Mutex<(usize, String)>>,
+    delay: Arc<Mutex<std::time::Duration>>,
 }
 
 fn matches(filters: &[Filter], event: &Event) -> bool {
@@ -217,6 +227,10 @@ impl Ctx {
                                     ));
                                     continue;
                                 }
+                            }
+                            let delay = *self.delay.lock().unwrap();
+                            if !delay.is_zero() {
+                                tokio::time::sleep(delay).await;
                             }
                             let stored: Vec<Event> = self.store.lock().unwrap().clone();
                             for ev in stored.into_iter().filter(|e| matches(&filters, e)) {

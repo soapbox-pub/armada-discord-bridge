@@ -65,8 +65,17 @@ pub(crate) enum Cmd {
 
 pub(crate) enum QueryMsg {
     Event(Box<Event>),
-    /// The relay is done with this query (EOSE, CLOSED, or unreachable).
+    /// The relay answered: everything it holds has been sent.
+    Eose,
+    /// The relay is done with this query without answering it (CLOSED,
+    /// unreachable, backing off).
     Done,
+}
+
+impl QueryMsg {
+    pub(crate) fn is_final(&self) -> bool {
+        !matches!(self, QueryMsg::Event(_))
+    }
 }
 
 struct RelaySub {
@@ -617,7 +626,7 @@ impl RelayTask {
                 sub_id: id.to_string(),
             });
         } else if let Some(q) = self.queries.remove(id) {
-            let _ = q.tx.send(QueryMsg::Done);
+            let _ = q.tx.send(QueryMsg::Eose);
             self.push(ClientMessage::close(id.clone()));
         }
     }
