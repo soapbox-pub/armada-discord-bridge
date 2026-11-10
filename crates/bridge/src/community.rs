@@ -24,7 +24,7 @@ use concord::kinds;
 use nostr::prelude::*;
 use tokio::sync::Notify;
 
-use crate::client::{ChatHandler, ConcordClient, CursorHandler, OpenedChat, TaskGuard, now_ms, open_chat};
+use crate::client::{ChatHandler, ConcordClient, CursorHandler, OpenedChat, TaskGuard, channel_addresses, now_ms, open_chat};
 use crate::recent::RecentIds;
 use crate::relays::RelayLike;
 
@@ -64,8 +64,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Where a bridged channel's posts arrive: its read streams and, once a
+/// Writers ledger restricts it, each writer address.
 fn stream_pks(view: &ChannelView) -> Vec<PublicKey> {
-    view.streams.iter().map(|s| s.key.pubkey()).collect()
+    channel_addresses(view)
 }
 
 impl CommunityRuntime {
@@ -147,7 +149,10 @@ impl CommunityRuntime {
             if stream_pks(&fresh) != stream_pks(&m.view) {
                 m.view = fresh;
                 changed = true;
-                tracing::info!(bridge = %id, "stream keys rotated; chat subscription refreshed");
+                tracing::info!(bridge = %id, "stream keys or writer addresses moved; chat subscription refreshed");
+            } else {
+                // Same addresses, newer metadata (a rename, a sealed name opened).
+                m.view = fresh;
             }
         }
         if changed {
@@ -193,7 +198,7 @@ impl CommunityRuntime {
         let mut out: Vec<(ChatHandler, OpenedChat)> = Vec::new();
         let mut opened = false;
         for m in lock(&self.members).values_mut() {
-            if !m.view.streams.iter().any(|s| s.key.pubkey() == wrap.pubkey) {
+            if !stream_pks(&m.view).contains(&wrap.pubkey) {
                 continue;
             }
             let Some(chat) = open_chat(wrap, &m.view) else { continue };

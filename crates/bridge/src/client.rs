@@ -15,11 +15,16 @@ use concord::chat::Binding;
 use concord::community::{ChannelView, Membership};
 use concord::control::{FoldedControl, fold_control};
 use concord::edition::{Edition, parse_edition};
+use concord::guestbook::{FoldedTimeout, fold_timeouts};
 use concord::invite::{InviteBundle, parse_bundle_event, parse_invite_link};
+use concord::judge::{Post, Verdict, judge_post};
 use concord::kinds::{self, Plane};
 use concord::roles::perm;
 use concord::rumor::Rumor;
-use concord::stream::{StreamKey, WrapOptions, check_channel_binding, open_plane_wrap, seal_and_wrap};
+use concord::stream::{
+    MAX_EVENT_BYTES, Opened, StreamKey, WrapOptions, check_channel_binding, check_writer_binding, open_plane_wrap, seal_and_wrap, seal_rumor, wrap_seal,
+};
+use concord::writers::rides_writer_address;
 use nostr::prelude::*;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
@@ -56,6 +61,21 @@ pub struct OpenedChat {
     pub ms: u64,
     pub channel_id_hex: String,
     pub epoch: u64,
+    /// The writer epoch whose address served it, in a restricted Channel.
+    pub writer_epoch: Option<u64>,
+}
+
+/// Why the bridge declined to post for someone: Armada's readers would hold or
+/// collapse the post, so publishing it would only put a message on the relays
+/// that nobody sees, while Discord shows it as delivered.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct PostRefused(pub &'static str);
+
+/// Every address a Channel's posts arrive at: its read streams and, in a
+/// restricted Channel, its writer addresses.
+pub fn channel_addresses(channel: &ChannelView) -> Vec<PublicKey> {
+    channel.streams.iter().map(|s| s.key.pubkey()).chain(channel.writers.iter().map(|w| w.pk)).collect()
 }
 
 impl OpenedChat {
@@ -83,16 +103,29 @@ impl OpenedChat {
 /// possession alone cannot keep an ejected member writing into an epoch the
 /// community rotated away from.
 pub fn open_chat(wrap: &Event, channel: &ChannelView) -> Option<OpenedChat> {
-    let stream = channel.streams.iter().find(|s| s.key.pubkey() == wrap.pubkey)?;
-    let key: StreamKey = (&stream.key).into();
+    if let Some(stream) = channel.streams.iter().find(|s| s.key.pubkey() == wrap.pubkey) {
+        let key: StreamKey = (&stream.key).into();
+        return finish_chat(wrap, &key, channel, stream.epoch, stream.retired_at, None);
+    }
+    // A writer address signs its wraps with the writer key but encrypts under
+    // the Channel's READ key (CORD-03 §1), so it is tried under every one.
+    let writer = channel.writers.iter().find(|w| w.pk == wrap.pubkey)?;
+    channel.streams.iter().find_map(|stream| {
+        let key = StreamKey { pk: writer.pk, conv_key: stream.key.conv_key, sk: None, restricted: false };
+        finish_chat(wrap, &key, channel, stream.epoch, stream.retired_at, Some(writer.epoch))
+    })
+}
+
+fn finish_chat(wrap: &Event, key: &StreamKey, channel: &ChannelView, epoch: u64, retired_at: Option<u64>, writer_epoch: Option<u64>) -> Option<OpenedChat> {
     // Plane::Chat also refuses a plaintext seal: that would make the message a
     // standalone signed artifact any relay could display (CORD-02 §5).
-    let opened = open_plane_wrap(wrap, &key, Plane::Chat).ok()?;
-    check_channel_binding(&opened.rumor, &channel.id_hex, stream.epoch).ok()?;
-    if stream.retired_at.is_some_and(|cutoff| opened.rumor.created_at > cutoff) {
+    let opened = open_plane_wrap(wrap, key, Plane::Chat).ok()?;
+    check_channel_binding(&opened.rumor, &channel.id_hex, epoch).ok()?;
+    check_writer_binding(&opened.rumor, writer_epoch).ok()?;
+    if retired_at.is_some_and(|cutoff| opened.rumor.created_at > cutoff) {
         return None;
     }
-    Some(OpenedChat { ms: opened.ms, rumor: opened.rumor, channel_id_hex: channel.id_hex.clone(), epoch: stream.epoch })
+    Some(OpenedChat { ms: opened.ms, rumor: opened.rumor, channel_id_hex: channel.id_hex.clone(), epoch, writer_epoch })
 }
 
 /// What resolving an invite yields.
@@ -142,6 +175,15 @@ pub type FoldHandler = Arc<dyn Fn(Arc<FoldedControl>) + Send + Sync>;
 /// The latest Control Plane fold, shareable between clients of one community.
 type FoldCell = Arc<RwLock<Option<Arc<FoldedControl>>>>;
 
+/// The Guestbook's Timeout rumors seen so far, shared like the fold. Kept raw:
+/// whether one counts is judged against the Roster as it stands (CORD-04 §8).
+type TimeoutCell = Arc<RwLock<HashMap<String, Opened>>>;
+
+/// Timeouts run at most 28 days, so older Guestbook entries can't hold one.
+const TIMEOUT_LOOKBACK_SECS: u64 = 28 * 24 * 60 * 60;
+/// Bound on Timeout rumors held per community: a flood can't grow it without end.
+const MAX_TIMEOUTS_HELD: usize = 10_000;
+
 /// One entry of the kind-10304 command manifest (Armada's draft bot NIP).
 pub struct BotCommand {
     pub name: &'static str,
@@ -162,6 +204,7 @@ pub struct ConcordClient {
     relays: Arc<dyn RelayLike>,
     primary: Keys,
     folded: FoldCell,
+    timeouts: TimeoutCell,
 }
 
 impl ConcordClient {
@@ -170,7 +213,7 @@ impl ConcordClient {
         let mut keys = stream_keys(&community.control_streams());
         keys.extend(stream_keys(&community.guestbook_streams()));
         relays.register_auth_keys(keys);
-        Arc::new(ConcordClient { community, relays, primary, folded: FoldCell::default() })
+        Arc::new(ConcordClient { community, relays, primary, folded: FoldCell::default(), timeouts: TimeoutCell::default() })
     }
 
     /// A client for another member of `with`'s community: its own membership
@@ -179,7 +222,7 @@ impl ConcordClient {
     /// two must share: a Direct Invite can add channel keys but never move it.
     pub fn sharing_fold(community: Membership, primary: Keys, with: &ConcordClient) -> Arc<ConcordClient> {
         debug_assert_eq!(community.community_id, with.community.community_id);
-        Arc::new(ConcordClient { community, relays: with.relays.clone(), primary, folded: with.folded.clone() })
+        Arc::new(ConcordClient { community, relays: with.relays.clone(), primary, folded: with.folded.clone(), timeouts: with.timeouts.clone() })
     }
 
     pub fn community(&self) -> &Membership {
@@ -271,6 +314,53 @@ impl ConcordClient {
         self.is_authorized(pubkey_hex, perm::MANAGE_MESSAGES)
     }
 
+    /// May `deleter`'s kind 5 hide `author`'s message in this Channel (CORD-03 §3)?
+    /// Against the CURRENT Roster: Manage Messages in the Channel (its
+    /// overwrites on the ranked Roster) and a strict outrank of the author; the
+    /// citation is a sync floor, so an uncited moderator hide waits rather than
+    /// counting on a Grant this fold hasn't read.
+    pub fn may_hide(&self, deleter: &str, author: &str, channel_id_hex: &str, delete: &Rumor) -> bool {
+        let Some(f) = self.folded() else { return false };
+        f.may_hide_in(deleter, author, channel_id_hex) && f.citation_satisfied(&self.community.id(), deleter, concord::edition::Citation::from_tags(&delete.tags).as_ref())
+    }
+
+    /// The Timeouts running now, judged against the current Roster.
+    pub fn timeouts(&self) -> HashMap<String, FoldedTimeout> {
+        let Some(f) = self.folded() else { return HashMap::new() };
+        let opened: Vec<Opened> = self.timeouts.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+        let cid = self.community.id();
+        fold_timeouts(&opened, now_ms(), &f.owner, &f.banned, |actor, target, citation| {
+            f.roster.can_act_on_member(actor, &f.owner, target, perm::MODERATE_MEMBERS) && f.citation_satisfied(&cid, actor, citation)
+        })
+    }
+
+    /// How Armada's readers judge this post (CORD-03 §1, CORD-04 §8). Without a
+    /// fold nothing can be judged, and the bridge never runs without one.
+    pub fn judge(&self, chat: &OpenedChat) -> Verdict {
+        let Some(f) = self.folded() else { return Verdict::Stands };
+        let post = Post { author: chat.author(), kind: chat.kind(), ms: chat.ms, edited_ms: None, tags: chat.tags() };
+        judge_post(&f, &self.community.id(), &chat.channel_id_hex, post, &self.timeouts(), now_ms())
+    }
+
+    /// Why a post of `kind` by `author_pk` would not stand in this Channel, if it
+    /// wouldn't. A puppet holds `@everyone`'s bits and manages nothing, so in a
+    /// restricted (read-only) Channel its post would be held from every reader,
+    /// and with Send Messages denied it would be collapsed. Reactions and
+    /// deletions stay at the read address and are judged by no ledger.
+    pub fn post_refusal(&self, channel: &ChannelView, author_pk: &str, kind: u16) -> Option<PostRefused> {
+        let f = self.folded()?;
+        if !rides_writer_address(kind) {
+            return None;
+        }
+        if f.restricting_ledger(&channel.id_hex).is_some() && !f.manages_channels(author_pk) {
+            return Some(PostRefused("the Armada channel is read-only: only its writers can post there"));
+        }
+        if f.ranked && f.channel_permissions(author_pk, &channel.id_hex) & perm::SEND_MESSAGES == 0 {
+            return Some(PostRefused("Send Messages is denied to this member in the Armada channel"));
+        }
+        None
+    }
+
     async fn publish_signed(&self, author: &Keys, kind: u16, content: String, tags: Vec<Vec<String>>) -> anyhow::Result<Event> {
         let tags = tags.into_iter().map(Tag::parse).collect::<Result<Vec<_>, _>>()?;
         let event = EventBuilder::new(Kind::Custom(kind), content).tags(tags).finalize(author)?;
@@ -331,10 +421,15 @@ impl ConcordClient {
     /// An ephemeral typing signal (kind 23311 in a 21059 wrap). Relays never
     /// store it, so failure is not worth surfacing.
     pub async fn send_typing(&self, channel: &ChannelView, author: &Keys, ms: u64) -> anyhow::Result<()> {
+        // Typing moves to the writer address in a restricted Channel; a signal
+        // of the moment that wouldn't stand is simply not sent.
+        if self.post_refusal(channel, &author.public_key().to_hex(), kinds::TYPING).is_some() {
+            return Ok(());
+        }
         let b = Binding { channel_id_hex: &channel.id_hex, epoch: channel.current().epoch };
         let rumor = concord::chat::typing(&b, &author.public_key().to_hex(), ms);
         let stream: StreamKey = (&channel.current().key).into();
-        let wrap = seal_and_wrap(&rumor, Plane::Chat, &stream, author, WrapOptions { ephemeral: true, expiration: None })?;
+        let wrap = seal_and_wrap(&rumor, Plane::Chat, &stream, author, WrapOptions { ephemeral: true, ..Default::default() })?;
         self.relays.publish(&wrap).await
     }
 
@@ -346,11 +441,25 @@ impl ConcordClient {
         if self.is_banned(&pk) {
             bail!("author {pk} is banned in this community");
         }
+        if let Some(refused) = self.post_refusal(channel, &pk, msg.kind) {
+            return Err(refused.into());
+        }
         let mut tags = concord::stream::channel_binding_tags(&channel.id_hex, channel.current().epoch);
         tags.extend(msg.tags);
         let rumor = Rumor::new(msg.kind, msg.content, tags, &pk, Some(msg.ms.unwrap_or_else(now_ms)), None);
         let stream: StreamKey = (&channel.current().key).into();
-        let wrap = seal_and_wrap(&rumor, Plane::Chat, &stream, msg.author, WrapOptions::default())?;
+        // The wrap's `p` is the author's derived wrap-owner key, not a random
+        // one, so the puppet (any instance of this bridge holding its key) can
+        // find and delete its own wraps later (CORD-01 §Deletions).
+        let rumor_id = concord::hex32(&rumor.id).context("rumor id is 32 bytes")?;
+        let owner = concord::derive::wrap_owner_key(msg.author.secret_key(), &stream.pk.to_bytes(), &rumor_id);
+        let seal = seal_rumor(&rumor, Plane::Chat.seal_kind(), &stream.conv_key, msg.author)?;
+        let wrap = wrap_seal(&seal, &stream, WrapOptions { p: Some(owner.public_key()), ..Default::default() })?;
+        // Relays drop an event past 64 KB (CORD-02 Appendix B): refuse here,
+        // where the caller can still say so, instead of losing it on the wire.
+        if wrap.as_json().len() > MAX_EVENT_BYTES {
+            bail!("the message is too large for a relay event once encrypted");
+        }
         self.relays.publish(&wrap).await?;
         Ok((rumor, wrap))
     }
@@ -363,8 +472,7 @@ impl ConcordClient {
         // the router on every subscribe. Catch-up after downtime is cursor
         // work. A small overlap absorbs clock skew.
         let since = Timestamp::from_secs((now_ms() / 1000).saturating_sub(60));
-        let pks = channel.streams.iter().map(|s| s.key.pubkey()).collect::<Vec<_>>();
-        let filter = Filter::new().kinds([Kind::Custom(kinds::WRAP), Kind::Custom(kinds::WRAP_EPHEMERAL)]).authors(pks).since(since);
+        let filter = Filter::new().kinds([Kind::Custom(kinds::WRAP), Kind::Custom(kinds::WRAP_EPHEMERAL)]).authors(channel_addresses(channel)).since(since);
         let mut sub = self.relays.subscribe(vec![filter]);
         let channel = channel.clone();
         TaskGuard(tokio::spawn(async move {
@@ -389,13 +497,35 @@ impl ConcordClient {
     /// them in order (the mapping table dedupes already-mirrored rumors).
     /// Returns the chats and the newest wrap timestamp seen, the next cursor.
     pub async fn backfill_channel(&self, channel: &ChannelView, since_secs: u64, limit: usize) -> anyhow::Result<(Vec<OpenedChat>, Option<u64>)> {
-        let pks = channel.streams.iter().map(|s| s.key.pubkey()).collect::<Vec<_>>();
-        let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).authors(pks).since(Timestamp::from_secs(since_secs)).limit(limit);
+        let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).authors(channel_addresses(channel)).since(Timestamp::from_secs(since_secs)).limit(limit);
         let wraps = self.relays.query(vec![filter]).await?;
         let mut chats: Vec<OpenedChat> = wraps.iter().filter_map(|w| open_chat(w, channel)).collect();
         chats.sort_by_key(|c| c.ms);
         let newest = wraps.iter().map(|w| w.created_at.as_secs()).max();
         Ok((chats, newest))
+    }
+
+    /// The Guestbook's address set and the filter reading its Timeouts (kind
+    /// 3314) for the per-post judge. A Timeout runs at most 28 days, so the
+    /// filter reaches back only that far.
+    fn guestbook_filter(&self) -> (Vec<StreamKey>, Filter) {
+        let streams = self.community.guestbook_streams();
+        let since = Timestamp::from_secs((now_ms() / 1000).saturating_sub(TIMEOUT_LOOKBACK_SECS));
+        let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).authors(streams.iter().map(|s| s.pk).collect::<Vec<_>>()).since(since);
+        (streams, filter)
+    }
+
+    /// Hold a Guestbook wrap if it is a Timeout.
+    fn take_timeout(&self, wrap: &Event, streams: &[StreamKey]) {
+        let Some(stream) = streams.iter().find(|s| s.pk == wrap.pubkey) else { return };
+        let Ok(opened) = open_plane_wrap(wrap, stream, Plane::Guestbook) else { return };
+        if opened.rumor.kind != kinds::TIMEOUT {
+            return;
+        }
+        let mut held = self.timeouts.write().unwrap_or_else(|e| e.into_inner());
+        if held.len() < MAX_TIMEOUTS_HELD || held.contains_key(&opened.rumor.id) {
+            held.insert(opened.rumor.id.clone(), opened);
+        }
     }
 
     /// Live-fold the Control Plane, so bans and channel changes apply to (nearly)
@@ -405,8 +535,13 @@ impl ConcordClient {
     /// every relay replays the whole plane on subscribe, and folding once per
     /// arriving wrap made that replay quadratic. Each wrap is opened once, on
     /// arrival; a re-fold only replays the editions already opened.
+    ///
+    /// The same REQ follows the Guestbook's Timeouts: relays cap standing
+    /// subscriptions, and a community's Control Plane and Guestbook are read
+    /// together anyway.
     pub fn subscribe_control(self: &Arc<Self>, on_fold: Option<FoldHandler>) -> TaskGuard {
-        let mut sub = self.relays.subscribe(vec![self.control_filter()]);
+        let (guestbook, guestbook_filter) = self.guestbook_filter();
+        let mut sub = self.relays.subscribe(vec![self.control_filter(), guestbook_filter]);
         let me = Arc::downgrade(self);
         TaskGuard(tokio::spawn(async move {
             let mut editions: HashMap<EventId, Edition> = HashMap::new();
@@ -434,6 +569,10 @@ impl ConcordClient {
                     continue;
                 }
                 let Some(me) = me.upgrade() else { return };
+                if guestbook.iter().any(|s| s.pk == wrap.pubkey) {
+                    me.take_timeout(&wrap, &guestbook);
+                    continue;
+                }
                 if let Some(edition) = me.open_editions(std::slice::from_ref(&wrap)).pop() {
                     editions.insert(wrap.id, edition);
                     pending = true;

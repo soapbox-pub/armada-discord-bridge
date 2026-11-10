@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use concord::community::ChannelView;
+use concord::judge::{FUTURE_HOLD_MS, Verdict, is_beyond_horizon, is_held_ahead};
 use concord::kinds;
 use nostr::prelude::Keys;
 use regex::Regex;
@@ -287,6 +288,13 @@ impl BridgeRouter {
         let Some(channel) = self.channel(link) else { return Ok(None) };
 
         let puppet = self.puppets.get(&msg.author.id)?;
+        // A read-only Armada channel takes posts only from its writers, and a
+        // puppet is never one: Armada would hold the post from every reader.
+        // Checked before any upload, which would be wasted work.
+        if let Some(refused) = self.client.post_refusal(&channel, &puppet.pk, kinds::MESSAGE) {
+            tracing::debug!(channel = %link.discord_channel_id, reason = %refused, "not bridging to Armada");
+            return Ok(None);
+        }
         let mut tags = vec![proxy_tag(&msg.guild_id, &msg.channel_id, &msg.id)];
         tags.extend(custom_emoji_tags(&msg.content));
         let source = match self.klipy_gif(&msg, &puppet.keys, &mut tags).await {
@@ -466,6 +474,16 @@ impl BridgeRouter {
     /// have. Past [`MAX_QUEUED_CHATS`] new rumors are dropped: shedding load
     /// beats unbounded growth, and the relay copy is still the record.
     pub async fn on_concord_chat(&self, chat: &OpenedChat, link: &ChannelLink) -> anyhow::Result<Vec<String>> {
+        // A message dated ahead waits for its time, as Armada holds it (CORD-03
+        // §3); one past the hour's horizon isn't shown there at all yet, and a
+        // relay will serve it again to a later catch-up when it nears.
+        let now = now_ms();
+        if is_beyond_horizon(chat.ms, now) {
+            return Ok(vec![]);
+        }
+        if is_held_ahead(chat.kind(), chat.ms, now) {
+            tokio::time::sleep(Duration::from_millis(chat.ms - FUTURE_HOLD_MS - now)).await;
+        }
         if self.queued.fetch_add(1, Ordering::SeqCst) >= MAX_QUEUED_CHATS {
             self.queued.fetch_sub(1, Ordering::SeqCst);
             tracing::warn!(
@@ -498,6 +516,17 @@ impl BridgeRouter {
             || self.client.is_banned(author)
         {
             return Ok(vec![]);
+        }
+        // What Armada's readers hold or collapse stays on Armada: a timed-out
+        // member, a pause, a member denied Send Messages, or a post in a
+        // read-only channel its Writers ledger doesn't stand behind. Relaying
+        // it would make Discord the way around the community's moderation.
+        if matches!(chat.kind(), kinds::MESSAGE | kinds::COMMENT | kinds::EDIT | kinds::TYPING) {
+            let verdict = self.client.judge(chat);
+            if verdict != Verdict::Stands {
+                tracing::debug!(rumor = %&chat.rumor_id()[..8], ?verdict, "not mirroring a post Armada doesn't show");
+                return Ok(vec![]);
+            }
         }
         match chat.kind() {
             kinds::TYPING => {
@@ -576,7 +605,10 @@ impl BridgeRouter {
     }
 
     /// Kind 5 -> remove every mapped Discord part. Honored for the rumor's own
-    /// author and for MANAGE_MESSAGES holders (moderator deletes propagate).
+    /// author, and for a moderator hide Armada would honor: Manage Messages in
+    /// the channel, a strict outrank of the author, and a citation of their
+    /// Grant (CORD-03 §3). Without the outrank a moderator could erase an
+    /// admin's message from Discord while it still stands on Armada.
     async fn on_concord_delete(&self, chat: &OpenedChat, link: &ChannelLink) -> anyhow::Result<()> {
         let targets: Vec<&str> =
             chat.tags().iter().filter(|t| t.first().is_some_and(|n| n == "e") && t.get(1).is_some_and(|v| !v.is_empty())).map(|t| t[1].as_str()).collect();
@@ -586,7 +618,7 @@ impl BridgeRouter {
             // bot reaction).
             if let Some(reaction) = self.store.reaction_by_rumor_id(target).await? {
                 let own = reaction.origin == Origin::Concord && reaction.author_ref == chat.author();
-                if !own && !self.client.is_moderator(chat.author()) {
+                if !own && !self.may_hide(chat, reaction.origin, &reaction.author_ref, link)? {
                     continue;
                 }
                 self.store.delete_reaction(target).await?;
@@ -601,7 +633,7 @@ impl BridgeRouter {
             let rows = self.store.by_rumor_id(target).await?;
             let Some(first) = rows.first() else { continue };
             let own = first.origin == Origin::Concord && first.author_ref == chat.author();
-            if !own && !self.client.is_moderator(chat.author()) {
+            if !own && !self.may_hide(chat, first.origin, &first.author_ref, link)? {
                 continue;
             }
             for row in &rows {
@@ -611,6 +643,17 @@ impl BridgeRouter {
             }
         }
         Ok(())
+    }
+
+    /// Whether `chat` (a kind 5) is a moderator hide of a rumor whose author is
+    /// `author_ref` — a pubkey for Armada-origin rows, a Discord user id (whose
+    /// puppet authored it) for Discord-origin ones.
+    fn may_hide(&self, chat: &OpenedChat, origin: Origin, author_ref: &str, link: &ChannelLink) -> anyhow::Result<bool> {
+        let author = match origin {
+            Origin::Concord => author_ref.to_owned(),
+            Origin::Discord => self.puppets.get(author_ref)?.pk,
+        };
+        Ok(self.client.may_hide(chat.author(), &author, &link.concord_channel_id_hex, &chat.rumor))
     }
 
     /// Kind 7 -> bot reaction on the mapped Discord message.

@@ -219,7 +219,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Bounded catch-up for messages missed while down (no cursor = fresh link,
     // live-only on purpose). The mapping table dedupes anything mirrored.
-    let stream_pks: Vec<String> = channel.streams.iter().map(|s| s.key.pk_hex()).collect();
+    let stream_pks: Vec<String> = bridge::client::channel_addresses(&channel).iter().map(|pk| pk.to_hex()).collect();
     if let Some(cursor) = store.cursor_get(&community.community_id, &stream_pks).await? {
         let (chats, newest) = client.backfill_channel(&channel, cursor.saturating_sub(60), 500).await?;
         for chat in &chats {
@@ -245,12 +245,12 @@ async fn main() -> anyhow::Result<()> {
         client.subscribe_control(Some(Arc::new(move |_| {
             let Some(fresh) = client2.channel(&link.concord_channel_id_hex) else { return };
             let mut cur = current.lock().unwrap_or_else(|e| e.into_inner());
-            let keys = |c: &concord::community::ChannelView| c.streams.iter().map(|s| s.key.pk_hex()).collect::<Vec<_>>();
+            let keys = bridge::client::channel_addresses;
             if keys(&fresh) == keys(&cur.0) {
                 return;
             }
             *cur = (fresh.clone(), client2.subscribe_channel(&fresh, on_chat.clone(), Some(on_cursor.clone())));
-            tracing::info!("stream keys rotated; chat subscription refreshed");
+            tracing::info!("stream keys or writer addresses moved; chat subscription refreshed");
         })))
     };
     tracing::info!("live in both directions");

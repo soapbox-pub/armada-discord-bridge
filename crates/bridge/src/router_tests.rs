@@ -187,7 +187,7 @@ impl Harness {
         let mut tags = concord::stream::channel_binding_tags(&self.channel.id_hex, 0);
         tags.extend(extra);
         let rumor = Rumor::new(kind, content, tags, &author.public_key().to_hex(), Some(now_ms()), None);
-        OpenedChat { ms: rumor.created_at * 1000, rumor, channel_id_hex: self.channel.id_hex.clone(), epoch: 0 }
+        OpenedChat { ms: rumor.created_at * 1000, rumor, channel_id_hex: self.channel.id_hex.clone(), epoch: 0, writer_epoch: None }
     }
 
     fn rows(&self) -> Vec<MessageMappingRow> {
@@ -198,13 +198,17 @@ impl Harness {
         self.webhooks.sent.lock().unwrap().clone()
     }
 
-    /// Make `member` a MANAGE_MESSAGES moderator in the fold.
-    fn promote(&self, member: &Keys) {
+    /// Make `member` a MANAGE_MESSAGES moderator in the fold, with a Grant
+    /// head their actions can cite. Returns the `vac` tag they act under.
+    fn promote(&self, member: &Keys) -> Vec<String> {
         let mut f = (*self.client.folded().unwrap()).clone();
         let role_id = hex::encode([9u8; 32]);
         f.roster.roles.push(Role::new(&role_id, "Mod", 2, perm::MANAGE_MESSAGES, RoleScope::Server));
         f.roster.grants.push(MemberGrant { member: member.public_key().to_hex(), role_ids: vec![role_id], control_wrap: None });
+        let eid = concord::derive::grant_locator(&self.client.community().id(), &member.public_key().to_bytes());
+        f.heads.insert(hex::encode(eid), concord::edition::Head { version: 1, hash: [0x42; 32] });
         self.client.set_folded(f);
+        concord::edition::Citation { entity_id: eid, version: 1, edition_hash: [0x42; 32] }.to_tag()
     }
 
     fn ban(&self, pk: &str) {
@@ -361,6 +365,99 @@ async fn never_echoes_proxied_puppet_banned_or_primary_rumors() {
     assert!(h.sent().is_empty());
 }
 
+// ── Roles v2: what Armada holds or collapses stays there ───────────────────
+
+impl Harness {
+    /// Switch the fold to the ranked Roster (CORD-04 §2) with Armada's default `@everyone`.
+    fn rank(&self) {
+        let mut f = (*self.client.folded().unwrap()).clone();
+        f.ranked = true;
+        f.roster.everyone = Some(perm::EVERYONE_DEFAULT);
+        self.client.set_folded(f);
+    }
+
+    /// Make the bridged channel read-only: `@everyone` denied Send Messages and a
+    /// Writers ledger at writer epoch 1, whose writer key and certifier are returned.
+    fn restrict(&self) -> (Keys, Keys) {
+        use concord::writers::{Spell, empty_ledger, ledger_appended};
+        self.rank();
+        let mut f = (*self.client.folded().unwrap()).clone();
+        let chan = self.channel.id_hex.clone();
+        f.roster.overwrites.push(Overwrite { scope: chan.clone(), target: OverwriteTarget::Everyone, allow: 0, deny: perm::SEND_MESSAGES });
+        let (writer, certifier) = (Keys::generate(), Keys::generate());
+        let spell = Spell::Writer { epoch: 1, pk: writer.public_key().to_hex(), root: 0, by: f.owner.clone(), certifier: Some(certifier.public_key().to_hex()) };
+        f.writers.insert(chan.clone(), ledger_appended(&empty_ledger(&chan), now_ms() - 60_000, spell).unwrap());
+        self.client.set_folded(f);
+        (writer, certifier)
+    }
+}
+
+use concord::roles::{Overwrite, OverwriteTarget};
+
+#[tokio::test]
+async fn a_read_only_armada_channel_takes_nothing_from_puppets() {
+    let h = harness();
+    h.restrict();
+    assert_eq!(h.router.on_discord_message(discord_msg(), &h.link).await.unwrap(), None);
+    assert!(h.chats().is_empty(), "a puppet post would be held from every Armada reader");
+    h.router.on_discord_typing(USER, &h.link).await.unwrap();
+    assert!(h.published_of_kind(kinds::WRAP_EPHEMERAL).is_empty(), "nor does its typing go out");
+}
+
+#[tokio::test]
+async fn a_read_only_channel_mirrors_only_what_its_ledger_stands_behind() {
+    let h = harness();
+    let (writer, certifier) = h.restrict();
+    let cid = h.client.community().id();
+    let chan = concord::hex32(&h.channel.id_hex).unwrap();
+
+    // Someone posting at the read address while it is closed: held on Armada.
+    let stray = h.chat(&Keys::generate(), kinds::MESSAGE, "let me in", vec![]);
+    assert!(h.router.on_concord_chat(&stray, &h.link).await.unwrap().is_empty());
+
+    // A certified writer posting at the writer address stands, and is read
+    // from that address under the channel's read key.
+    let alice = Keys::generate();
+    let cert = concord::writers::sign_writer_cert(certifier.secret_key(), &concord::writers::cert_digest(&cid, &chan, 1, &alice.public_key().to_bytes()));
+    let mut tags = concord::stream::channel_binding_tags(&h.channel.id_hex, 0);
+    tags.extend([s(&["wepoch", "1"]), vec!["wcert".into(), cert]]);
+    let rumor = Rumor::new(kinds::MESSAGE, "news", tags, &alice.public_key().to_hex(), Some(now_ms()), None);
+    let read_key: StreamKey = (&h.channel.current().key).into();
+    let at_writer = StreamKey { pk: writer.public_key(), conv_key: read_key.conv_key, sk: Some(writer.secret_key().clone()), restricted: false };
+    let wrap = concord::stream::seal_and_wrap(&rumor, concord::kinds::Plane::Chat, &at_writer, &alice, Default::default()).unwrap();
+    let view = h.client.channel(&h.channel.id_hex).unwrap();
+    assert!(crate::client::channel_addresses(&view).contains(&writer.public_key()), "the writer address is subscribed");
+    let opened = crate::client::open_chat(&wrap, &view).expect("opens at the writer address");
+    assert_eq!(opened.writer_epoch, Some(1));
+    assert_eq!(h.router.on_concord_chat(&opened, &h.link).await.unwrap().len(), 1);
+
+    // The same rumor replayed at the read address is refused outright.
+    let replayed = concord::stream::seal_and_wrap(&rumor, concord::kinds::Plane::Chat, &read_key, &alice, Default::default()).unwrap();
+    assert!(crate::client::open_chat(&replayed, &view).is_none());
+
+    // The owner manages the channel: their post stands at the read address too.
+    let mut owner_tags = concord::stream::channel_binding_tags(&h.channel.id_hex, 0);
+    owner_tags.push(s(&["x", "y"]));
+    let owner = h.client.folded().unwrap().owner.clone();
+    let rumor = Rumor::new(kinds::MESSAGE, "from the owner", owner_tags, &owner, Some(now_ms()), None);
+    let from_owner = OpenedChat { ms: rumor.created_at * 1000, rumor, channel_id_hex: h.channel.id_hex.clone(), epoch: 0, writer_epoch: None };
+    assert_eq!(h.router.on_concord_chat(&from_owner, &h.link).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_member_denied_send_messages_is_collapsed_and_not_mirrored() {
+    let h = harness();
+    h.rank();
+    let alice = Keys::generate();
+    let mut f = (*h.client.folded().unwrap()).clone();
+    f.roster.overwrites.push(Overwrite { scope: h.channel.id_hex.clone(), target: OverwriteTarget::Member(alice.public_key().to_hex()), allow: 0, deny: perm::SEND_MESSAGES });
+    h.client.set_folded(f);
+    let muted = h.chat(&alice, kinds::MESSAGE, "hi", vec![]);
+    assert!(h.router.on_concord_chat(&muted, &h.link).await.unwrap().is_empty());
+    let other = h.chat(&Keys::generate(), kinds::MESSAGE, "hi", vec![]);
+    assert_eq!(h.router.on_concord_chat(&other, &h.link).await.unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn mirrors_custom_discord_emoji_as_native_markup() {
     let h = harness();
@@ -436,10 +533,33 @@ async fn concord_delete_honors_the_author_and_moderators_only() {
     h.router.on_concord_chat(&delete(&alice), &h.link).await.unwrap();
     assert_eq!(*h.webhooks.deleted.lock().unwrap(), ids);
 
+    // A moderator hide stands only with a citation of their Grant (CORD-03 §3):
+    // uncited, it waits for a Grant this fold may not have read.
     h.webhooks.deleted.lock().unwrap().clear();
-    h.promote(&moderator);
+    let vac = h.promote(&moderator);
     h.router.on_concord_chat(&delete(&moderator), &h.link).await.unwrap();
+    assert!(h.webhooks.deleted.lock().unwrap().is_empty());
+    let cited = h.chat(&moderator, kinds::DELETE, "", vec![s(&["e", original.rumor_id()]), vac]);
+    h.router.on_concord_chat(&cited, &h.link).await.unwrap();
     assert_eq!(*h.webhooks.deleted.lock().unwrap(), ids);
+}
+
+#[tokio::test]
+async fn a_moderator_cannot_hide_a_higher_ranked_members_message() {
+    let h = harness();
+    let (admin, moderator) = (Keys::generate(), Keys::generate());
+    // The admin holds a Role above the moderator's.
+    let mut f = (*h.client.folded().unwrap()).clone();
+    let admin_role = hex::encode([8u8; 32]);
+    f.roster.roles.push(Role::new(&admin_role, "Admin", 1, perm::MANAGE_ROLES, RoleScope::Server));
+    f.roster.grants.push(MemberGrant { member: admin.public_key().to_hex(), role_ids: vec![admin_role], control_wrap: None });
+    h.client.set_folded(f);
+    let vac = h.promote(&moderator);
+    let original = h.chat(&admin, kinds::MESSAGE, "from the top", vec![]);
+    h.router.on_concord_chat(&original, &h.link).await.unwrap();
+    let hide = h.chat(&moderator, kinds::DELETE, "", vec![s(&["e", original.rumor_id()]), vac]);
+    h.router.on_concord_chat(&hide, &h.link).await.unwrap();
+    assert!(h.webhooks.deleted.lock().unwrap().is_empty());
 }
 
 // ── Reactions ───────────────────────────────────────────────────────────────
