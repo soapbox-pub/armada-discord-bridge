@@ -57,30 +57,67 @@ pub struct ParsedRekey {
     pub chunk_count: u64,
     pub blobs: Vec<Blob>,
     pub ms: u64,
+    /// A Severing Refounding (CORD-06 §3).
+    pub severed: bool,
     pub authority: Option<Citation>,
 }
 
+/// The most blobs a reader takes from one rekey event (CORD-06 §1); writers send at most 80.
+pub const MAX_REKEY_BLOBS_RECEIVED: usize = 120;
+
+/// The value of a tag that may appear at most once: `Err` when it repeats.
+fn unique_tag<'a>(tags: &'a [Vec<String>], name: &str) -> Result<Option<&'a str>, RekeyError> {
+    let mut found = None;
+    for t in tags.iter().filter(|t| t.len() >= 2 && t[0] == name) {
+        if found.is_some() {
+            return Err(RekeyError::Field("repeated tag"));
+        }
+        found = Some(t[1].as_str());
+    }
+    Ok(found)
+}
+
+/// Parse an opened rekey event into its rotation fields (Armada `parseRekey`,
+/// Vector `parse_rekey_chunk`): machinery tags at most once, strict decimals,
+/// exactly one `chunk` tag, `newepoch` above `prevepoch`, and blobs read as
+/// serde reads a `Vec<RekeyBlob>`.
 pub fn parse_rekey(opened: &Opened) -> Result<ParsedRekey, RekeyError> {
     let r = &opened.rumor;
     if r.kind != kinds::REKEY || opened.seal_kind() != kinds::SEAL_ENCRYPTED {
         return Err(RekeyError::NotRekey);
     }
-    let scope = r.tag_value("scope").filter(|s| is_hex64(s)).ok_or(RekeyError::Field("scope"))?;
-    let new_epoch = r.tag_value("newepoch").and_then(parse_tag_decimal).ok_or(RekeyError::Field("newepoch"))?;
-    let prev_epoch = r.tag_value("prevepoch").and_then(parse_tag_decimal).ok_or(RekeyError::Field("prevepoch"))?;
-    let prev_commit = r.tag_value("prevcommit").filter(|s| is_hex64(s)).ok_or(RekeyError::Field("prevcommit"))?;
-    let (chunk_index, chunk_count) = match r.tag("chunk") {
-        Some(t) => (
-            t.get(1).and_then(|s| parse_tag_decimal(s)).ok_or(RekeyError::Field("chunk"))?,
-            t.get(2).and_then(|s| parse_tag_decimal(s)).ok_or(RekeyError::Field("chunk"))?,
-        ),
-        None => (1, 1),
-    };
-    if chunk_index < 1 || chunk_count < 1 || chunk_index > chunk_count {
+    let scope = unique_tag(&r.tags, "scope")?.filter(|s| is_hex64(s)).ok_or(RekeyError::Field("scope"))?;
+    let new_epoch = unique_tag(&r.tags, "newepoch")?.and_then(parse_tag_decimal).ok_or(RekeyError::Field("newepoch"))?;
+    let prev_epoch = unique_tag(&r.tags, "prevepoch")?.and_then(parse_tag_decimal).ok_or(RekeyError::Field("prevepoch"))?;
+    if new_epoch <= prev_epoch {
+        return Err(RekeyError::Field("newepoch"));
+    }
+    let prev_commit = unique_tag(&r.tags, "prevcommit")?.filter(|s| is_hex64(s)).ok_or(RekeyError::Field("prevcommit"))?;
+    let chunks: Vec<&Vec<String>> = r.tags.iter().filter(|t| t.len() >= 3 && t[0] == "chunk").collect();
+    let [chunk] = chunks.as_slice() else { return Err(RekeyError::Field("chunk")) };
+    let chunk_index = parse_tag_decimal(&chunk[1]).ok_or(RekeyError::Field("chunk"))?;
+    let chunk_count = parse_tag_decimal(&chunk[2]).ok_or(RekeyError::Field("chunk"))?;
+    if chunk_index < 1 || chunk_count < 1 || chunk_index > chunk_count || chunk_count > u32::MAX as u64 {
         return Err(RekeyError::Field("chunk"));
     }
-    let raw: Vec<serde_json::Value> = serde_json::from_str(&r.content).map_err(|_| RekeyError::Field("content"))?;
-    let blobs = raw.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect();
+    // CORD-06 §3: present means exactly "1".
+    let severed = match unique_tag(&r.tags, "sever")? {
+        None => false,
+        Some("1") => true,
+        Some(_) => return Err(RekeyError::Field("sever")),
+    };
+    let raw = crate::strict::parse_value(&r.content).ok_or(RekeyError::Field("content"))?;
+    let list = raw.as_array().filter(|a| a.len() <= MAX_REKEY_BLOBS_RECEIVED).ok_or(RekeyError::Field("content"))?;
+    let mut blobs = Vec::with_capacity(list.len());
+    for b in list {
+        if crate::strict::repeated_keys(b) {
+            return Err(RekeyError::Field("content"));
+        }
+        let (Some(locator), Some(wrapped)) = (b.get("locator").and_then(|v| v.as_str()), b.get("wrapped").and_then(|v| v.as_str())) else {
+            return Err(RekeyError::Field("content"));
+        };
+        blobs.push(Blob { locator: locator.to_owned(), wrapped: wrapped.to_owned() });
+    }
     Ok(ParsedRekey {
         rotator: r.pubkey.clone(),
         scope_hex: scope.to_lowercase(),
@@ -91,6 +128,7 @@ pub fn parse_rekey(opened: &Opened) -> Result<ParsedRekey, RekeyError> {
         chunk_count,
         blobs,
         ms: opened.ms,
+        severed,
         authority: Citation::from_tags(&r.tags),
     })
 }
@@ -103,8 +141,12 @@ pub struct Rotation {
     pub new_epoch: u64,
     pub prev_epoch: u64,
     pub prev_commit: String,
+    /// The largest `n` any chunk declares: an extension raises it (CORD-06 §1).
     pub chunk_count: u64,
+    /// One entry per chunk index; chunks claiming the same index union their blobs.
     pub chunks: BTreeMap<u64, ParsedRekey>,
+    /// Any chunk marked it severing, so an unmarked chunk can't launder the mark away.
+    pub severed: bool,
     pub authority: Option<Citation>,
 }
 
@@ -118,9 +160,9 @@ impl Rotation {
         self.chunks.values().flat_map(|c| c.blobs.iter()).find(|b| b.locator == locator_hex)
     }
 
-    /// When this rotation published (newest chunk ms).
+    /// When this rotation published: its earliest chunk.
     pub fn published_ms(&self) -> u64 {
-        self.chunks.values().map(|c| c.ms).max().unwrap_or(0)
+        self.chunks.values().map(|c| c.ms).min().unwrap_or(0)
     }
 
     /// Continuity against the held key: `prevcommit` must commit to exactly it.
@@ -154,10 +196,16 @@ pub fn group_rotations(parsed: Vec<ParsedRekey>) -> Vec<Rotation> {
             prev_commit: p.prev_commit.clone(),
             chunk_count: p.chunk_count,
             chunks: BTreeMap::new(),
+            severed: false,
             authority: p.authority.clone(),
         });
-        if p.chunk_count == set.chunk_count {
-            set.chunks.insert(p.chunk_index, p);
+        set.chunk_count = set.chunk_count.max(p.chunk_count);
+        set.severed |= p.severed;
+        match set.chunks.get_mut(&p.chunk_index) {
+            Some(held) => held.blobs.extend(p.blobs),
+            None => {
+                set.chunks.insert(p.chunk_index, p);
+            }
         }
     }
     by_key.into_values().collect()

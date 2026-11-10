@@ -85,6 +85,15 @@ pub struct ChannelStream {
     pub retired_at: Option<u64>,
 }
 
+/// One writer address of a restricted Channel (CORD-03 §1). Its wraps are
+/// signed by the writer key but encrypted under the Channel's READ key, so a
+/// reader opens them with each of the Channel's streams' conversation keys.
+#[derive(Clone, Debug)]
+pub struct WriterStream {
+    pub epoch: u64,
+    pub pk: nostr::prelude::PublicKey,
+}
+
 /// A Channel as the member can read it.
 #[derive(Clone, Debug)]
 pub struct ChannelView {
@@ -96,8 +105,10 @@ pub struct ChannelView {
     pub position: Option<f64>,
     /// The rank-key position, ordering Channels on the ranked Roster (CORD-03 §2).
     pub rank: Option<String>,
-    /// Newest first; `streams[0]` is where writes go.
+    /// Newest first; `streams[0]` is where writes go, unless a Writers ledger restricts it.
     pub streams: Vec<ChannelStream>,
+    /// Every writer address the Channel's ledger names, live and retired.
+    pub writers: Vec<WriterStream>,
 }
 
 impl ChannelView {
@@ -288,6 +299,15 @@ impl Membership {
                 position: def.position,
                 rank: def.rank.clone(),
                 streams,
+                writers: folded
+                    .and_then(|f| f.writers.get(&def.channel_id_hex))
+                    .map(|l| {
+                        crate::writers::writer_windows(l)
+                            .into_iter()
+                            .filter_map(|w| Some(WriterStream { epoch: w.epoch, pk: nostr::prelude::PublicKey::from_hex(&w.pk).ok()? }))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             });
         }
         for held in &self.private_channels {
@@ -304,6 +324,7 @@ impl Membership {
                 position: None,
                 rank: None,
                 streams: private_streams(held, &id),
+                writers: Vec::new(),
             });
         }
         let ranked = folded.is_some_and(|f| f.ranked);

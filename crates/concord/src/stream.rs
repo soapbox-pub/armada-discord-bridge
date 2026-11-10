@@ -44,6 +44,8 @@ pub enum StreamError {
     WrongPlane(u16),
     #[error("channel/epoch binding mismatch")]
     BindingMismatch,
+    #[error("writer epoch binding mismatch")]
+    WriterBindingMismatch,
     #[error("signing failed: {0}")]
     Sign(String),
 }
@@ -231,4 +233,21 @@ pub fn check_channel_binding(rumor: &Rumor, channel_id_hex: &str, epoch: u64) ->
         return Err(StreamError::BindingMismatch);
     }
     Ok(())
+}
+
+/// CORD-03 §3: a rumor a writer address served commits its `wepoch`, canonical
+/// and strict-equal to the epoch whose address served it; one at the read
+/// address carries none, and one carrying it twice or malformed is dropped
+/// wherever it arrives. Without this a writer post could be replayed at the
+/// read address (or another epoch's) to dodge the window it was judged in.
+pub fn check_writer_binding(rumor: &Rumor, writer_epoch: Option<u64>) -> Result<(), StreamError> {
+    let found: Vec<&[String]> = rumor.tags_named("wepoch").collect();
+    match writer_epoch {
+        None if found.is_empty() => Ok(()),
+        None => Err(StreamError::WriterBindingMismatch),
+        Some(epoch) => match found.as_slice() {
+            [t] if t.get(1).and_then(|v| crate::parse_tag_decimal(v)) == Some(epoch) => Ok(()),
+            _ => Err(StreamError::WriterBindingMismatch),
+        },
+    }
 }

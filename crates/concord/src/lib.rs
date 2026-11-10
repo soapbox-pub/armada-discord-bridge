@@ -15,6 +15,7 @@ pub mod direct_invite;
 pub mod edition;
 pub mod guestbook;
 pub mod invite;
+pub mod judge;
 pub mod kinds;
 pub mod media;
 pub mod nip44;

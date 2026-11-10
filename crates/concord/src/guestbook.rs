@@ -92,3 +92,83 @@ pub fn coalesce(
     }
     by_member
 }
+
+/// A Timeout's `until` is capped this far past the rumor's own time (CORD-04 §8).
+pub const TIMEOUT_MAX_SECS: u64 = 28 * 24 * 60 * 60;
+
+/// One folded Timeout (CORD-04 §8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoldedTimeout {
+    pub by: String,
+    /// Its window: from its own time in whole seconds, inclusive, to `until`, exclusive.
+    pub from_secs: u64,
+    pub until: u64,
+    pub ms: u64,
+    pub rumor_id: String,
+}
+
+impl FoldedTimeout {
+    /// Whether it runs at `now_ms`.
+    pub fn running(&self, now_ms: u64) -> bool {
+        self.until.saturating_mul(1000) > now_ms
+    }
+
+    /// Whether a post at `at_ms` falls inside its window while it runs: what
+    /// readers collapse.
+    pub fn silences(&self, at_ms: u64, now_ms: u64) -> bool {
+        self.running(now_ms) && at_ms >= self.from_secs * 1000 && at_ms < self.until.saturating_mul(1000)
+    }
+}
+
+fn sole_tag<'a>(r: &'a Rumor, name: &str) -> Option<&'a str> {
+    let mut found = None;
+    for t in r.tags.iter().filter(|t| t.len() >= 2 && t[0] == name) {
+        if found.is_some() {
+            return None;
+        }
+        found = Some(t[1].as_str());
+    }
+    found
+}
+
+/// Fold Timeouts (kind 3314, CORD-04 §8): per target, the newest by its time to
+/// the millisecond among those `may_timeout(actor, target, citation)` lets time
+/// the target out, the lower rumor id breaking a tie. `until` is capped at 28
+/// days past the rumor's own time; a past `until` lifts. Exactly one `p` and one
+/// `until`, and never the owner.
+pub fn fold_timeouts(
+    opened: &[Opened],
+    now_ms: u64,
+    owner: &str,
+    banned: &HashSet<String>,
+    may_timeout: impl Fn(&str, &str, Option<&Citation>) -> bool,
+) -> HashMap<String, FoldedTimeout> {
+    let mut out: HashMap<String, FoldedTimeout> = HashMap::new();
+    for ev in opened {
+        let r = &ev.rumor;
+        if r.kind != kinds::TIMEOUT || ev.ms > now_ms + MAX_FUTURE_MS || ev.seal_kind() != kinds::SEAL_ENCRYPTED || banned.contains(ev.author()) {
+            continue;
+        }
+        let Some(target) = sole_tag(r, "p").map(str::to_lowercase) else { continue };
+        let Some(until_raw) = sole_tag(r, "until") else { continue };
+        // Digits fitting a u64, leading zeros allowed, as Vector parses them.
+        if until_raw.is_empty() || !until_raw.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(until) = until_raw.parse::<u64>() else { continue };
+        if !crate::is_hex64(&target) || nostr::prelude::PublicKey::from_hex(&target).is_err() || target == owner {
+            continue;
+        }
+        if !may_timeout(&r.pubkey, &target, Citation::from_tags(&r.tags).as_ref()) {
+            continue;
+        }
+        let from_secs = ev.ms / 1000;
+        let until = until.min(from_secs + TIMEOUT_MAX_SECS);
+        if let Some(prev) = out.get(&target)
+            && (ev.ms < prev.ms || (ev.ms == prev.ms && r.id >= prev.rumor_id)) {
+                continue;
+            }
+        out.insert(target, FoldedTimeout { by: r.pubkey.clone(), from_secs, until, ms: ev.ms, rumor_id: r.id.clone() });
+    }
+    out
+}
