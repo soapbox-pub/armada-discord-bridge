@@ -363,6 +363,10 @@ impl Membership {
             if hex32(&id).is_none() || hex32(&c.key).is_none() {
                 continue;
             }
+            // A Public Channel's entry carries the root itself (Armada `isRootKeyed`): no Private key.
+            if c.key.eq_ignore_ascii_case(&bundle.community_root) {
+                continue;
+            }
             if self.channel_cuts.iter().any(|(cid, cut)| cid == &id && c.epoch < *cut) {
                 continue;
             }

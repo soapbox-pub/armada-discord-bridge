@@ -131,3 +131,71 @@ mod tests {
         assert!(unwrap(&wrap, &stranger).is_none());
     }
 }
+
+/// How far past the held epoch a vend may claim to be (Vector `MAX_VEND_EPOCH_LEAD`).
+pub const MAX_VEND_EPOCH_LEAD: u64 = 1024;
+
+/// Why a catch-up vend of one channel key is or isn't taken (Armada `CatchUpVerdict`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VendVerdict {
+    Adopt,
+    /// Our fold has no such live channel: a vend may deliver a key, never define a channel.
+    NoFold,
+    /// Our owner-rooted fold says the channel is public, so this is no Private key.
+    NotPrivate,
+    Banned,
+    SenderBanned,
+    ImplausibleEpoch,
+    KeyMismatch,
+    Unverified,
+    SenderUnauthorized,
+    NotEntitled,
+}
+
+/// Judge one channel key a Direct Invite vends to `recipient` from `sender`
+/// against the folded Control Plane (Armada `judgeCatchUpChannels`, Vector
+/// `judge_channel_key_vend`). `held_epoch` is the epoch already held, if any.
+///
+/// Sender authority alone was the bridge's old gate, and it let any Manage
+/// Channels holder claim any epoch with any key: the bridge moves its write
+/// stream to the newest epoch, so a bad vend redirected everything mirrored
+/// from Discord into a stream only the vendor could read, and a monotonic head
+/// can never be walked back. The seal is what authenticates a key where one
+/// exists; elsewhere only the owner or a manager, who could rotate to a key of
+/// their own anyway, is taken at their word.
+pub fn judge_vend(folded: &crate::control::FoldedControl, recipient: &str, sender: &str, channel: &crate::invite::BundleChannel, held_epoch: Option<u64>) -> VendVerdict {
+    use crate::roles::perm;
+    let id = channel.id.to_lowercase();
+    if folded.banned.contains(recipient) {
+        return VendVerdict::Banned;
+    }
+    let Some(ch) = folded.channels.get(&id).filter(|c| !c.deleted) else { return VendVerdict::NoFold };
+    if !ch.private {
+        return VendVerdict::NotPrivate;
+    }
+    if channel.epoch > held_epoch.unwrap_or(0).saturating_add(MAX_VEND_EPOCH_LEAD) {
+        return VendVerdict::ImplausibleEpoch;
+    }
+    let owner = folded.owner.as_str();
+    if !folded.roster.entitled_to_channel(recipient, owner, &id) {
+        return VendVerdict::NotEntitled;
+    }
+    if folded.banned.contains(sender) {
+        return VendVerdict::SenderBanned;
+    }
+    let manages = folded.roster.is_authorized(sender, owner, perm::MANAGE_CHANNELS);
+    if !manages && !folded.roster.entitled_to_channel(sender, owner, &id) {
+        return VendVerdict::SenderUnauthorized;
+    }
+    if let Some(sealed) = &ch.sealed {
+        if channel.epoch == sealed.epoch {
+            let (Some(key), Some(cid)) = (crate::hex32(&channel.key), crate::hex32(&id)) else { return VendVerdict::KeyMismatch };
+            if crate::channel_seal::open_channel_seal(sealed, &key, &cid).is_none() {
+                return VendVerdict::KeyMismatch;
+            }
+        } else if !manages && sender != owner {
+            return VendVerdict::Unverified;
+        }
+    }
+    VendVerdict::Adopt
+}
