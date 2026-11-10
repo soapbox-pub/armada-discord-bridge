@@ -139,6 +139,12 @@ impl CommunityRuntime {
         Attachment { runtime: self.clone(), bridge_id: bridge_id.to_owned(), token }
     }
 
+    /// Re-read every attached bridge's channel: a bridge's client took a new
+    /// key (see `ConcordClient::follow_channel_keys`).
+    pub fn refresh(&self) {
+        self.refresh_views();
+    }
+
     /// Follow a rekey: the fold changed, and a bridge whose channel now has a
     /// different stream set would go silent on a REQ pinned to the old one.
     fn refresh_views(&self) {

@@ -461,3 +461,54 @@ async fn reads_deliveries_and_rotations_on_a_relay_that_gates_giftwraps() {
     assert_eq!(held.epoch, 2, "and so is the rotation");
 }
 
+#[tokio::test]
+async fn follows_a_rotation_while_running() {
+    let w = world();
+    let bridge = Keys::generate();
+    let (id, key, next) = ([0x81; 32], [0x82; 32], [0x83; 32]);
+    let folded = ranked_fold(&w, id, key, &bridge);
+    w.deliver(&w.owner, &bridge, id, 1, key);
+    let intake = bridge::key_intake::intake_access_keys(&w.relay, &bridge, &w.community, &folded).await;
+    let client = ConcordClient::new(intake.community, Arc::new(w.relay.clone()), bridge.clone());
+    client.set_folded(folded);
+    let epoch_of = |c: &ConcordClient| c.community().private_channels.iter().find(|h| h.id == hex::encode(id)).map(|h| h.epoch);
+    assert_eq!(epoch_of(&client), Some(1));
+
+    let changes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = changes.clone();
+    let _watch = client.follow_channel_keys(&hex::encode(id), Arc::new(move || {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // The owner re-keys the channel, keeping the bridge, while it runs.
+    let rotate = |from: [u8; 32], to: [u8; 32], epoch: u64| {
+        let rumors = concord::rekey::build_channel_rotation(&w.owner, &id, epoch, epoch - 1, &from, &to, &[bridge.public_key().to_hex()], now_ms(), None).unwrap();
+        let address: StreamKey = (&concord::derive::channel_rekey_group_key(&w.community.root_key(), &id, epoch)).into();
+        for r in rumors {
+            w.relay.inject(seal_and_wrap(&r, Plane::Rekey, &address, &w.owner, Default::default()).unwrap());
+        }
+    };
+    let wait_for = |want: u64| {
+        let client = client.clone();
+        async move {
+            for _ in 0..100 {
+                if epoch_of(&client) == Some(want) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            false
+        }
+    };
+    rotate(key, next, 2);
+    assert!(wait_for(2).await, "took epoch 2 without a restart");
+    assert_eq!(changes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let view = client.channel(&hex::encode(id)).unwrap();
+    assert_eq!(view.streams.iter().map(|s| s.epoch).max(), Some(2), "the channel now reads and writes the new epoch");
+
+    // And the one after: the watcher moved to epoch 3's address.
+    rotate(next, [0x84; 32], 3);
+    assert!(wait_for(3).await, "followed the next rotation too");
+    assert_eq!(changes.load(std::sync::atomic::Ordering::SeqCst), 2);
+}

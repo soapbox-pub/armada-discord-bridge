@@ -189,6 +189,9 @@ type FoldCell = Arc<RwLock<Option<Arc<FoldedControl>>>>;
 /// whether one counts is judged against the Roster as it stands (CORD-04 §8).
 type TimeoutCell = Arc<RwLock<HashMap<String, Opened>>>;
 
+/// How long a key watcher lets a rotation's chunks land before reading it.
+const KEY_SETTLE: Duration = Duration::from_millis(750);
+
 /// A shared fold and this client's keyed reading of it (see `folded`).
 type KeyedCache = std::sync::Mutex<Option<(Arc<FoldedControl>, Arc<FoldedControl>)>>;
 
@@ -213,7 +216,9 @@ pub struct BotCommandArg {
 }
 
 pub struct ConcordClient {
-    community: Membership,
+    /// Swapped when a rotation or delivery hands this client a channel key
+    /// while it runs (see `follow_channel_keys`).
+    community: RwLock<Arc<Membership>>,
     relays: Arc<dyn RelayLike>,
     primary: Keys,
     folded: FoldCell,
@@ -227,7 +232,14 @@ impl ConcordClient {
         let mut keys = stream_keys(&community.control_streams());
         keys.extend(stream_keys(&community.guestbook_streams()));
         relays.register_auth_keys(keys);
-        Arc::new(ConcordClient { community, relays, primary, folded: FoldCell::default(), keyed: KeyedCache::default(), timeouts: TimeoutCell::default() })
+        Arc::new(ConcordClient {
+            community: RwLock::new(Arc::new(community)),
+            relays,
+            primary,
+            folded: FoldCell::default(),
+            keyed: KeyedCache::default(),
+            timeouts: TimeoutCell::default(),
+        })
     }
 
     /// A client for another member of `with`'s community: its own membership
@@ -235,12 +247,28 @@ impl ConcordClient {
     /// relays and reading `with`'s fold. The fold depends only on the base the
     /// two must share: a Direct Invite can add channel keys but never move it.
     pub fn sharing_fold(community: Membership, primary: Keys, with: &ConcordClient) -> Arc<ConcordClient> {
-        debug_assert_eq!(community.community_id, with.community.community_id);
-        Arc::new(ConcordClient { community, relays: with.relays.clone(), primary, folded: with.folded.clone(), keyed: KeyedCache::default(), timeouts: with.timeouts.clone() })
+        debug_assert_eq!(community.community_id, with.community().community_id);
+        Arc::new(ConcordClient {
+            community: RwLock::new(Arc::new(community)),
+            relays: with.relays.clone(),
+            primary,
+            folded: with.folded.clone(),
+            keyed: KeyedCache::default(),
+            timeouts: with.timeouts.clone(),
+        })
     }
 
-    pub fn community(&self) -> &Membership {
-        &self.community
+    pub fn community(&self) -> Arc<Membership> {
+        self.community.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Take a membership holding newer channel keys. The base may not move:
+    /// the fold this client shares was read from it.
+    pub fn set_community(&self, community: Membership) {
+        debug_assert_eq!(community.community_id, self.community().community_id);
+        *self.community.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(community);
+        // The creators a keyed fold opened depend on the keys held.
+        *self.keyed.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     pub fn relays(&self) -> &Arc<dyn RelayLike> {
@@ -273,7 +301,7 @@ impl ConcordClient {
         {
             return Some(keyed.clone());
         }
-        let creators = self.community.open_creators(&base);
+        let creators = self.community().open_creators(&base);
         let keyed = if creators.is_empty() {
             base.clone()
         } else {
@@ -291,19 +319,19 @@ impl ConcordClient {
     }
 
     fn fold(&self, editions: &[Edition]) -> Arc<FoldedControl> {
-        let folded = Arc::new(fold_control(editions, &self.community.id(), &self.community.owner, None, None));
+        let folded = Arc::new(fold_control(editions, &self.community().id(), &self.community().owner, None, None));
         *self.folded.write().unwrap_or_else(|e| e.into_inner()) = Some(folded.clone());
         folded
     }
 
     fn control_filter(&self) -> Filter {
-        let pks = self.community.control_streams().iter().map(|s| s.pk).collect::<Vec<_>>();
+        let pks = self.community().control_streams().iter().map(|s| s.pk).collect::<Vec<_>>();
         Filter::new().kind(Kind::Custom(kinds::WRAP)).authors(pks)
     }
 
     /// Open control wraps into editions, skipping anything that is not one.
     fn open_editions(&self, wraps: &[Event]) -> Vec<Edition> {
-        let streams = self.community.control_streams();
+        let streams = self.community().control_streams();
         wraps
             .iter()
             .filter_map(|w| {
@@ -339,7 +367,7 @@ impl ConcordClient {
 
     /// Channels readable with held keys, per the current fold.
     pub fn channels(&self) -> Vec<ChannelView> {
-        let channels = self.community.channels(self.folded().as_deref());
+        let channels = self.community().channels(self.folded().as_deref());
         let keys = channels.iter().flat_map(|c| c.streams.iter().map(|s| s.key.keys.clone())).collect();
         self.relays.register_auth_keys(keys);
         channels
@@ -355,7 +383,7 @@ impl ConcordClient {
     }
 
     pub fn is_authorized(&self, pubkey_hex: &str, bits: u64) -> bool {
-        self.folded().is_some_and(|f| f.roster.is_authorized(pubkey_hex, &self.community.owner, bits))
+        self.folded().is_some_and(|f| f.roster.is_authorized(pubkey_hex, &self.community().owner, bits))
     }
 
     /// MANAGE_MESSAGES holder (or owner) per the current fold.
@@ -370,14 +398,14 @@ impl ConcordClient {
     /// counting on a Grant this fold hasn't read.
     pub fn may_hide(&self, deleter: &str, author: &str, channel_id_hex: &str, delete: &Rumor) -> bool {
         let Some(f) = self.folded() else { return false };
-        f.may_hide_in(deleter, author, channel_id_hex) && f.citation_satisfied(&self.community.id(), deleter, concord::edition::Citation::from_tags(&delete.tags).as_ref())
+        f.may_hide_in(deleter, author, channel_id_hex) && f.citation_satisfied(&self.community().id(), deleter, concord::edition::Citation::from_tags(&delete.tags).as_ref())
     }
 
     /// The Timeouts running now, judged against the current Roster.
     pub fn timeouts(&self) -> HashMap<String, FoldedTimeout> {
         let Some(f) = self.folded() else { return HashMap::new() };
         let opened: Vec<Opened> = self.timeouts.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
-        let cid = self.community.id();
+        let cid = self.community().id();
         fold_timeouts(&opened, now_ms(), &f.owner, &f.banned, |actor, target, citation| {
             f.roster.can_act_on_member(actor, &f.owner, target, perm::MODERATE_MEMBERS) && f.citation_satisfied(&cid, actor, citation)
         })
@@ -388,7 +416,7 @@ impl ConcordClient {
     pub fn judge(&self, chat: &OpenedChat) -> Verdict {
         let Some(f) = self.folded() else { return Verdict::Stands };
         let post = Post { author: chat.author(), kind: chat.kind(), ms: chat.ms, edited_ms: None, tags: chat.tags() };
-        judge_post(&f, &self.community.id(), &chat.channel_id_hex, post, &self.timeouts(), now_ms())
+        judge_post(&f, &self.community().id(), &chat.channel_id_hex, post, &self.timeouts(), now_ms())
     }
 
     /// Why a post of `kind` by `author_pk` would not stand in this Channel, if it
@@ -450,7 +478,7 @@ impl ConcordClient {
     pub async fn publish_join(&self, ms: u64, author: Option<&Keys>) -> anyhow::Result<Event> {
         let author = author.unwrap_or(&self.primary);
         let rumor = concord::guestbook::join(&author.public_key().to_hex(), ms, None);
-        let wrap = seal_and_wrap(&rumor, Plane::Guestbook, &self.community.current_guestbook_stream(), author, WrapOptions::default())?;
+        let wrap = seal_and_wrap(&rumor, Plane::Guestbook, &self.community().current_guestbook_stream(), author, WrapOptions::default())?;
         self.relays.publish(&wrap).await?;
         Ok(wrap)
     }
@@ -571,7 +599,7 @@ impl ConcordClient {
     /// 3314) for the per-post judge. A Timeout runs at most 28 days, so the
     /// filter reaches back only that far.
     fn guestbook_filter(&self) -> (Vec<StreamKey>, Filter) {
-        let streams = self.community.guestbook_streams();
+        let streams = self.community().guestbook_streams();
         let since = Timestamp::from_secs((now_ms() / 1000).saturating_sub(TIMEOUT_LOOKBACK_SECS));
         let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).authors(streams.iter().map(|s| s.pk).collect::<Vec<_>>()).since(since);
         (streams, filter)
@@ -601,6 +629,61 @@ impl ConcordClient {
     /// The same REQ follows the Guestbook's Timeouts: relays cap standing
     /// subscriptions, and a community's Control Plane and Guestbook are read
     /// together anyway.
+    /// Follow a private channel's key while the bridge runs: its next
+    /// rotations and its access deliveries. Each wrap arriving at one of those
+    /// addresses re-runs the same vetted intake a start runs, and a key it
+    /// takes for this channel swaps in this client's membership and calls
+    /// `on_change`, so the caller can move its chat REQ.
+    ///
+    /// Without it a rotation (a ban, a revoke, an owner re-keying) left the
+    /// bridge reading and writing the superseded epoch until its next restart:
+    /// Armada's members moved to the new stream, and the channel went quiet in
+    /// both directions while every bridge looked healthy.
+    pub fn follow_channel_keys(self: &Arc<Self>, channel_id_hex: &str, on_change: Arc<dyn Fn() + Send + Sync>) -> TaskGuard {
+        let me = Arc::downgrade(self);
+        let channel = channel_id_hex.to_owned();
+        TaskGuard::spawn(async move {
+            let mut seen = RecentIds::default();
+            'resubscribe: loop {
+                let Some(client) = me.upgrade() else { return };
+                let Some(id) = concord::hex32(&channel) else { return };
+                let streams = key_watch_streams(&client.community(), &channel, &id);
+                client.relays.register_auth_keys(crate::key_intake::auth_keys(&streams));
+                let since = Timestamp::from_secs((now_ms() / 1000).saturating_sub(60));
+                let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).authors(streams.iter().map(|s| s.pk).collect::<Vec<_>>()).since(since);
+                let mut sub = client.relays.subscribe(vec![filter]);
+                let addresses: Vec<PublicKey> = streams.iter().map(|s| s.pk).collect();
+                drop(client);
+                loop {
+                    let Some(wrap) = sub.recv().await else { return };
+                    // A resubscription replays the last minute; what was
+                    // already read is no news.
+                    if !seen.insert(&wrap.id.to_hex()) {
+                        continue;
+                    }
+                    // A rotation arrives as several chunks; let them land.
+                    tokio::time::sleep(KEY_SETTLE).await;
+                    let Some(client) = me.upgrade() else { return };
+                    let Some(folded) = client.folded() else { continue };
+                    let held = client.community();
+                    let intake = crate::key_intake::intake_access_keys(client.relays.as_ref(), &client.primary, &held, &folded).await;
+                    if !intake.learned.is_empty() {
+                        let ours = intake.learned.contains(&channel);
+                        client.set_community(intake.community);
+                        if ours {
+                            tracing::info!(channel = %&channel[..8], "took a new key for the bridged channel while running");
+                            on_change();
+                        }
+                    }
+                    // A new epoch moves the next rotation's address.
+                    if key_watch_streams(&client.community(), &channel, &id).iter().map(|s| s.pk).ne(addresses.iter().copied()) {
+                        continue 'resubscribe;
+                    }
+                }
+            }
+        })
+    }
+
     pub fn subscribe_control(self: &Arc<Self>, on_fold: Option<FoldHandler>) -> TaskGuard {
         let (guestbook, guestbook_filter) = self.guestbook_filter();
         let mut sub = self.relays.subscribe(vec![self.control_filter(), guestbook_filter]);
@@ -660,6 +743,15 @@ impl<'a> SendChat<'a> {
     pub fn message(author: &'a Keys, content: impl Into<String>) -> Self {
         SendChat { content: content.into(), author, kind: kinds::MESSAGE, tags: vec![], ms: None }
     }
+}
+
+/// Where a held private channel's next keys arrive: its upcoming rotations
+/// and its access plane.
+fn key_watch_streams(community: &Membership, channel_id_hex: &str, id: &concord::Bytes32) -> Vec<StreamKey> {
+    let mut streams: Vec<StreamKey> =
+        community.channel_rekey_addresses().into_iter().filter(|(_, c, _)| c == channel_id_hex).map(|(g, _, _)| (&g).into()).collect();
+    streams.push((&community.access_plane(id)).into());
+    streams
 }
 
 fn stream_keys(streams: &[StreamKey]) -> Vec<Keys> {

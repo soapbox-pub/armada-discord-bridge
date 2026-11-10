@@ -171,3 +171,31 @@ async fn a_private_key_vended_to_one_bridge_stays_with_that_bridge() {
     heard(&got_a, 1).await;
     assert!(got_b.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_key_taken_while_running_moves_the_shared_chat_req() {
+    let w = world();
+    let private = concord::random32();
+    w.channel(private, "mods", true);
+    let rt = w.open(Arc::default()).await;
+    let key = |k: [u8; 32], epoch: u64| PrivateChannelKey { id: hex::encode(private), key: hex::encode(k), epoch, name: "mods".into(), priors: vec![] };
+    let mut held = w.community.clone();
+    held.private_channels.push(key(concord::random32(), 0));
+    let client = rt.client_for(held.clone(), Keys::generate());
+    let (got, on_chat) = inbox();
+    let attachment = rt.attach("a", client.clone(), client.channel(&hex::encode(private)).unwrap(), on_chat);
+    eventually("the chat REQ", || w.relay.open_subscriptions() == 2).await;
+
+    // The client takes epoch 1 (as follow_channel_keys would) and the runtime
+    // is told: the attachment's view, and the REQ under it, move to the new stream.
+    held.private_channels[0] = key(concord::random32(), 1);
+    client.set_community(held);
+    rt.refresh();
+    let at_new_epoch = || attachment.channel().is_some_and(|c| c.streams.iter().any(|s| s.epoch == 1));
+    eventually("the attachment's view to move", at_new_epoch).await;
+    tokio::time::sleep(RESUBSCRIBE_SETTLE * 2).await;
+    let mods = client.channel(&hex::encode(private)).unwrap();
+    client.send_chat(&mods, SendChat::message(&Keys::generate(), "after the rotation")).await.unwrap();
+    heard(&got, 1).await;
+    assert_eq!(got.lock().unwrap()[0].epoch, 1);
+}

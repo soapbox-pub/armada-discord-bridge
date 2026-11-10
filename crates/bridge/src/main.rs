@@ -238,10 +238,11 @@ async fn main() -> anyhow::Result<()> {
 
     let current = Arc::new(std::sync::Mutex::new((channel.clone(), client.subscribe_channel(&channel, on_chat.clone(), Some(on_cursor.clone())))));
     // A rekey mints new stream keys; a REQ pinned to the old ones goes silent
-    // while publishes (fresh channel lookup) keep working.
-    let _control = {
+    // while publishes (fresh channel lookup) keep working. Both a refold and a
+    // newly taken key re-read the channel.
+    let resubscribe: Arc<dyn Fn() + Send + Sync> = {
         let (client2, current, link) = (client.clone(), current.clone(), link.clone());
-        client.subscribe_control(Some(Arc::new(move |_| {
+        Arc::new(move || {
             let Some(fresh) = client2.channel(&link.concord_channel_id_hex) else { return };
             let mut cur = current.lock().unwrap_or_else(|e| e.into_inner());
             let keys = bridge::client::channel_addresses;
@@ -250,8 +251,13 @@ async fn main() -> anyhow::Result<()> {
             }
             *cur = (fresh.clone(), client2.subscribe_channel(&fresh, on_chat.clone(), Some(on_cursor.clone())));
             tracing::info!("stream keys or writer addresses moved; chat subscription refreshed");
-        })))
+        })
     };
+    let _control = {
+        let resubscribe = resubscribe.clone();
+        client.subscribe_control(Some(Arc::new(move |_| resubscribe())))
+    };
+    let _keys = channel.private.then(|| client.follow_channel_keys(&channel.id_hex, resubscribe.clone()));
     tracing::info!("live in both directions");
 
     shutdown_signal().await;

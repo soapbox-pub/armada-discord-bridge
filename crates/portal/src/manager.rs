@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use async_trait::async_trait;
-use bridge::client::{BotCommand, BotCommandArg, ConcordClient, OpenedChat, SendChat, now_ms, resolve_invite};
+use bridge::client::{BotCommand, BotCommandArg, ConcordClient, OpenedChat, SendChat, TaskGuard, now_ms, resolve_invite};
 use bridge::community::{Attachment, CommunityRuntime};
 use bridge::discord::{CommandMessage, DiscordAdapter, DiscordEvents, TypingEvent};
 use bridge::key_intake::{intake_access_keys, intake_direct_invite_keys};
@@ -261,6 +261,8 @@ struct Running {
     status: Mutex<LiveStatus>,
     router: RwLock<Option<Arc<BridgeRouter>>>,
     attachment: Mutex<Option<Attachment>>,
+    /// Follows a private channel's rotations and deliveries while running.
+    key_watch: Mutex<Option<TaskGuard>>,
 }
 
 impl Running {
@@ -281,6 +283,7 @@ impl Running {
     /// subscriptions go with its last bridge.
     fn halt(&self) {
         self.attachment.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.key_watch.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 }
 
@@ -857,6 +860,7 @@ impl BridgeManager {
             status: Mutex::new(status),
             router: RwLock::new(None),
             attachment: Mutex::new(None),
+            key_watch: Mutex::new(None),
         });
         self.attach_chat(&rb, &channel);
 
@@ -1002,6 +1006,18 @@ impl BridgeManager {
             });
         });
         *lock(&rb.attachment) = Some(rb.community.runtime.attach(&rb.id, rb.client.clone(), channel.clone(), on_chat));
+        // A private channel's key rotates (a ban, a revoke); a public one's
+        // derives from the root. The shared runtime moves the chat REQ once
+        // this bridge's client holds the new key.
+        if channel.private {
+            let runtime = Arc::downgrade(&rb.community.runtime);
+            let on_change = Arc::new(move || {
+                if let Some(runtime) = runtime.upgrade() {
+                    runtime.refresh();
+                }
+            });
+            *lock(&rb.key_watch) = Some(rb.client.follow_channel_keys(&channel.id_hex, on_change));
+        }
     }
 
     /// Bounded catch-up after downtime: replay wraps newer than the stored
