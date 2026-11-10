@@ -288,6 +288,22 @@ fn ranked_fold_matches_armada() {
     let stands = concord::writers::post_stands(ledger, &cid, post.author(), post.ms, &post.rumor.tags);
     assert_eq!(stands, want["post_stands"].as_bool().unwrap());
     assert!(stands);
+    // Bob, let in by a member overwrite, takes the sealed channel's key from
+    // the owner's access delivery; the key opens the seal, which authenticates it.
+    let secret_id = hex32(secret).unwrap();
+    let access: StreamKey = (&channel_access_group_key(&h(&k["community_root"]), &secret_id, 0)).into();
+    let bob = keys(&k["bob_sk"]);
+    let wrap = &r["delivery_wraps"][0];
+    let d = concord::delivery::parse_delivery(&open_plane_wrap(&event(wrap), &access, Plane::Rekey).unwrap()).unwrap();
+    assert_eq!((d.form.as_str(), d.scope_hex.as_str(), d.new_epoch), ("access", secret, 1));
+    assert!(concord::delivery::access_delivery_admits(&folded, Some(sealed), secret, &bob.public_key().to_hex(), &d.deliverer, d.new_epoch));
+    let (epoch, key) = concord::delivery::open_access_key(&d, &bob, &secret_id).unwrap();
+    assert_eq!((epoch, to_hex(&key)), (1, r["secret_key"].as_str().unwrap().to_owned()));
+    assert!(!concord::delivery::access_key_refuted(Some(sealed), &secret_id, 1, &key));
+    assert!(concord::delivery::access_key_refuted(Some(sealed), &secret_id, 1, &[7; 32]));
+    // Alice holds no View Channel there, so the same delivery addressed to her wouldn't be taken.
+    assert!(!concord::delivery::access_delivery_admits(&folded, Some(sealed), secret, k["alice"].as_str().unwrap(), &d.deliverer, 1));
+
     let stray = open_plane_wrap(&event(&r["stray_wrap"]), &(&read_key).into(), Plane::Chat).unwrap();
     let stray_stands = concord::writers::post_stands(ledger, &cid, stray.author(), stray.ms, &stray.rumor.tags);
     assert_eq!(stray_stands, want["stray_stands"].as_bool().unwrap());

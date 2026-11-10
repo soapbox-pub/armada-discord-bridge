@@ -290,3 +290,68 @@ pub fn seal_control_wrap(epoch: u64, control_root: &Bytes32, granter: &nostr::pr
 pub fn decode_control_wrap(plain: &[u8]) -> Option<(u64, Bytes32)> {
     (plain.len() == 40).then(|| (u64::from_be_bytes(plain[..8].try_into().unwrap()), plain[8..40].try_into().unwrap()))
 }
+
+/// Blobs per Channel-rotation event a writer sends (CORD-06 §1); readers accept 120.
+pub const CHANNEL_BLOBS_PER_EVENT: usize = 80;
+
+/// A Channel rotation's rumors (CORD-06 §1): `new_key` at `new_epoch` for each
+/// recipient (the rotator always among them), committing to `(prev_epoch,
+/// prev_key)` so a holder of the prior key can prove continuity. A Private
+/// Channel's birth on the ranked Roster is one of these from `(0,
+/// community_root)` to epoch 1 (CORD-03 §2). `authority` rides every chunk so
+/// a partial holder can judge it; absent when the owner rotates.
+#[allow(clippy::too_many_arguments)]
+pub fn build_channel_rotation(
+    rotator: &nostr::prelude::Keys,
+    channel_id: &Bytes32,
+    new_epoch: u64,
+    prev_epoch: u64,
+    prev_key: &Bytes32,
+    new_key: &Bytes32,
+    recipients: &[String],
+    ms: u64,
+    authority: Option<&Citation>,
+) -> Result<Vec<crate::rumor::Rumor>, RekeyError> {
+    let me = rotator.public_key().to_hex();
+    let scope_hex = to_hex(channel_id);
+    let mut plain = Vec::with_capacity(72);
+    plain.extend_from_slice(channel_id);
+    plain.extend_from_slice(&new_epoch.to_be_bytes());
+    plain.extend_from_slice(new_key);
+    let plain = STANDARD.encode(plain);
+    let mut who: Vec<String> = vec![me.clone()];
+    for r in recipients {
+        let r = r.to_lowercase();
+        if !who.contains(&r) {
+            who.push(r);
+        }
+    }
+    let mut blobs = Vec::new();
+    for r in &who {
+        let pk = hex32(r).and_then(|b| nostr::prelude::PublicKey::from_slice(&b).ok()).ok_or(RekeyError::Field("recipient"))?;
+        let conv = crate::derive::conversation_key(rotator.secret_key(), &pk);
+        let locator = my_locator(&me, r, &scope_hex, new_epoch).ok_or(RekeyError::Field("recipient"))?;
+        let wrapped = nip44::encrypt_str(&conv, &plain).map_err(|_| RekeyError::Decrypt)?;
+        blobs.push(serde_json::json!({ "locator": locator, "wrapped": wrapped }));
+    }
+    let prev_commit = to_hex(&epoch_key_commitment(prev_epoch, prev_key));
+    let chunks: Vec<&[serde_json::Value]> = blobs.chunks(CHANNEL_BLOBS_PER_EVENT).collect();
+    let n = chunks.len().to_string();
+    Ok(chunks
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut tags = vec![
+                vec!["scope".to_string(), scope_hex.clone()],
+                vec!["newepoch".into(), new_epoch.to_string()],
+                vec!["prevepoch".into(), prev_epoch.to_string()],
+                vec!["prevcommit".into(), prev_commit.clone()],
+                vec!["chunk".into(), (i + 1).to_string(), n.clone()],
+            ];
+            if let Some(a) = authority {
+                tags.push(a.to_tag());
+            }
+            crate::rumor::Rumor::new(kinds::REKEY, serde_json::Value::Array(c.to_vec()).to_string(), tags, &me, Some(ms), None)
+        })
+        .collect())
+}

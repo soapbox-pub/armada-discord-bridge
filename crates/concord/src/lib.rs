@@ -10,6 +10,7 @@ pub mod channel_seal;
 pub mod chat;
 pub mod community;
 pub mod control;
+pub mod delivery;
 pub mod derive;
 pub mod direct_invite;
 pub mod edition;

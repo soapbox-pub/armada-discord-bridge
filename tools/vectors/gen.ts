@@ -367,6 +367,16 @@ out.derive_v2 = {
   const strayWrap = await stream.wrapSeal(await stream.sealRumor(stray, 20013, read, signer(fill(0x5e))), read);
   const l = folded.writers.get(annHex);
 
+  // The owner hands Bob, whom an overwrite let into the sealed channel, its key
+  // on the channel's access plane (CORD-03 §5).
+  const delivery = await (await lib("delivery")).buildAccessDeliveries(
+    owner,
+    async (pk: string, text: string) => nip44Encrypt(text, getConversationKey(ownerSk, pk)),
+    { scopeIdHex: secretHex, epoch: 1n, key: secretKey, recipients: [bob], atSecs: t + 7 },
+  );
+  const access = derive.channelAccessGroupKey(root, secret, 0);
+  const deliveryWraps = await Promise.all(delivery.map(async (r: any) => stream.wrapSeal(await stream.sealRumor(r, 20013, access, signer(ownerSk)), access)));
+
   out.ranked = {
     owner_salt: bytesToHex(salt2),
     community_id: bytesToHex(cid),
@@ -394,6 +404,7 @@ out.derive_v2 = {
     writer_pk: writerPk,
     post_wrap: postWrap,
     stray_wrap: strayWrap,
+    delivery_wraps: deliveryWraps,
   };
 }
 

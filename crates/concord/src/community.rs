@@ -384,6 +384,35 @@ impl Membership {
         adopted
     }
 
+    /// Adopt one private Channel key at `epoch` (an access delivery, CORD-03 §5):
+    /// a new Channel, or a held one advancing, its old key kept as a prior for
+    /// history. Never a step back, and never below a cut a rotation recorded.
+    /// Returns whether anything changed.
+    pub fn adopt_channel_key(&mut self, channel_id_hex: &str, epoch: u64, key: &Bytes32) -> bool {
+        let id = channel_id_hex.to_lowercase();
+        if self.channel_cuts.iter().any(|(cid, cut)| cid == &id && epoch < *cut) {
+            return false;
+        }
+        match self.private_channels.iter_mut().find(|h| h.id == id) {
+            Some(h) if epoch > h.epoch => {
+                h.priors.insert(0, PriorKey { key: h.key.clone(), epoch: h.epoch, retired_at: None });
+                h.key = to_hex(key);
+                h.epoch = epoch;
+                true
+            }
+            Some(_) => false,
+            None => {
+                self.private_channels.push(PrivateChannelKey { id, key: to_hex(key), epoch, name: String::new(), priors: vec![] });
+                true
+            }
+        }
+    }
+
+    /// A Channel's access plane at the current root epoch (CORD-03 §5).
+    pub fn access_plane(&self, channel_id: &Bytes32) -> GroupKey {
+        crate::derive::channel_access_group_key(&self.root_key(), channel_id, self.root_epoch)
+    }
+
     /// The address where the next base rotation would appear.
     pub fn next_base_rekey_address(&self) -> GroupKey {
         base_rekey_group_key(&self.root_key(), &self.id(), self.root_epoch + 1)
