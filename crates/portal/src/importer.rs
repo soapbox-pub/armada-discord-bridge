@@ -1392,31 +1392,59 @@ impl Importer {
         let vac = Self::op_vac(&community, &op, &plan)?;
         let op_pk = op.public_key().to_hex();
         let binding = edition_binding(&community.id());
-        // Marked on the ranked Roster: an unmarked Channel edition there
-        // describes only a Channel the switch listed (CORD-04 §2).
-        let op_v1 = if plan.checkpoints.ranked { EditionMeta::first(&op_pk, Some(&vac)).marked(&binding) } else { EditionMeta::first(&op_pk, Some(&vac)) };
+        // Judged by the community as it stands, not as the import left it: the
+        // owner may have switched a legacy import to ranked roles since, and an
+        // unmarked Channel edition there describes only a Channel the switch
+        // listed (CORD-04 §2), so it would be silently ignored.
+        let now = bridge::client::ConcordClient::new(community.clone(), relays.clone(), Keys::generate()).sync_control().await?;
+        let ranked = now.ranked;
+        let op_v1 = if ranked { EditionMeta::first(&op_pk, Some(&vac)).marked(&binding) } else { EditionMeta::first(&op_pk, Some(&vac)) };
         let first_position = plan.channels.iter().filter(|c| c.selected).count() as u64;
-        let mut last_rank = plan.channels.iter().filter(|c| c.selected).filter_map(|c| c.rank.clone()).max();
         let mut ids = Vec::new();
+        let mut placed: Vec<(Option<String>, String)> = Vec::new();
         for (i, (name, category)) in channels.iter().enumerate() {
             let id = random32();
             let mut metadata = json!({ "name": name, "private": false });
-            if plan.checkpoints.ranked {
-                // Ordered after every imported channel, filed under the Category
-                // of that name when the import made one.
-                let rank = concord::rank::rank_between(last_rank.as_deref(), None).context("no rank key left after the last channel")?;
-                metadata["position"] = json!(rank);
-                last_rank = Some(rank);
+            let mut sync_to = None;
+            if ranked {
+                // Filed under the live Category of that name, if any, and
+                // ordered last within it: position keys restart per Category.
                 let wanted = category.as_deref().map(str::trim).filter(|c| !c.is_empty());
-                if let Some(cat) = wanted.and_then(|w| plan.categories.iter().find(|k| k.name == w)).and_then(|k| k.category_id_hex.clone()) {
+                let cat = wanted.and_then(|w| now.categories.values().filter(|k| !k.deleted).find(|k| k.name == w)).map(|k| k.id_hex.clone());
+                let last = now
+                    .channels
+                    .values()
+                    .filter(|c| !c.deleted && c.category_id == cat)
+                    .filter_map(|c| c.rank.clone())
+                    .chain(placed.iter().filter(|(c, _)| *c == cat).map(|(_, r)| r.clone()))
+                    .filter(|r| concord::rank::is_rank_key(r))
+                    .max();
+                let rank = concord::rank::rank_between(last.as_deref(), None).context("no rank key left after the last channel")?;
+                metadata["position"] = json!(rank);
+                placed.push((cat.clone(), rank));
+                if let Some(cat) = &cat {
                     metadata["category"] = json!(cat);
                 }
+                sync_to = cat;
             } else {
                 with_channel_position(&mut metadata, Some(first_position + i as u64));
                 with_channel_category(&mut metadata, category.as_deref());
             }
             let edition = seal_edition(&build_channel_edition(&id, &metadata, &op_v1)?, &control, &op)?;
             self.publish_verified(relays.as_ref(), &edition, &format!("channel edition for #{name}")).await?;
+            // A public Channel made inside a Category takes its rules, as
+            // Armada files one (CORD-04 §8); unsynced, a Category that closes
+            // its channels to @everyone would leave this one open to all.
+            if let Some(cat) = sync_to {
+                let channel_hex = to_hex(&id);
+                let rumor = build_edition_rumor(
+                    concord::roster::VSK_SYNC,
+                    &concord::derive::sync_locator(&community.id(), &id),
+                    concord::roster::sync_to_json(&channel_hex, Some(&cat)),
+                    &op_v1,
+                );
+                self.publish_verified(relays.as_ref(), &seal_edition(&rumor, &control, &op)?, &format!("sync of #{name}")).await?;
+            }
             ids.push(to_hex(&id));
         }
         let reader = bridge::client::ConcordClient::new(community, relays, Keys::generate());
@@ -2021,9 +2049,14 @@ mod tests {
         assert_eq!(importer.import_for_community(&cid, &owner_discord).await.unwrap().as_deref(), Some(import_id.as_str()));
         assert_eq!(importer.import_for_community(&cid, "someone-else").await.unwrap(), None);
         let made = importer.create_channels(&import_id, &[("from-discord".into(), Some("Talk".into()))]).await.unwrap();
-        member.sync_control().await.unwrap();
+        let after = member.sync_control().await.unwrap();
         let added = member.channel(&made[0]).expect("a member sees the new channel");
         assert_eq!((added.name.as_str(), added.category.as_deref(), added.private), ("from-discord", Some("Talk"), false));
+        // It takes the Category's rules, as #general does, and sorts last in it.
+        assert_eq!(after.roster.syncs.get(&made[0]), Some(&talk.id_hex));
+        assert_eq!(after.channel_permissions(&someone, &made[0]) & perm::ADD_REACTIONS, 0);
+        let in_talk: Vec<String> = member.channels().into_iter().filter(|c| c.category.as_deref() == Some("Talk")).map(|c| c.name).collect();
+        assert_eq!(in_talk, ["general", "from-discord"]);
 
         let db = pool.get().await.unwrap();
         db.execute("DELETE FROM bridges WHERE discord_guild_id = $1", &[&guild_id]).await.unwrap();
