@@ -24,6 +24,8 @@ export interface ArmadaChannel {
   category?: string | null;
   private?: boolean;
   forum?: boolean;
+  /** A voice room (CORD-03 §2 `view`): no text timeline to mirror. */
+  voice?: boolean;
   bridged: boolean;
 }
 
@@ -54,9 +56,9 @@ export function normalize(name: string): string {
   return name.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
 }
 
-/** The Armada channels a bridge can carry: not forums, not key-gated rooms it holds no key for. */
+/** The Armada channels a bridge can carry: not forums or voice rooms, not key-gated rooms it holds no key for. */
 export function linkable(channels: ArmadaChannel[]): ArmadaChannel[] {
-  return channels.filter((c) => !c.bridged && !c.forum && !c.private);
+  return channels.filter((c) => !c.bridged && !c.forum && !c.voice && !c.private);
 }
 
 /** Discord id -> Armada id, for channels whose names match. First match wins. */

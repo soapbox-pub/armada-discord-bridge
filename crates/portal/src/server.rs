@@ -645,7 +645,7 @@ async fn bridge_create(State(st): State<AppState>, headers: HeaderMap, body: Opt
         .map(|c| {
             json!({
                 "idHex": c.id_hex, "name": c.name, "category": c.category, "private": c.private, "forum": c.forum,
-                "position": c.position, "bridged": bridged.contains(&c.id_hex),
+                "voice": c.view.as_deref() == Some("voice"), "bridged": bridged.contains(&c.id_hex),
             })
         })
         .collect();
