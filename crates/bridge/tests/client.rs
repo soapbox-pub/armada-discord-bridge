@@ -512,3 +512,49 @@ async fn follows_a_rotation_while_running() {
     assert!(wait_for(3).await, "followed the next rotation too");
     assert_eq!(changes.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn a_converted_channels_public_era_reads_and_stands_up_to_when_it_went_private() {
+    use concord::judge::Verdict;
+    let w = world();
+    let bridge = Keys::generate();
+    let (id, key) = ([0x91; 32], [0x92; 32]);
+    let went_private = now_ms() - 3_600_000;
+    let mut folded = ranked_fold(&w, id, key, &bridge);
+    let mut meta = serde_json::Map::new();
+    meta.insert("name".into(), json!("mods"));
+    meta.insert("public_until".into(), json!(went_private));
+    let content = concord::channel_seal::seal_channel_metadata(&meta, &key, &id, 1, None, Some(&w.owner.public_key().to_hex())).unwrap();
+    let (raw, sealed) = concord::control::read_channel_content(&content).unwrap();
+    let ch = folded.channels.get_mut(&hex::encode(id)).unwrap();
+    (ch.raw, ch.sealed) = (serde_json::Value::Object(raw), sealed);
+    let mut held = w.community.clone();
+    held.adopt_channel_key(&hex::encode(id), 1, &key);
+    let client = ConcordClient::new(held, Arc::new(w.relay.clone()), bridge);
+    client.set_folded(folded);
+
+    let view = client.channel(&hex::encode(id)).unwrap();
+    assert_eq!(view.public_until, Some(went_private));
+    assert_eq!(view.current().epoch, 1, "writes go to the channel's own key");
+    let root = view.streams.iter().find(|s| s.epoch == 0).expect("the public era reads at the root stream");
+    assert_eq!(root.retired_at, Some(went_private / 1000));
+
+    // At the root stream, what's dated before it went private opens; what's after stands nowhere.
+    let public_era = concord::community::ChannelView { streams: vec![root.clone()], ..view.clone() };
+    let owner = w.owner.clone();
+    for (ms, opens) in [(went_private - 60_000, true), (went_private + 60_000, false)] {
+        client.send_chat(&public_era, SendChat { ms: Some(ms), ..SendChat::message(&owner, "public era") }).await.unwrap();
+        let wrap = w.relay.published().last().unwrap().clone();
+        assert_eq!(bridge::client::open_chat(&wrap, &view).is_some(), opens, "a post at {ms}");
+    }
+
+    // A member the private channel doesn't let in posted while it was public: that stands.
+    let alice = Keys::generate();
+    let chat = |ms: u64| {
+        let tags = concord::stream::channel_binding_tags(&view.id_hex, 0);
+        let rumor = concord::rumor::Rumor::new(kinds::MESSAGE, "hi", tags, &alice.public_key().to_hex(), Some(ms), None);
+        OpenedChat { ms, rumor, channel_id_hex: view.id_hex.clone(), epoch: 0, writer_epoch: None }
+    };
+    assert_eq!(client.judge(&chat(went_private - 60_000)), Verdict::Stands);
+    assert_eq!(client.judge(&chat(went_private + 60_000)), Verdict::Collapsed);
+}

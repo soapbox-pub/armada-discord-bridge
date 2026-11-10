@@ -416,7 +416,8 @@ impl ConcordClient {
     pub fn judge(&self, chat: &OpenedChat) -> Verdict {
         let Some(f) = self.folded() else { return Verdict::Stands };
         let post = Post { author: chat.author(), kind: chat.kind(), ms: chat.ms, edited_ms: None, tags: chat.tags() };
-        judge_post(&f, &self.community().id(), &chat.channel_id_hex, post, &self.timeouts(), now_ms())
+        let public_until = self.community().public_until(&f, &chat.channel_id_hex);
+        judge_post(&f, &self.community().id(), &chat.channel_id_hex, post, &self.timeouts(), now_ms(), public_until)
     }
 
     /// Why a post of `kind` by `author_pk` would not stand in this Channel, if it

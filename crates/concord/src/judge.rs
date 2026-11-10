@@ -58,12 +58,24 @@ pub fn is_beyond_horizon(ms: u64, now_ms: u64) -> bool {
 /// Judge one post in one Channel. `timeouts` is the Guestbook's folded
 /// Timeouts (empty when unread). Membership and departures are not judged:
 /// like Armada with its Guestbook unread, the ledger and the Roster decide.
-pub fn judge_post(folded: &FoldedControl, community_id: &Bytes32, channel_id_hex: &str, post: Post, timeouts: &HashMap<String, FoldedTimeout>, now_ms: u64) -> Verdict {
+///
+/// `public_until_ms` is when a converted Channel went private (CORD-03 §2,
+/// from its opened seal): a post dated before it was a public post, and isn't
+/// collapsed for a Send Messages the private Channel no longer gives.
+pub fn judge_post(
+    folded: &FoldedControl,
+    community_id: &Bytes32,
+    channel_id_hex: &str,
+    post: Post,
+    timeouts: &HashMap<String, FoldedTimeout>,
+    now_ms: u64,
+    public_until_ms: Option<u64>,
+) -> Verdict {
     if let Some(ledger) = folded.writers.get(channel_id_hex)
         && !ledger_stands(folded, ledger, community_id, channel_id_hex, &post) {
             return Verdict::Held;
         }
-    if collapses(folded, channel_id_hex, &post, timeouts, now_ms) { Verdict::Collapsed } else { Verdict::Stands }
+    if collapses(folded, channel_id_hex, &post, timeouts, now_ms, public_until_ms) { Verdict::Collapsed } else { Verdict::Stands }
 }
 
 /// A restricted Channel's judge (Armada `writerJudge`): a post stands by the
@@ -101,7 +113,7 @@ fn ledger_stands(folded: &FoldedControl, ledger: &Ledger, community_id: &Bytes32
 /// Posts inside their author's running Timeout, posts after a pause from
 /// anyone but staff, and, in an open Channel on the ranked Roster, posts whose
 /// author can't send there.
-fn collapses(folded: &FoldedControl, channel_id_hex: &str, m: &Post, timeouts: &HashMap<String, FoldedTimeout>, now_ms: u64) -> bool {
+fn collapses(folded: &FoldedControl, channel_id_hex: &str, m: &Post, timeouts: &HashMap<String, FoldedTimeout>, now_ms: u64, public_until_ms: Option<u64>) -> bool {
     if let Some(t) = timeouts.get(m.author)
         && (t.silences(m.ms, now_ms) || m.edited_ms.is_some_and(|e| t.silences(e, now_ms))) {
             return true;
@@ -110,7 +122,8 @@ fn collapses(folded: &FoldedControl, channel_id_hex: &str, m: &Post, timeouts: &
         && m.ms >= since * 1000 && !folded.roster.is_staff(m.author, &folded.owner) {
             return true;
         }
-    folded.ranked && folded.roster.everyone_sends(channel_id_hex) && folded.channel_permissions(m.author, channel_id_hex) & perm::SEND_MESSAGES == 0
+    let public_era = public_until_ms.is_some_and(|until| m.ms < until);
+    folded.ranked && folded.roster.everyone_sends(channel_id_hex) && !public_era && folded.channel_permissions(m.author, channel_id_hex) & perm::SEND_MESSAGES == 0
 }
 
 #[cfg(test)]
@@ -137,18 +150,18 @@ mod tests {
     #[test]
     fn a_member_overwrite_denying_send_collapses_in_an_open_channel() {
         let mut f = folded();
-        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 1), &HashMap::new(), 2), Verdict::Stands);
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 1), &HashMap::new(), 2, None), Verdict::Stands);
         f.roster.overwrites.push(Overwrite { scope: CHAN.into(), target: OverwriteTarget::Member(ALICE.into()), allow: 0, deny: perm::SEND_MESSAGES });
-        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 1), &HashMap::new(), 2), Verdict::Collapsed);
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 1), &HashMap::new(), 2, None), Verdict::Collapsed);
     }
 
     #[test]
     fn a_timeout_collapses_inside_its_window_only() {
         let f = folded();
         let t = HashMap::from([(ALICE.to_owned(), FoldedTimeout { by: OWNER.into(), from_secs: 100, until: 200, ms: 100_000, rumor_id: String::new() })]);
-        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 150_000), &t, 160_000), Verdict::Collapsed);
-        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 50_000), &t, 160_000), Verdict::Stands);
-        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 150_000), &t, 250_000), Verdict::Stands, "a lapsed Timeout un-collapses");
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 150_000), &t, 160_000, None), Verdict::Collapsed);
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 50_000), &t, 160_000, None), Verdict::Stands);
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 150_000), &t, 250_000, None), Verdict::Stands, "a lapsed Timeout un-collapses");
     }
 
     #[test]

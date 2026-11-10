@@ -113,6 +113,9 @@ pub struct ChannelView {
     pub streams: Vec<ChannelStream>,
     /// Every writer address the Channel's ledger names, live and retired.
     pub writers: Vec<WriterStream>,
+    /// When a converted Channel went private, unix ms, from its opened seal
+    /// (CORD-03 §2). Its public era reads at the root streams, cut there.
+    pub public_until: Option<u64>,
 }
 
 impl ChannelView {
@@ -137,6 +140,15 @@ impl Membership {
         let h = self.private_channels.iter().find(|c| c.id.eq_ignore_ascii_case(channel_id_hex))?;
         let key = if h.epoch == epoch { Some(h.key.as_str()) } else { h.priors.iter().find(|p| p.epoch == epoch).map(|p| p.key.as_str()) };
         hex32(key?)
+    }
+
+    /// When a converted private Channel went private (unix ms), from its seal
+    /// opened with the key held here (CORD-03 §2); `None` for any other.
+    pub fn public_until(&self, folded: &FoldedControl, channel_id_hex: &str) -> Option<u64> {
+        let ch = folded.channels.get(channel_id_hex).filter(|c| c.private && !c.deleted)?;
+        let sealed = ch.sealed.as_ref()?;
+        let key = self.channel_key_at(channel_id_hex, sealed.epoch)?;
+        crate::channel_seal::open_channel_seal(sealed, &key, &hex32(channel_id_hex)?)?.public_until
     }
 
     /// Each sealed Private Channel's `creator`, opened with the keys held here
@@ -305,14 +317,6 @@ impl Membership {
                 .collect();
             let held = self.private_channels.iter().find(|c| c.id == def.channel_id_hex);
             let channel_streams = held.map(|h| private_streams(h, &id)).unwrap_or_default();
-            let streams = if def.private {
-                if held.is_none() {
-                    continue;
-                }
-                channel_streams
-            } else {
-                root_streams.into_iter().chain(channel_streams).collect()
-            };
             // A sealed Private Channel's details are readable only with its key
             // (CORD-03 §2): its name, and where it sits — Category, position
             // key and view all ride inside the seal, not beside it.
@@ -320,6 +324,22 @@ impl Membership {
                 let key = self.channel_key_at(&def.channel_id_hex, sealed.epoch)?;
                 crate::channel_seal::open_channel_seal(sealed, &key, &id)
             });
+            let public_until = if def.private { opened.as_ref().and_then(|o| o.public_until) } else { None };
+            let streams = if def.private {
+                if held.is_none() {
+                    continue;
+                }
+                // A converted Channel's public era stays history every key
+                // holder reads, at the root streams, taking only what is dated
+                // before it went private: a post arriving there later stands
+                // nowhere (CORD-03 §2). Writes still go to the channel key.
+                let public_era = public_until.map(|until| {
+                    root_streams.into_iter().map(move |r| ChannelStream { retired_at: Some(r.retired_at.map_or(until / 1000, |t| t.min(until / 1000))), ..r })
+                });
+                channel_streams.into_iter().chain(public_era.into_iter().flatten()).collect()
+            } else {
+                root_streams.into_iter().chain(channel_streams).collect()
+            };
             let field = |k: &str| opened.as_ref().and_then(|o| o.metadata.get(k)).and_then(serde_json::Value::as_str).map(str::to_owned);
             let name = match (&opened, held) {
                 (Some(_), _) => field("name").unwrap_or_default(),
@@ -358,6 +378,7 @@ impl Membership {
                             .collect()
                     })
                     .unwrap_or_default(),
+                public_until,
             });
         }
         for held in &self.private_channels {
@@ -377,6 +398,7 @@ impl Membership {
                 view: None,
                 streams: private_streams(held, &id),
                 writers: Vec::new(),
+                public_until: None,
             });
         }
         let ranked = folded.is_some_and(|f| f.ranked);
