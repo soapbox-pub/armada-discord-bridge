@@ -179,6 +179,9 @@ type FoldCell = Arc<RwLock<Option<Arc<FoldedControl>>>>;
 /// whether one counts is judged against the Roster as it stands (CORD-04 §8).
 type TimeoutCell = Arc<RwLock<HashMap<String, Opened>>>;
 
+/// A shared fold and this client's keyed reading of it (see `folded`).
+type KeyedCache = std::sync::Mutex<Option<(Arc<FoldedControl>, Arc<FoldedControl>)>>;
+
 /// Timeouts run at most 28 days, so older Guestbook entries can't hold one.
 const TIMEOUT_LOOKBACK_SECS: u64 = 28 * 24 * 60 * 60;
 /// Bound on Timeout rumors held per community: a flood can't grow it without end.
@@ -204,6 +207,7 @@ pub struct ConcordClient {
     relays: Arc<dyn RelayLike>,
     primary: Keys,
     folded: FoldCell,
+    keyed: KeyedCache,
     timeouts: TimeoutCell,
 }
 
@@ -213,7 +217,7 @@ impl ConcordClient {
         let mut keys = stream_keys(&community.control_streams());
         keys.extend(stream_keys(&community.guestbook_streams()));
         relays.register_auth_keys(keys);
-        Arc::new(ConcordClient { community, relays, primary, folded: FoldCell::default(), timeouts: TimeoutCell::default() })
+        Arc::new(ConcordClient { community, relays, primary, folded: FoldCell::default(), keyed: KeyedCache::default(), timeouts: TimeoutCell::default() })
     }
 
     /// A client for another member of `with`'s community: its own membership
@@ -222,7 +226,7 @@ impl ConcordClient {
     /// two must share: a Direct Invite can add channel keys but never move it.
     pub fn sharing_fold(community: Membership, primary: Keys, with: &ConcordClient) -> Arc<ConcordClient> {
         debug_assert_eq!(community.community_id, with.community.community_id);
-        Arc::new(ConcordClient { community, relays: with.relays.clone(), primary, folded: with.folded.clone(), timeouts: with.timeouts.clone() })
+        Arc::new(ConcordClient { community, relays: with.relays.clone(), primary, folded: with.folded.clone(), keyed: KeyedCache::default(), timeouts: with.timeouts.clone() })
     }
 
     pub fn community(&self) -> &Membership {
@@ -242,8 +246,33 @@ impl ConcordClient {
         self.primary.public_key().to_hex()
     }
 
+    /// The community's fold as THIS client reads it. The shared fold is keyless
+    /// (bridges of one community never pool keys), but a sealed Private
+    /// Channel's creator is readable only with its key and changes who may view
+    /// it (CORD-04 §8), so each client adds the creators its own keys open, as
+    /// Armada's fold does. Cached per shared fold: opening seals on every
+    /// judged post would be the hot path.
     pub fn folded(&self) -> Option<Arc<FoldedControl>> {
-        self.folded.read().unwrap_or_else(|e| e.into_inner()).clone()
+        let base = self.folded.read().unwrap_or_else(|e| e.into_inner()).clone()?;
+        if !base.ranked {
+            return Some(base);
+        }
+        let mut cache = self.keyed.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((from, keyed)) = cache.as_ref()
+            && Arc::ptr_eq(from, &base)
+        {
+            return Some(keyed.clone());
+        }
+        let creators = self.community.open_creators(&base);
+        let keyed = if creators.is_empty() {
+            base.clone()
+        } else {
+            let mut f = (*base).clone();
+            f.roster.creators = creators;
+            Arc::new(f)
+        };
+        *cache = Some((base, keyed.clone()));
+        Some(keyed)
     }
 
     /// Install a fold directly (tests, and folds computed elsewhere).

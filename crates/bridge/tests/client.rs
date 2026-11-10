@@ -367,3 +367,37 @@ async fn takes_no_delivered_key_for_a_channel_the_bridge_may_not_view() {
     let intake = bridge::key_intake::intake_access_keys(&w.relay, &bridge, &w.community, &folded).await;
     assert!(intake.learned.is_empty());
 }
+
+#[tokio::test]
+async fn a_sealed_channels_creator_and_layout_open_with_the_held_key() {
+    use concord::roles::{MemberGrant, Role, RoleScope, perm};
+    let w = world();
+    let (bridge, creator) = (Keys::generate(), Keys::generate());
+    let (id, key, cat) = ([0x61; 32], [0x62; 32], hex::encode([0x63; 32]));
+    let mut folded = ranked_fold(&w, id, key, &bridge);
+    let mut meta = serde_json::Map::new();
+    for (k, v) in [("name", json!("plans")), ("category", json!(cat)), ("position", json!("W")), ("view", json!("forum"))] {
+        meta.insert(k.into(), v);
+    }
+    let content = concord::channel_seal::seal_channel_metadata(&meta, &key, &id, 1, None, Some(&creator.public_key().to_hex())).unwrap();
+    let (raw, sealed) = concord::control::read_channel_content(&content).unwrap();
+    let ch = folded.channels.get_mut(&hex::encode(id)).unwrap();
+    (ch.raw, ch.sealed) = (serde_json::Value::Object(raw), sealed);
+    folded.categories.insert(cat.clone(), concord::control::FoldedCategory { id_hex: cat.clone(), name: "Staff".into(), position: Some("V".into()), deleted: false });
+    let role = hex::encode([0x64; 32]);
+    folded.roster.roles.push(Role { rank: Some("V".into()), ..Role::new(&role, "Mods", 1, perm::MANAGE_CHANNELS, RoleScope::Server) });
+    folded.roster.grants.push(MemberGrant { member: creator.public_key().to_hex(), role_ids: vec![role], control_wrap: None });
+
+    let keyless = w.client(Keys::generate());
+    keyless.set_folded(folded.clone());
+    assert_eq!(keyless.folded().unwrap().channel_permissions(&creator.public_key().to_hex(), &hex::encode(id)), 0, "without the key the creator is unknown");
+
+    let mut held = w.community.clone();
+    held.adopt_channel_key(&hex::encode(id), 1, &key);
+    let client = ConcordClient::new(held, Arc::new(w.relay.clone()), bridge);
+    client.set_folded(folded);
+    let f = client.folded().unwrap();
+    assert_ne!(f.channel_permissions(&creator.public_key().to_hex(), &hex::encode(id)) & perm::VIEW_CHANNEL, 0, "the creator, a manager, views it");
+    let view = client.channel(&hex::encode(id)).unwrap();
+    assert_eq!((view.name.as_str(), view.category.as_deref(), view.rank.as_deref(), view.forum), ("plans", Some("Staff"), Some("W"), true));
+}
