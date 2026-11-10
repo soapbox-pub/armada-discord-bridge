@@ -139,7 +139,9 @@ fn every_fuzzed_roster_folds_as_vector_folds_it() {
     for c in cases.as_array().unwrap() {
         let all = editions(&c["community"], &c["events"]);
         let served: HashSet<&str> = c["served"].as_array().unwrap().iter().map(s).collect();
-        let slice: Vec<Edition> = all.into_iter().filter(|e| served.contains(to_hex(&e.rumor_id).as_str())).collect();
+        // One edition may ride several wraps (a re-wrap); Armada keys them by rumor id.
+        let mut seen = HashSet::new();
+        let slice: Vec<Edition> = all.into_iter().filter(|e| served.contains(to_hex(&e.rumor_id).as_str()) && seen.insert(e.rumor_id)).collect();
         assert_eq!(slice.len(), served.len(), "case {}: every served edition opens", c["seed"]);
         let cid = hex32(s(&c["community"]["id"])).unwrap();
         let f = fold_control(&slice, &cid, s(&c["community"]["owner"]), None, None);
@@ -237,4 +239,44 @@ fn vectors_communities_fold_to_the_same_roles_permissions_and_channels() {
             }
         }
     }
+}
+
+#[test]
+fn every_fuzzed_channel_plane_folds_as_vector_folds_it() {
+    let str_of = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_owned);
+    let cases = fixture("channel_fuzz");
+    let mut failures = Vec::new();
+    for c in cases.as_array().unwrap() {
+        let all = editions(&c["community"], &c["events"]);
+        let served: HashSet<&str> = c["served"].as_array().unwrap().iter().map(s).collect();
+        // One edition may ride several wraps (a re-wrap); Armada keys them by rumor id.
+        let mut seen = HashSet::new();
+        let slice: Vec<Edition> = all.into_iter().filter(|e| served.contains(to_hex(&e.rumor_id).as_str()) && seen.insert(e.rumor_id)).collect();
+        assert_eq!(slice.len(), served.len(), "case {}: every served edition opens", c["seed"]);
+        let cid = hex32(s(&c["community"]["id"])).unwrap();
+        let f = fold_control(&slice, &cid, s(&c["community"]["owner"]), None, None);
+        let mut channels: Vec<Value> = f
+            .channels
+            .values()
+            .filter(|ch| !ch.deleted)
+            .map(|ch| {
+                json!({
+                    "id": ch.channel_id_hex, "name": ch.name, "private": ch.private,
+                    "category": str_of(ch.raw.get("category")), "position": str_of(ch.raw.get("position")), "topic": str_of(ch.raw.get("topic")),
+                })
+            })
+            .collect();
+        channels.sort_by(|a, b| s(&a["id"]).cmp(s(&b["id"])));
+        let mut categories: Vec<Value> = f.categories.values().filter(|k| !k.deleted).map(|k| json!({ "id": k.id_hex, "name": k.name, "position": k.position })).collect();
+        categories.sort_by(|a, b| s(&a["id"]).cmp(s(&b["id"])));
+        let mine = json!({ "channels": channels, "categories": categories });
+        let mut want = c["vector"].clone();
+        for k in ["channels", "categories"] {
+            want[k].as_array_mut().unwrap().sort_by(|a, b| s(&a["id"]).cmp(s(&b["id"])));
+            if mine[k] != want[k] {
+                failures.push(format!("case {} {k}:\n  bridge {}\n  vector {}", c["seed"], mine[k], want[k]));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} divergences from Vector:\n{}", failures.len(), failures.join("\n"));
 }
