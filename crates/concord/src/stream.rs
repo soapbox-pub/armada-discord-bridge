@@ -103,14 +103,22 @@ pub struct WrapOptions {
     pub ephemeral: bool,
     /// NIP-40 deadline on the wrap so relays purge it (CORD-08 §2).
     pub expiration: Option<u64>,
+    /// The wrap's `p`; a fresh random key when `None`. An author's own wraps
+    /// SHOULD carry their wrap-owner key ([`crate::derive::wrap_owner_key`]) so
+    /// any of their clients can delete the wrap later (CORD-01 §Deletions).
+    pub p: Option<PublicKey>,
 }
+
+/// The CORD-02 Appendix B cap: every published event, outer wrap included,
+/// fits a 64 KB relay event, or relays drop it.
+pub const MAX_EVENT_BYTES: usize = 65_536;
 
 /// Wrap a signed seal into the outer stream event, signed by the stream key.
 pub fn wrap_seal(seal: &Event, stream: &StreamKey, opts: WrapOptions) -> Result<Event, StreamError> {
     let sk = stream.sk.clone().ok_or_else(|| StreamError::Sign("stream key is read-only".into()))?;
     let keys = Keys::new(sk);
-    let ephemeral = Keys::generate();
-    let mut tags = vec![Tag::parse(["p".to_string(), ephemeral.public_key().to_hex()]).expect("valid p tag")];
+    let p = opts.p.unwrap_or_else(|| Keys::generate().public_key());
+    let mut tags = vec![Tag::parse(["p".to_string(), p.to_hex()]).expect("valid p tag")];
     if let Some(exp) = opts.expiration {
         tags.push(Tag::parse(["expiration".to_string(), exp.to_string()]).expect("valid tag"));
     }
