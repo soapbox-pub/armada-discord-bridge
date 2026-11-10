@@ -1427,18 +1427,32 @@ impl Importer {
     /// fold ignores them. So the result is checked against a fold before it is
     /// returned — a channel that no member would see must not be bridged.
     pub async fn create_channels(&self, import_id: &str, channels: &[(String, Option<String>)]) -> anyhow::Result<Vec<String>> {
-        let (community, op, plan) = self.load(import_id).await?;
-        let control = community.control_write_stream().context("the portal does not hold this community's control key")?;
-        let relays = (self.io.relays)(community.relays.clone());
-        relays.register_auth_keys(stream_keys(&community.control_streams()));
-        let vac = Self::op_vac(&community, &op, &plan)?;
-        let op_pk = op.public_key().to_hex();
-        let binding = edition_binding(&community.id());
+        let (genesis, op, plan) = self.load(import_id).await?;
+        let relays = (self.io.relays)(genesis.relays.clone());
+        relays.register_auth_keys(stream_keys(&genesis.control_streams()));
         // Judged by the community as it stands, not as the import left it: the
         // owner may have switched a legacy import to ranked roles since, and an
         // unmarked Channel edition there describes only a Channel the switch
         // listed (CORD-04 §2), so it would be silently ignored.
-        let now = bridge::client::ConcordClient::new(community.clone(), relays.clone(), Keys::generate()).sync_control().await?;
+        let reader = bridge::client::ConcordClient::new(genesis, relays.clone(), op.clone());
+        let mut now = reader.sync_control().await?;
+        // And at the root it stands on. The sealed secrets are genesis's, epoch
+        // 0; after a Refounding a Channel edition there lands on a plane
+        // nobody reads. The op is staff, so the rotation carries it the new
+        // root and staff key, which it opens with its own key.
+        let base = reader.adopt_base_rotations().await;
+        if base.excluded.is_some() {
+            bail!("a Refounding removed the portal's operator key from this community; it can no longer add channels");
+        }
+        if base.adopted.is_some() {
+            now = reader.sync_control().await?;
+        }
+        let community: Membership = (*reader.community()).clone();
+        let control = community.control_write_stream().context("the portal does not hold this community's control key")?;
+        relays.register_auth_keys(stream_keys(&community.control_streams()));
+        let vac = Self::op_vac(&community, &op, &plan)?;
+        let op_pk = op.public_key().to_hex();
+        let binding = edition_binding(&community.id());
         let ranked = now.ranked;
         let op_v1 = if ranked { EditionMeta::first(&op_pk, Some(&vac)).marked(&binding) } else { EditionMeta::first(&op_pk, Some(&vac)) };
         let first_position = plan.channels.iter().filter(|c| c.selected).count() as u64;
@@ -2126,10 +2140,68 @@ mod tests {
         let in_talk: Vec<String> = member.channels().into_iter().filter(|c| c.category.as_deref() == Some("Talk")).map(|c| c.name).collect();
         assert_eq!(in_talk, ["general", "from-discord"]);
 
+        // The owner refounds the community, as a ban would; the op is staff, so
+        // its blob carries the new staff key. A channel the map adds afterwards
+        // goes to the new root's Control Plane, where members now read.
+        let refounded = refound_with_staff(&relay, &owner, &joined.membership, &PublicKey::from_hex(&op_pk).unwrap());
+        let made = importer.create_channels(&import_id, &[("after-refounding".into(), None)]).await.unwrap();
+        let reader = ConcordClient::new(refounded.clone(), Arc::new(relay.clone()), Keys::generate());
+        reader.sync_control().await.unwrap();
+        assert!(reader.channel(&made[0]).is_some(), "the new channel folds at the new root");
+        let new_plane = refounded.control_pk.clone().unwrap();
+        let landed = relay.published().iter().any(|w| w.pubkey.to_hex() == new_plane);
+        assert!(landed, "published on the new epoch's Control Plane");
+
         let db = pool.get().await.unwrap();
         db.execute("DELETE FROM bridges WHERE discord_guild_id = $1", &[&guild_id]).await.unwrap();
         db.execute("DELETE FROM imports WHERE discord_guild_id = $1", &[&guild_id]).await.unwrap();
         db.execute("DELETE FROM guild_community_secrets WHERE discord_guild_id = $1", &[&guild_id]).await.unwrap();
+    }
+
+    /// The owner refounds `from` to its next epoch with a staff blob (CORD-06
+    /// §1: 136 bytes, the new staff key appended) for `staff`, and returns the
+    /// owner's view at the new root.
+    fn refound_with_staff(relay: &MemoryRelay, owner: &Keys, from: &Membership, staff: &PublicKey) -> Membership {
+        use base64::Engine;
+        use concord::derive::{base_rekey_group_key, control_signer_group_key, conversation_key, epoch_key_commitment};
+        let (cid, next) = (from.id(), from.root_epoch + 1);
+        let (new_root, new_control_root) = (random32(), random32());
+        let control_pk = control_signer_group_key(&new_control_root, &cid, next).keys.public_key();
+        let mut plain = vec![0u8; 32];
+        plain.extend_from_slice(&next.to_be_bytes());
+        plain.extend_from_slice(&new_root);
+        plain.extend_from_slice(&control_pk.to_bytes());
+        plain.extend_from_slice(&new_control_root);
+        let plain = base64::engine::general_purpose::STANDARD.encode(plain);
+        let owner_hex = owner.public_key().to_hex();
+        let scope = concord::rekey::ROOT_SCOPE_HEX;
+        let conv = conversation_key(owner.secret_key(), staff);
+        let locator = concord::rekey::my_locator(&owner_hex, &staff.to_hex(), scope, next).unwrap();
+        let blobs = json!([{ "locator": locator, "wrapped": concord::nip44::encrypt_str(&conv, &plain).unwrap() }]);
+        let tags = vec![
+            vec!["scope".to_string(), scope.to_string()],
+            vec!["newepoch".into(), next.to_string()],
+            vec!["prevepoch".into(), from.root_epoch.to_string()],
+            vec!["prevcommit".into(), to_hex(&epoch_key_commitment(from.root_epoch, &from.root_key()))],
+            vec!["chunk".into(), "1".into(), "1".into()],
+        ];
+        let ms = now_ms();
+        let rumor = concord::rumor::Rumor::new(kinds::REKEY, blobs.to_string(), tags, &owner_hex, Some(ms), None);
+        let address: StreamKey = (&base_rekey_group_key(&from.root_key(), &cid, next)).into();
+        relay.inject(seal_and_wrap(&rumor, Plane::Rekey, &address, owner, WrapOptions::default()).unwrap());
+        let mut after = from.clone();
+        for r in &mut after.held_roots {
+            r.retired_at.get_or_insert(ms / 1000);
+        }
+        after.held_roots.insert(
+            0,
+            concord::community::HeldRoot { epoch: next, key: to_hex(&new_root), control_pk: Some(control_pk.to_hex()), retired_at: None, refounder: Some(owner_hex) },
+        );
+        after.root = to_hex(&new_root);
+        after.root_epoch = next;
+        after.control_pk = Some(control_pk.to_hex());
+        after.control_root = Some(to_hex(&new_control_root));
+        after
     }
 
     #[tokio::test]
