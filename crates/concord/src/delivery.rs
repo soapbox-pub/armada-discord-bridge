@@ -128,9 +128,37 @@ pub fn open_access_key(d: &ParsedDelivery, me: &Keys, channel_id: &Bytes32) -> O
     })
 }
 
+/// At most this many blobs in an event that hands its recipients writer certificates.
+pub const MAX_CERTIFIED_BLOBS_PER_EVENT: usize = 48;
+
+/// What a writer-epoch delivery adds to a plain key delivery (CORD-03 §1).
+#[derive(Clone, Debug, Default)]
+pub struct WriterDelivery {
+    /// The pubkey the delivered secret derives to: the writer address, or the certifier.
+    pub writer: Option<String>,
+    /// A writer certificate per recipient, `(recipient, cert)`, riding the event carrying its blob.
+    pub certs: Vec<(String, String)>,
+    /// Each event is a part of the epoch's minting delivery.
+    pub mint: bool,
+}
+
 /// A key delivery's rumors: the key of `scope`'s `epoch`, one blob per
 /// recipient, at most [`DELIVERY_BLOBS_PER_EVENT`] an event.
 pub fn build_access_deliveries(deliverer: &Keys, scope: &Bytes32, epoch: u64, key: &Bytes32, recipients: &[String], at_secs: u64) -> Result<Vec<Rumor>, nip44::Nip44Error> {
+    build_writer_deliveries(deliverer, scope, epoch, key, recipients, at_secs, &WriterDelivery::default())
+}
+
+/// [`build_access_deliveries`] for a writer epoch's secret or certifier
+/// (Armada `buildAccessDeliveries` with `writer`, `certs`, `mint`).
+pub fn build_writer_deliveries(
+    deliverer: &Keys,
+    scope: &Bytes32,
+    epoch: u64,
+    key: &Bytes32,
+    recipients: &[String],
+    at_secs: u64,
+    w: &WriterDelivery,
+) -> Result<Vec<Rumor>, nip44::Nip44Error> {
     let mut plain = Vec::with_capacity(72);
     plain.extend_from_slice(scope);
     plain.extend_from_slice(&epoch.to_be_bytes());
@@ -139,18 +167,32 @@ pub fn build_access_deliveries(deliverer: &Keys, scope: &Bytes32, epoch: u64, ke
     let me = deliverer.public_key().to_hex();
     let scope_hex = crate::to_hex(scope);
     let mut blobs = Vec::new();
+    let mut who: Vec<&String> = Vec::new();
     for r in recipients {
         let Some(pk) = hex32(r).and_then(|b| PublicKey::from_slice(&b).ok()) else { continue };
         let conv = conversation_key(deliverer.secret_key(), &pk);
         let locator = my_locator(&me, r, &scope_hex, epoch).expect("validated hex");
         blobs.push(serde_json::json!({ "locator": locator, "wrapped": nip44::encrypt_str(&conv, &plain)? }));
+        who.push(r);
     }
-    let chunks: Vec<&[serde_json::Value]> = if blobs.is_empty() { vec![&[]] } else { blobs.chunks(DELIVERY_BLOBS_PER_EVENT).collect() };
-    Ok(chunks
-        .into_iter()
-        .map(|c| {
-            let tags = vec![vec!["scope".into(), scope_hex.clone()], vec!["newepoch".into(), epoch.to_string()], vec!["delivery".into(), "access".into()]];
-            Rumor::new(kinds::REKEY, serde_json::Value::Array(c.to_vec()).to_string(), tags, &me, None, Some(at_secs))
+    let per_event = if w.certs.is_empty() { DELIVERY_BLOBS_PER_EVENT } else { MAX_CERTIFIED_BLOBS_PER_EVENT };
+    let parts = blobs.len().div_ceil(per_event).max(1);
+    Ok((0..parts)
+        .map(|i| {
+            let range = (i * per_event).min(blobs.len())..((i + 1) * per_event).min(blobs.len());
+            let mut tags = vec![vec!["scope".into(), scope_hex.clone()], vec!["newepoch".into(), epoch.to_string()], vec!["delivery".into(), "access".into()]];
+            if let Some(writer) = &w.writer {
+                tags.push(vec!["writer".into(), writer.clone()]);
+            }
+            for r in &who[range.clone()] {
+                if let Some((_, cert)) = w.certs.iter().find(|(recipient, _)| recipient == *r) {
+                    tags.push(vec!["cert".into(), (*r).clone(), cert.clone()]);
+                }
+            }
+            if w.mint {
+                tags.push(vec!["mint".into(), (i + 1).to_string(), parts.to_string()]);
+            }
+            Rumor::new(kinds::REKEY, serde_json::Value::Array(blobs[range].to_vec()).to_string(), tags, &me, None, Some(at_secs))
         })
         .collect())
 }
