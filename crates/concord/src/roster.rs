@@ -33,6 +33,10 @@ pub const VSK_WRITERS: &str = "18";
 /// is refused (CORD-04 §1).
 pub const ALWAYS_MARKED_VSKS: [&str; 6] = [VSK_RANKED_ROLE, VSK_ACL, VSK_CATEGORY, VSK_TENURE, VSK_SYNC, VSK_WRITERS];
 
+/// The Roster's and Banlist's kinds: their heads keep their slot against
+/// another kind's edition aimed at the same coordinate (Armada `AUTHORITY_VSKS`).
+pub const AUTHORITY_VSKS: [&str; 7] = ["1", VSK_RANKED_ROLE, "3", "4", VSK_TENURE, VSK_ACL, VSK_SYNC];
+
 /// The most Channels a switching `@everyone` lists (CORD-04 §2).
 pub const MAX_LEGACY_CHANNELS: usize = 256;
 pub const MAX_TENURE_ENTRIES: usize = 16;

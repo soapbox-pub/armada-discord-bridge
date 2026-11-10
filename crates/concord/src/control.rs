@@ -17,7 +17,7 @@ use crate::kinds::{self, SIGNAL_PAUSE};
 use crate::rank::is_rank_key;
 use crate::roles::{BENEATH_EVERY_ROLE, MAX_ROLES_PER_COMMUNITY, MemberGrant, NAME_MAX_BYTES, Overwrite, Role, Roster, cut_name, perm};
 use crate::roster::{
-    ALWAYS_MARKED_VSKS, SealedBy, VSK_ACL, VSK_CATEGORY, VSK_RANKED_ROLE, VSK_SYNC, VSK_TENURE, VSK_WRITERS, fold_ranked_roster, is_listed, may_swap_overwrites,
+    ALWAYS_MARKED_VSKS, AUTHORITY_VSKS, SealedBy, VSK_ACL, VSK_CATEGORY, VSK_RANKED_ROLE, VSK_SYNC, VSK_TENURE, VSK_WRITERS, fold_ranked_roster, is_listed, may_swap_overwrites,
     overwrite_authorized, overwrite_locator, parse_overwrite, parse_sync, roster_activated, seal_of,
 };
 use crate::strict;
@@ -295,7 +295,17 @@ fn head_candidates<'a>(editions: &[&'a Edition], floor: Option<&Head>, snapshot:
     ordered
 }
 
+/// Record `e` as its coordinate's head. A Roster or Banlist head is never
+/// replaced by another kind's edition at the same coordinate (Armada
+/// `HeadSlots`): pins are read with no coordinate check, so without this a
+/// PIN_MESSAGES holder could aim a Pin List at a moderator's Grant and
+/// replace the head their citations are checked against, failing their
+/// hides or passing stale ones.
 fn settle(heads: &mut HashMap<String, Head>, head_editions: &mut HashMap<String, Edition>, e: &Edition) {
+    let authority = |vsk: &str| AUTHORITY_VSKS.contains(&vsk);
+    if head_editions.get(&e.eid_hex()).is_some_and(|prev| authority(&prev.vsk) && !authority(&e.vsk)) {
+        return;
+    }
     heads.insert(e.eid_hex(), Head { version: e.version, hash: e.self_hash });
     head_editions.insert(e.eid_hex(), e.clone());
 }
@@ -1242,4 +1252,65 @@ pub fn is_dissolved_opened(opened: &Opened, owner: &str, community_id: &Bytes32)
         && opened.rumor.kind == kinds::CONTROL
         && opened.rumor.tag_value("vsk") == Some(kinds::VSK_DISSOLVED)
         && opened.rumor.tag_value("eid") == Some(to_hex(community_id).as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::community::Membership;
+    use crate::edition::{EditionMeta, parse_edition};
+    use crate::roles::{Role, RoleScope};
+    use crate::stream::open_plane_wrap;
+
+    struct Plane {
+        community: Membership,
+        owner: Keys,
+        editions: Vec<Edition>,
+    }
+
+    impl Plane {
+        fn new() -> Plane {
+            let owner = Keys::generate();
+            let community = Membership::mint("t", &owner.public_key().to_hex(), vec![], 0);
+            Plane { community, owner, editions: vec![] }
+        }
+        fn put(&mut self, rumor: &Rumor, by: &Keys) -> Edition {
+            let control = self.community.control_write_stream().unwrap();
+            let wrap = seal_edition(rumor, &control, by).unwrap();
+            let e = parse_edition(open_plane_wrap(&wrap, &self.community.current_control_stream(), kinds::Plane::Control).unwrap()).unwrap();
+            self.editions.push(e.clone());
+            e
+        }
+        fn fold(&self) -> FoldedControl {
+            fold_control(&self.editions, &self.community.id(), &self.community.owner, None, None)
+        }
+    }
+
+    #[test]
+    fn a_pin_list_aimed_at_a_grant_never_takes_its_head() {
+        let mut p = Plane::new();
+        let owner = p.owner.public_key().to_hex();
+        let (alice, bob) = (Keys::generate(), Keys::generate());
+        let cid = p.community.id();
+        let pins_role = Role::new(&"aa".repeat(32), "Pinner", 2, perm::PIN_MESSAGES | perm::MANAGE_MESSAGES, RoleScope::Server);
+        let owner_meta = EditionMeta { created_at: Some(1_700_000_000), ..EditionMeta::first(&owner, None) };
+        p.put(&build_role_edition(&pins_role, &owner_meta).unwrap(), &p.owner.clone());
+        let mut grant_hash = HashMap::new();
+        for who in [&alice, &bob] {
+            let g = MemberGrant { member: who.public_key().to_hex(), role_ids: vec![pins_role.role_id.clone()], control_wrap: None };
+            let e = p.put(&build_grant_edition(&cid, &g, &owner_meta).unwrap(), &p.owner.clone());
+            grant_hash.insert(who.public_key().to_hex(), e.self_hash);
+        }
+        let bob_eid = grant_locator(&cid, &bob.public_key().to_bytes());
+        let alice_vac = Citation { entity_id: grant_locator(&cid, &alice.public_key().to_bytes()), version: 1, edition_hash: grant_hash[&alice.public_key().to_hex()] };
+        // Alice, a pinner, aims a Pin List at Bob's Grant coordinate, at version 9.
+        let alice_pk = alice.public_key().to_hex();
+        let pins = build_edition_rumor(kinds::VSK_PINS, &bob_eid, "[]".into(), &EditionMeta { version: 9, ..EditionMeta::first(&alice_pk, Some(&alice_vac)) });
+        p.put(&pins, &alice);
+        let f = p.fold();
+        let head = f.heads[&to_hex(&bob_eid)];
+        assert_eq!((head.version, head.hash), (1, grant_hash[&bob.public_key().to_hex()]), "Bob's Grant keeps its head");
+        let bob_vac = Citation { entity_id: bob_eid, version: 1, edition_hash: head.hash };
+        assert!(f.citation_satisfied(&cid, &bob.public_key().to_hex(), Some(&bob_vac)));
+    }
 }
