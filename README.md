@@ -35,6 +35,7 @@ never bridged without its community's consent.
   v2 (no overwrite lets Discord members in), bridge Armada → Discord only, and
   the bridge says so once in the Discord channel. Checked against Vector's own
   fixtures as well as Armada's code.
+- **Refoundings** followed with the bridge's own key, at start and live.
 - **Private channel keys** from Direct Invites, access-plane deliveries and
   channel rotations, read at every start and followed while running; a
   converted channel's public-era history stays readable.
@@ -50,8 +51,8 @@ never bridged without its community's consent.
   genesis (metadata included, which Vector's join checks) signed by the owner's
   own key in their browser, then backfill history.
 
-Not yet: severance detection (ban, refounding, dissolution) is partial, and a
-Refounding's new root is taken only at the next start; Discord-side commands are parsed from message text rather than
+Not yet: severance detection is partial (a Refounding that leaves the bridge
+out pauses it; a ban without one, or a dissolution, doesn't yet); Discord-side commands are parsed from message text rather than
 registered as slash commands. And the owner of an imported community does not
 receive its staff write key: Roles v2 left no protocol path for a custodial
 importer to hand it over, so that needs an upstream change.
