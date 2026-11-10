@@ -313,6 +313,20 @@ struct MemoryState {
     refuse: bool,
     max_subs: Option<usize>,
     refused_subs: usize,
+    /// Serve giftwraps only to their address or recipient, once AUTHed as it.
+    gated: bool,
+    authed: std::collections::HashSet<PublicKey>,
+}
+
+impl MemoryState {
+    /// What a gated relay hands this connection: a kind-1059 wrap only when
+    /// it has authenticated as the wrap's author or a `p`-tagged recipient.
+    fn serves(&self, e: &Event) -> bool {
+        if !self.gated || e.kind != Kind::GiftWrap {
+            return true;
+        }
+        self.authed.contains(&e.pubkey) || e.tags.public_keys().any(|p| self.authed.contains(&p))
+    }
 }
 
 /// Closes a memory subscription when dropped, as a real relay's CLOSE would:
@@ -364,12 +378,19 @@ impl MemoryRelay {
         st.subs.len()
     }
 
+    /// Gate kind 1059 by NIP-42, as ditto-relay does by default: a wrap is
+    /// served only to a connection authenticated as its author or recipient.
+    pub fn gate_giftwraps(&self) {
+        self.inner.lock().unwrap().gated = true;
+    }
+
     /// Store an event as if published, delivering it to subscriptions.
     pub fn inject(&self, event: Event) {
         let mut st = self.inner.lock().unwrap();
         st.subs.retain(|(_, _, tx)| !tx.is_closed());
+        let served = st.serves(&event);
         for (_, filters, tx) in &st.subs {
-            if filters.iter().any(|f| f.match_event(&event, MatchEventOptions::default())) {
+            if served && filters.iter().any(|f| f.match_event(&event, MatchEventOptions::default())) {
                 let _ = tx.send(event.clone());
             }
         }
@@ -384,7 +405,7 @@ impl RelayLike for MemoryRelay {
         let mut out: Vec<Event> = Vec::new();
         for f in &filters {
             let mut matched: Vec<Event> =
-                st.events.iter().filter(|e| f.match_event(e, MatchEventOptions::default())).cloned().collect();
+                st.events.iter().filter(|e| st.serves(e) && f.match_event(e, MatchEventOptions::default())).cloned().collect();
             matched.sort_by_key(|e| std::cmp::Reverse(e.created_at));
             if let Some(limit) = f.limit {
                 matched.truncate(limit);
@@ -415,7 +436,7 @@ impl RelayLike for MemoryRelay {
             return Subscription::new(rx, ());
         }
         for e in &st.events {
-            if filters.iter().any(|f| f.match_event(e, MatchEventOptions::default())) {
+            if st.serves(e) && filters.iter().any(|f| f.match_event(e, MatchEventOptions::default())) {
                 let _ = tx.send(e.clone());
             }
         }
@@ -423,5 +444,9 @@ impl RelayLike for MemoryRelay {
         st.next_sub += 1;
         st.subs.push((id, filters, tx));
         Subscription::new(rx, MemoryUnsubscribe { state: Arc::downgrade(&self.inner), id })
+    }
+
+    fn register_auth_keys(&self, keys: Vec<Keys>) {
+        self.inner.lock().unwrap().authed.extend(keys.iter().map(|k| k.public_key()));
     }
 }

@@ -442,3 +442,22 @@ async fn a_timed_out_member_is_not_posted_for() {
     assert!(client.send_chat(&channel, SendChat::message(&alice, "let me speak")).await.is_err());
     assert!(client.send_chat(&channel, SendChat::message(&Keys::generate(), "fine")).await.is_ok());
 }
+
+#[tokio::test]
+async fn reads_deliveries_and_rotations_on_a_relay_that_gates_giftwraps() {
+    let w = world();
+    w.relay.gate_giftwraps();
+    let bridge = Keys::generate();
+    let (id, key, next) = ([0x71; 32], [0x72; 32], [0x73; 32]);
+    let folded = ranked_fold(&w, id, key, &bridge);
+    w.deliver(&w.owner, &bridge, id, 1, key);
+    let rumors = concord::rekey::build_channel_rotation(&w.owner, &id, 2, 1, &key, &next, &[bridge.public_key().to_hex()], now_ms(), None).unwrap();
+    let address: StreamKey = (&concord::derive::channel_rekey_group_key(&w.community.root_key(), &id, 2)).into();
+    for r in rumors {
+        w.relay.inject(seal_and_wrap(&r, Plane::Rekey, &address, &w.owner, Default::default()).unwrap());
+    }
+    let intake = bridge::key_intake::intake_access_keys(&w.relay, &bridge, &w.community, &folded).await;
+    let held = intake.community.private_channels.iter().find(|c| c.id == hex::encode(id)).expect("the delivery is served once AUTHed as its plane");
+    assert_eq!(held.epoch, 2, "and so is the rotation");
+}
+

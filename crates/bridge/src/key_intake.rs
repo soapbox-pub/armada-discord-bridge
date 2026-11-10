@@ -150,6 +150,7 @@ pub async fn intake_access_keys(relays: &dyn RelayLike, identity: &Keys, communi
             .filter_map(|c| Some((c.channel_id_hex.clone(), (&community.access_plane(&concord::hex32(&c.channel_id_hex)?)).into())))
             .collect();
         if !wanted.is_empty() {
+            relays.register_auth_keys(auth_keys(wanted.iter().map(|(_, s)| s)));
             let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).authors(wanted.iter().map(|(_, s)| s.pk).collect::<Vec<_>>()).limit(SCAN_LIMIT);
             let mut wraps = relays.query_settled(vec![filter]).await.unwrap_or_default();
             wraps.sort_by_key(|w| w.created_at);
@@ -181,6 +182,7 @@ pub async fn intake_access_keys(relays: &dyn RelayLike, identity: &Keys, communi
     let addresses = next.channel_rekey_addresses();
     if !addresses.is_empty() {
         let streams: Vec<StreamKey> = addresses.iter().map(|(g, _, _)| g.into()).collect();
+        relays.register_auth_keys(auth_keys(&streams));
         let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).authors(streams.iter().map(|s| s.pk).collect::<Vec<_>>()).limit(SCAN_LIMIT);
         let wraps = relays.query_settled(vec![filter]).await.unwrap_or_default();
         let parsed = wraps
@@ -199,4 +201,13 @@ pub async fn intake_access_keys(relays: &dyn RelayLike, identity: &Keys, communi
         }
     }
     KeyIntake { community: next, learned }
+}
+
+/// NIP-42 identities for the stream addresses about to be queried. Relays that
+/// gate kind 1059 (ditto-relay does by default) serve a group-addressed wrap
+/// only to a connection authenticated as its address, and these wraps are
+/// p-tagged to nobody, so without this a gated relay answered every delivery
+/// and rotation query with nothing, and a bridge never learned a key there.
+pub(crate) fn auth_keys<'a>(streams: impl IntoIterator<Item = &'a StreamKey>) -> Vec<Keys> {
+    streams.into_iter().filter_map(|s| s.sk.clone().map(Keys::new)).collect()
 }
