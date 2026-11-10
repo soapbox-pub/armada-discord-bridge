@@ -199,3 +199,125 @@ async fn a_key_taken_while_running_moves_the_shared_chat_req() {
     heard(&got, 1).await;
     assert_eq!(got.lock().unwrap()[0].epoch, 1);
 }
+
+// ── Refoundings ─────────────────────────────────────────────────────────────
+
+/// What a Refounding leaves a member holding at the new epoch, and the
+/// rotation that carries it (CORD-06 §1: a 104-byte member blob per recipient).
+struct Refounding {
+    after: Membership,
+}
+
+/// The owner refounds `from` to its next epoch, with blobs for `recipients`.
+fn refound(w: &World, from: &Membership, recipients: &[&Keys]) -> Refounding {
+    use base64::Engine;
+    use concord::derive::{base_rekey_group_key, control_signer_group_key, conversation_key, epoch_key_commitment};
+    let (cid, next) = (from.id(), from.root_epoch + 1);
+    let (new_root, new_control_root) = (concord::random32(), concord::random32());
+    let control_pk = control_signer_group_key(&new_control_root, &cid, next).keys.public_key();
+    let mut plain = vec![0u8; 32];
+    plain.extend_from_slice(&next.to_be_bytes());
+    plain.extend_from_slice(&new_root);
+    plain.extend_from_slice(&control_pk.to_bytes());
+    let plain = base64::engine::general_purpose::STANDARD.encode(plain);
+    let owner = w.owner.public_key().to_hex();
+    let scope = concord::rekey::ROOT_SCOPE_HEX;
+    let blobs: Vec<serde_json::Value> = recipients
+        .iter()
+        .map(|r| {
+            let conv = conversation_key(w.owner.secret_key(), &r.public_key());
+            let locator = concord::rekey::my_locator(&owner, &r.public_key().to_hex(), scope, next).unwrap();
+            json!({ "locator": locator, "wrapped": concord::nip44::encrypt_str(&conv, &plain).unwrap() })
+        })
+        .collect();
+    let tags = vec![
+        vec!["scope".to_string(), scope.to_string()],
+        vec!["newepoch".into(), next.to_string()],
+        vec!["prevepoch".into(), from.root_epoch.to_string()],
+        vec!["prevcommit".into(), hex::encode(epoch_key_commitment(from.root_epoch, &from.root_key()))],
+        vec!["chunk".into(), "1".into(), "1".into()],
+    ];
+    let ms = bridge::client::now_ms();
+    let rumor = concord::rumor::Rumor::new(concord::kinds::REKEY, serde_json::Value::Array(blobs).to_string(), tags, &owner, Some(ms), None);
+    let address: concord::stream::StreamKey = (&base_rekey_group_key(&from.root_key(), &cid, next)).into();
+    w.relay.inject(concord::stream::seal_and_wrap(&rumor, concord::kinds::Plane::Rekey, &address, &w.owner, Default::default()).unwrap());
+
+    // The owner's own view afterwards: the new root, and the staff key to it.
+    let mut after = from.clone();
+    for r in &mut after.held_roots {
+        r.retired_at.get_or_insert(ms / 1000);
+    }
+    after.held_roots.insert(
+        0,
+        concord::community::HeldRoot { epoch: next, key: hex::encode(new_root), control_pk: Some(control_pk.to_hex()), retired_at: None, refounder: Some(owner) },
+    );
+    after.root = hex::encode(new_root);
+    after.root_epoch = next;
+    after.control_pk = Some(control_pk.to_hex());
+    after.control_root = Some(hex::encode(new_control_root));
+    Refounding { after }
+}
+
+#[tokio::test]
+async fn a_refounding_while_running_moves_each_kept_bridge_and_the_shared_fold_and_pauses_the_one_left_out() {
+    let w = world();
+    let general = concord::random32();
+    w.channel(general, "general", false);
+    let rt = w.open(Arc::default()).await;
+    let excluded: Arc<Mutex<Vec<String>>> = Arc::default();
+    let seen = excluded.clone();
+    rt.set_on_excluded(Arc::new(move |id| seen.lock().unwrap().push(id)));
+
+    let (kept, dropped) = (Keys::generate(), Keys::generate());
+    let ca = rt.client_for(w.community.clone(), kept.clone());
+    let cb = rt.client_for(w.community.clone(), dropped.clone());
+    let (got, on_a) = inbox();
+    let (_, on_b) = inbox();
+    let a = rt.attach("a", ca.clone(), ca.channel(&hex::encode(general)).unwrap(), on_a);
+    let _b = rt.attach("b", cb.clone(), cb.channel(&hex::encode(general)).unwrap(), on_b);
+    eventually("the chat REQ", || w.relay.open_subscriptions() == 2).await;
+
+    // The owner refounds, keeping A and leaving B out.
+    let r = refound(&w, &w.community, &[&kept]);
+    eventually("A to take the new root", || ca.community().root_epoch == 1).await;
+    eventually("B to be reported", || excluded.lock().unwrap().as_slice() == ["b"]).await;
+    assert_eq!(cb.community().root_epoch, 0, "B holds no key to the new root");
+    eventually("A's view to move to the new root's stream", || a.channel().is_some_and(|c| c.current().epoch == 1)).await;
+
+    // The shared fold follows the new epoch's Control Plane live: a channel
+    // made there after the Refounding appears.
+    let after = concord::random32();
+    let rumor = build_channel_edition(&after, &json!({ "name": "after", "private": false }), &EditionMeta::first(&w.owner.public_key().to_hex(), None)).unwrap();
+    w.relay.inject(seal_edition(&rumor, &r.after.control_write_stream().unwrap(), &w.owner).unwrap());
+    eventually("the new epoch's edition to fold", || ca.channel(&hex::encode(after)).is_some()).await;
+
+    // And A hears what's posted at the new root.
+    tokio::time::sleep(RESUBSCRIBE_SETTLE * 2).await;
+    let general_now = ca.channel(&hex::encode(general)).unwrap();
+    ca.send_chat(&general_now, SendChat::message(&Keys::generate(), "after the refounding")).await.unwrap();
+    heard(&got, 1).await;
+    assert_eq!(got.lock().unwrap()[0].epoch, 1);
+}
+
+#[tokio::test]
+async fn a_start_walks_every_refounding_since_the_invite_and_hands_the_fold_the_newest_root() {
+    let w = world();
+    let general = concord::random32();
+    w.channel(general, "general", false);
+    let rt = w.open(Arc::default()).await;
+    let bridge = Keys::generate();
+    let first = refound(&w, &w.community, &[&bridge]);
+    let second = refound(&w, &first.after, &[&bridge]);
+
+    let folded = rt.folded().unwrap();
+    let intake = bridge::key_intake::intake_base_rotations(rt.relays().as_ref(), &bridge, &w.community, &folded).await;
+    assert_eq!((intake.adopted, intake.excluded), (Some(2), None));
+    assert_eq!(intake.community.root, second.after.root);
+    assert!(rt.adopt_base(&intake.community).await.unwrap());
+    assert!(!rt.adopt_base(&w.community).await.unwrap(), "never back to an older root");
+
+    // An identity with no blob there takes nothing from them.
+    let stranger = Keys::generate();
+    let other = bridge::key_intake::intake_base_rotations(rt.relays().as_ref(), &stranger, &w.community, &folded).await;
+    assert_eq!(other.adopted, None);
+}

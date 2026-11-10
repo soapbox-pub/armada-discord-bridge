@@ -630,6 +630,45 @@ impl ConcordClient {
     /// The same REQ follows the Guestbook's Timeouts: relays cap standing
     /// subscriptions, and a community's Control Plane and Guestbook are read
     /// together anyway.
+    /// Follow the community's Refoundings with this client's own identity
+    /// (see [`crate::key_intake::intake_base_rotations`]), taking the new root
+    /// into its membership. Its channels then derive from the new root.
+    pub async fn adopt_base_rotations(&self) -> crate::key_intake::BaseIntake {
+        let Some(folded) = self.folded() else {
+            return crate::key_intake::BaseIntake { community: (*self.community()).clone(), adopted: None, excluded: None };
+        };
+        let intake = crate::key_intake::intake_base_rotations(self.relays.as_ref(), &self.primary, &self.community(), &folded).await;
+        if let Some(epoch) = intake.adopted {
+            tracing::info!(community = %&intake.community.community_id[..8], epoch, "took the community's new root");
+            self.set_community(intake.community.clone());
+        }
+        intake
+    }
+
+    /// Move this client's base (roots, Control Plane address) up to `other`'s,
+    /// keeping its own channel keys. For the community's shared fold reader,
+    /// which holds no identity that could open a rotation's blob: it takes the
+    /// root a bridge verified. False when `other` is no newer.
+    pub fn take_base_from(&self, other: &Membership) -> bool {
+        let mine = self.community();
+        if other.community_id != mine.community_id || other.root_epoch <= mine.root_epoch {
+            return false;
+        }
+        let mut next = (*mine).clone();
+        next.held_roots = other.held_roots.clone();
+        next.root = other.root.clone();
+        next.root_epoch = other.root_epoch;
+        next.control_pk = other.control_pk.clone();
+        next.control_root = other.control_root.clone();
+        self.set_community(next);
+        // Read the new epoch's Control Plane and Guestbook as every member
+        // does, and stop AUTHing as nothing.
+        let mut keys = stream_keys(&self.community().control_streams());
+        keys.extend(stream_keys(&self.community().guestbook_streams()));
+        self.relays.register_auth_keys(keys);
+        true
+    }
+
     /// Follow a private channel's key while the bridge runs: its next
     /// rotations and its access deliveries. Each wrap arriving at one of those
     /// addresses re-runs the same vetted intake a start runs, and a key it
@@ -685,9 +724,19 @@ impl ConcordClient {
         })
     }
 
-    pub fn subscribe_control(self: &Arc<Self>, on_fold: Option<FoldHandler>) -> TaskGuard {
+    ///
+    /// `on_base` is called when a wrap lands at the next base rotation's
+    /// address, in the same REQ: a Refounding is under way, and the caller
+    /// follows it with each bridge's own identity (only they can open their
+    /// blobs). The subscription names the addresses of the root held when it
+    /// started, so the caller replaces it once a new root is taken.
+    pub fn subscribe_control(self: &Arc<Self>, on_fold: Option<FoldHandler>, on_base: Option<Arc<dyn Fn() + Send + Sync>>) -> TaskGuard {
         let (guestbook, guestbook_filter) = self.guestbook_filter();
-        let mut sub = self.relays.subscribe(vec![self.control_filter(), guestbook_filter]);
+        let base: StreamKey = (&self.community().next_base_rekey_address()).into();
+        self.relays.register_auth_keys(crate::key_intake::auth_keys([&base]));
+        let since = Timestamp::from_secs((now_ms() / 1000).saturating_sub(60));
+        let base_filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).author(base.pk).since(since);
+        let mut sub = self.relays.subscribe(vec![self.control_filter(), guestbook_filter, base_filter]);
         let me = Arc::downgrade(self);
         TaskGuard(tokio::spawn(async move {
             let mut editions: HashMap<EventId, Edition> = HashMap::new();
@@ -712,6 +761,12 @@ impl ConcordClient {
                 };
                 let Some(wrap) = next else { return };
                 if editions.contains_key(&wrap.id) {
+                    continue;
+                }
+                if wrap.pubkey == base.pk {
+                    if let Some(f) = &on_base {
+                        f();
+                    }
                     continue;
                 }
                 let Some(me) = me.upgrade() else { return };

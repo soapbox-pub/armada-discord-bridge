@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use bridge::client::{BotCommand, BotCommandArg, ConcordClient, OpenedChat, SendChat, TaskGuard, now_ms, resolve_invite};
 use bridge::community::{Attachment, CommunityRuntime};
 use bridge::discord::{CommandMessage, DiscordAdapter, DiscordEvents, TypingEvent};
-use bridge::key_intake::{intake_access_keys, intake_direct_invite_keys};
+use bridge::key_intake::{intake_access_keys, intake_base_rotations, intake_direct_invite_keys};
 use bridge::profiles::Kind0ProfileResolver;
 use bridge::puppets::PuppetCache;
 use bridge::relays::{Hub, RelayLike, Relays};
@@ -198,6 +198,15 @@ pub struct GatewayUnavailable;
 #[derive(Debug, thiserror::Error)]
 #[error("the bot was removed from this Discord server")]
 pub struct BotRemoved;
+
+/// A Refounding left this bridge's identity out of the community: it holds
+/// only planes everyone else has left, so it is paused, not retried.
+#[derive(Debug, thiserror::Error)]
+#[error("a Refounding removed this bridge from its Armada community")]
+pub struct RefoundedOut;
+
+const REFOUNDED_OUT_DETAIL: &str =
+    "A Refounding in the Armada community left this bridge out (a moderator removed it). Re-invite the bridge in Armada, then resume it.";
 
 /// `options` keys marking a pause the portal made, not a person. Only such a
 /// pause is ever lifted automatically; any other stop clears them.
@@ -741,6 +750,20 @@ impl BridgeManager {
         // "concord channel not found" on every start (2026-09-24).
         relays.register_auth_keys(vec![primary.clone()]);
         let folded = community.runtime.folded().context("community has no fold")?;
+        // Refoundings the invite doesn't know of yet, opened with this
+        // bridge's own key, before any channel key: the access plane derives
+        // from the root. The invite moves only when its creator re-posts it,
+        // and nobody re-posts the one an import minted.
+        let base = stage("following refoundings", STAGE_RELAY, async { Ok(intake_base_rotations(relays, &primary, &membership, &folded).await) }).await?;
+        if base.excluded.is_some() {
+            return Err(RefoundedOut.into());
+        }
+        let (membership, folded) = if base.adopted.is_some() {
+            stage("refolding at the new root", STAGE_RELAY, community.runtime.adopt_base(&base.community)).await?;
+            (base.community, community.runtime.folded().context("community has no fold")?)
+        } else {
+            (membership, folded)
+        };
         let floor = relays.with_urls(invite_delivery_relays(&[]));
         floor.register_auth_keys(vec![primary.clone()]);
         let intake = stage("scanning for direct invites", STAGE_RELAY, async {
@@ -972,6 +995,15 @@ impl BridgeManager {
             });
             let runtime =
                 stage("folding the control plane", STAGE_RELAY, CommunityRuntime::open(membership.clone(), Arc::new(relays.clone()), Some(on_cursor))).await?;
+            let me = self.me.clone();
+            runtime.set_on_excluded(Arc::new(move |bridge_id: String| {
+                let Some(me) = me.upgrade() else { return };
+                tokio::spawn(async move {
+                    if let Err(error) = me.stop(&bridge_id, "paused", Some(REFOUNDED_OUT_DETAIL)).await {
+                        tracing::error!(bridge = %bridge_id, error = %format!("{error:#}"), "could not pause a bridge a Refounding removed");
+                    }
+                });
+            }));
             // A fold with no channels is no relay having answered, not a
             // community without channels: one has a bridge into it. Kept, it
             // would fail every bridge of the community "channel not found"
@@ -1428,6 +1460,12 @@ impl BridgeManager {
                 Err(error) if error.is::<BotRemoved>() => {
                     if let Err(error) = self.pause_bot_removed(&row.bridge_id, &row.status).await {
                         tracing::error!(bridge = %row.bridge_id, error = %format!("{error:#}"), "could not pause a bridge whose server removed the bot");
+                    }
+                }
+                Err(error) if error.is::<RefoundedOut>() => {
+                    tracing::warn!(bridge = %row.bridge_id, "a Refounding removed this bridge; pausing");
+                    if let Err(error) = self.stop(&row.bridge_id, "paused", Some(REFOUNDED_OUT_DETAIL)).await {
+                        tracing::error!(bridge = %row.bridge_id, error = %format!("{error:#}"), "could not pause a bridge a Refounding removed");
                     }
                 }
                 Err(error) if error.is::<GatewayUnavailable>() => {

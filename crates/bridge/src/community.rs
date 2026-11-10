@@ -57,8 +57,21 @@ pub struct CommunityRuntime {
     /// The stream addresses the current chat REQ names, and the REQ.
     chat: Mutex<Option<(BTreeSet<PublicKey>, TaskGuard)>>,
     resubscribe: Arc<Notify>,
+    /// The control REQ, replaced when the community takes a new root: it
+    /// names the old root's Control Plane, Guestbook and next rotation address.
+    control_sub: Mutex<Option<TaskGuard>>,
+    /// Woken when a wrap lands at the next base rotation's address.
+    refound: Arc<Notify>,
+    /// Told the id of each attached bridge a Refounding removed.
+    on_excluded: Mutex<Option<ExcludedHandler>>,
     tasks: Mutex<Vec<TaskGuard>>,
 }
+
+/// Called with a bridge id when a Refounding left that bridge out.
+pub type ExcludedHandler = Arc<dyn Fn(String) + Send + Sync>;
+
+/// How long a Refounding's chunks are given to land before it is read.
+const REFOUND_SETTLE: Duration = Duration::from_millis(1500);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -85,14 +98,12 @@ impl CommunityRuntime {
             next_token: Mutex::new(0),
             chat: Mutex::new(None),
             resubscribe: Arc::default(),
+            control_sub: Mutex::new(None),
+            refound: Arc::default(),
+            on_excluded: Mutex::new(None),
             tasks: Mutex::default(),
         });
-        let weak = Arc::downgrade(&rt);
-        let control_sub = rt.control.subscribe_control(Some(Arc::new(move |_| {
-            if let Some(rt) = weak.upgrade() {
-                rt.refresh_views();
-            }
-        })));
+        rt.restart_control();
         let (weak, notify) = (Arc::downgrade(&rt), rt.resubscribe.clone());
         let resubscriber = TaskGuard::spawn(async move {
             loop {
@@ -102,8 +113,81 @@ impl CommunityRuntime {
                 rt.resubscribe_now();
             }
         });
-        *lock(&rt.tasks) = vec![control_sub, resubscriber];
+        let (weak, notify) = (Arc::downgrade(&rt), rt.refound.clone());
+        let refounder = TaskGuard::spawn(async move {
+            loop {
+                notify.notified().await;
+                tokio::time::sleep(REFOUND_SETTLE).await;
+                let Some(rt) = weak.upgrade() else { return };
+                rt.follow_refounding().await;
+            }
+        });
+        *lock(&rt.tasks) = vec![resubscriber, refounder];
         Ok(rt)
+    }
+
+    /// (Re)open the control REQ on the root the fold reader holds now.
+    fn restart_control(&self) {
+        let weak = self.me.clone();
+        let refound = self.refound.clone();
+        let sub = self.control.subscribe_control(
+            Some(Arc::new(move |_| {
+                if let Some(rt) = weak.upgrade() {
+                    rt.refresh_views();
+                }
+            })),
+            Some(Arc::new(move || refound.notify_one())),
+        );
+        *lock(&self.control_sub) = Some(sub);
+    }
+
+    /// Who to tell when a Refounding removes an attached bridge.
+    pub fn set_on_excluded(&self, handler: ExcludedHandler) {
+        *lock(&self.on_excluded) = Some(handler);
+    }
+
+    /// A Refounding landed: each attached bridge follows it with its own
+    /// identity, since only it can open its blob, and the first new root one
+    /// takes moves the shared fold. A bridge left out is reported: it holds
+    /// only planes the community has left, so nothing it mirrors would reach
+    /// anyone.
+    pub async fn follow_refounding(&self) {
+        let members: Vec<(String, Arc<ConcordClient>)> = lock(&self.members).iter().map(|(id, m)| (id.clone(), m.client.clone())).collect();
+        let mut excluded = Vec::new();
+        for (id, client) in members {
+            let intake = client.adopt_base_rotations().await;
+            if intake.adopted.is_some()
+                && let Err(error) = self.adopt_base(&intake.community).await
+            {
+                tracing::warn!(error = %format!("{error:#}"), "refolding at the new root failed; the live subscription will catch up");
+            }
+            if intake.excluded.is_some() {
+                excluded.push(id);
+            }
+        }
+        let handler = lock(&self.on_excluded).clone();
+        for id in excluded {
+            tracing::warn!(bridge = %id, "a Refounding removed this bridge from its community");
+            if let Some(handler) = &handler {
+                handler(id);
+            }
+        }
+        self.refresh_views();
+    }
+
+    /// Move the shared fold to a root a bridge verified (its own rotation
+    /// blob, judged against this fold): re-subscribe to the new epoch's
+    /// Control Plane, Guestbook and next rotation address, and refold. False
+    /// when `from` holds no newer root. Never from an invite's word alone: a
+    /// bundle can name any root, and this fold serves every bridge here.
+    pub async fn adopt_base(&self, from: &Membership) -> anyhow::Result<bool> {
+        if !self.control.take_base_from(from) {
+            return Ok(false);
+        }
+        self.restart_control();
+        self.control.sync_control().await?;
+        self.refresh_views();
+        Ok(true)
     }
 
     pub fn relays(&self) -> &Arc<dyn RelayLike> {

@@ -151,7 +151,7 @@ async fn live_folds_a_new_channel_edition() {
     assert!(client.channels().is_empty());
     let folds = Arc::new(Mutex::new(0));
     let f = folds.clone();
-    let _sub = client.subscribe_control(Some(Arc::new(move |_| *f.lock().unwrap() += 1)));
+    let _sub = client.subscribe_control(Some(Arc::new(move |_| *f.lock().unwrap() += 1)), None);
     w.channel([2u8; 32], "random", false);
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(client.channels().iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["random"]);

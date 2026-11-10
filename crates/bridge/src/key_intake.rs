@@ -203,6 +203,52 @@ pub async fn intake_access_keys(relays: &dyn RelayLike, identity: &Keys, communi
     KeyIntake { community: next, learned }
 }
 
+/// What following the community's base rotations decided.
+pub struct BaseIntake {
+    pub community: Membership,
+    /// The root epoch the walk ended on, if it moved.
+    pub adopted: Option<u64>,
+    /// A rotation from someone who outranks us carried nothing for us: we were
+    /// removed, at this epoch (CORD-06 §2).
+    pub excluded: Option<u64>,
+}
+
+/// The most Refoundings one walk follows: each step is a query, and a plane
+/// that kept serving new epochs past this is no community's real history.
+const MAX_BASE_STEPS: usize = 16;
+
+/// Follow the community's Refoundings (CORD-06 §2) from the root held,
+/// opening each rotation's blob with `identity`'s own key, as every Armada
+/// member does.
+///
+/// The bridge used to take its root from the invite bundle alone, which moves
+/// only when the link's creator re-posts it. Nobody re-posts the link an
+/// import minted, and a member's link moves only once their client comes
+/// online, so after a Refounding a bridge read and wrote planes nobody else
+/// did any more, restarts included. Authority stays the fold's: the kernel
+/// takes a rotation only from an unbanned BAN holder citing a satisfied
+/// Grant, continuing from the root held.
+pub async fn intake_base_rotations(relays: &dyn RelayLike, identity: &Keys, community: &Membership, folded: &FoldedControl) -> BaseIntake {
+    let mut next = community.clone();
+    let (mut adopted, mut excluded) = (None, None);
+    for _ in 0..MAX_BASE_STEPS {
+        let address: StreamKey = (&next.next_base_rekey_address()).into();
+        relays.register_auth_keys(auth_keys([&address]));
+        let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).author(address.pk).limit(SCAN_LIMIT);
+        let wraps = relays.query_settled(vec![filter]).await.unwrap_or_default();
+        let parsed = wraps.iter().filter_map(|w| parse_rekey(&open_plane_wrap(w, &address, Plane::Rekey).ok()?).ok()).collect();
+        match next.apply_base_rotations(&group_rotations(parsed), folded, identity) {
+            concord::community::RekeyOutcome::AdoptedRoot(epoch) => adopted = Some(epoch),
+            concord::community::RekeyOutcome::Excluded(epoch) => {
+                excluded = Some(epoch);
+                break;
+            }
+            concord::community::RekeyOutcome::Nothing => break,
+        }
+    }
+    BaseIntake { community: next, adopted, excluded }
+}
+
 /// NIP-42 identities for the stream addresses about to be queried. Relays that
 /// gate kind 1059 (ditto-relay does by default) serve a group-addressed wrap
 /// only to a connection authenticated as its address, and these wraps are

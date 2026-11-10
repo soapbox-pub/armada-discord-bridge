@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use bridge::client::{ConcordClient, OpenedChat, now_ms, resolve_invite};
 use bridge::config::BridgeConfig;
 use bridge::discord::{DiscordAdapter, DiscordEvents, TypingEvent};
-use bridge::key_intake::{intake_access_keys, intake_direct_invite_keys};
+use bridge::key_intake::{intake_access_keys, intake_base_rotations, intake_direct_invite_keys};
 use bridge::relays::{Hub, RelayLike};
 use bridge::router::{BridgeRouter, RouterOptions, SelfIds};
 use bridge::store::{MappingStore, PgMappingStore};
@@ -125,6 +125,21 @@ async fn main() -> anyhow::Result<()> {
     // before we accept any. The intake refuses bundles from anyone else.
     let preflight = ConcordClient::new(community.clone(), Arc::new(relays.clone()), primary.clone());
     let folded = preflight.sync_control().await?;
+    // Refoundings since the invite was last re-posted, opened with our own
+    // key, before any channel key: the access plane derives from the root.
+    let base = intake_base_rotations(&relays, &primary, &community, &folded).await;
+    if let Some(epoch) = base.excluded {
+        anyhow::bail!("a Refounding at epoch {epoch} removed this bridge from the community");
+    }
+    let (community, preflight, folded) = match base.adopted {
+        None => (community, preflight, folded),
+        Some(epoch) => {
+            tracing::info!(epoch, "took the community's new root");
+            let preflight = ConcordClient::new(base.community.clone(), Arc::new(relays.clone()), primary.clone());
+            let folded = preflight.sync_control().await?;
+            (base.community, preflight, folded)
+        }
+    };
     // Private-channel keys addressed to us since the last boot. The stock
     // floor is scanned too: it is where a sender delivers to an npub with no
     // published inbox (which we were, until the 10050 below).
@@ -253,14 +268,39 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("stream keys or writer addresses moved; chat subscription refreshed");
         })
     };
-    let _control = {
-        let resubscribe = resubscribe.clone();
-        client.subscribe_control(Some(Arc::new(move |_| resubscribe())))
+    let refound = Arc::new(tokio::sync::Notify::new());
+    let control_sub = || {
+        let (resubscribe, refound) = (resubscribe.clone(), refound.clone());
+        client.subscribe_control(Some(Arc::new(move |_| resubscribe())), Some(Arc::new(move || refound.notify_one())))
     };
+    let mut _control = control_sub();
     let _keys = channel.private.then(|| client.follow_channel_keys(&channel.id_hex, resubscribe.clone()));
     tracing::info!("live in both directions");
 
-    shutdown_signal().await;
+    // A Refounding moves every plane: take the new root with our own key,
+    // then re-subscribe to the new Control Plane and the channel's new stream.
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            _ = refound.notified() => {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                let intake = client.adopt_base_rotations().await;
+                if let Some(epoch) = intake.excluded {
+                    tracing::error!(epoch, "a Refounding removed this bridge from the community; stopping");
+                    break;
+                }
+                if intake.adopted.is_some() {
+                    _control = control_sub();
+                    if let Err(error) = client.sync_control().await {
+                        tracing::warn!(error = %format!("{error:#}"), "refolding at the new root failed; the live subscription will catch up");
+                    }
+                    resubscribe();
+                }
+            }
+        }
+    }
     tracing::info!("shutting down");
     adapter.stop();
     Ok(())
