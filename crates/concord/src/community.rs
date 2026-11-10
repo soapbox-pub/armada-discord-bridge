@@ -105,6 +105,10 @@ pub struct ChannelView {
     pub position: Option<f64>,
     /// The rank-key position, ordering Channels on the ranked Roster (CORD-03 §2).
     pub rank: Option<String>,
+    /// The Category entity it files under (CORD-03 §4).
+    pub category_id: Option<String>,
+    /// `"chat"`, `"forum"`, `"voice"`, or unknown (read as chat) (CORD-03 §2).
+    pub view: Option<String>,
     /// Newest first; `streams[0]` is where writes go, unless a Writers ledger restricts it.
     pub streams: Vec<ChannelStream>,
     /// Every writer address the Channel's ledger names, live and retired.
@@ -125,6 +129,35 @@ pub enum RekeyOutcome {
     /// A complete post-join rotation by an outranking rotator carried no blob for us.
     Excluded(u64),
     Nothing,
+}
+
+impl Membership {
+    /// The held key of a private Channel at `epoch`, current or prior.
+    pub fn channel_key_at(&self, channel_id_hex: &str, epoch: u64) -> Option<Bytes32> {
+        let h = self.private_channels.iter().find(|c| c.id.eq_ignore_ascii_case(channel_id_hex))?;
+        let key = if h.epoch == epoch { Some(h.key.as_str()) } else { h.priors.iter().find(|p| p.epoch == epoch).map(|p| p.key.as_str()) };
+        hex32(key?)
+    }
+
+    /// Each sealed Private Channel's `creator`, opened with the keys held here
+    /// (CORD-03 §2). Armada fills `roster.creators` from these on the ranked
+    /// Roster, and the creator, holding Manage Channels, may view the channel
+    /// with no overwrite naming them (CORD-04 §8); a reader without them
+    /// resolves that member's permissions there differently from Armada.
+    pub fn open_creators(&self, folded: &FoldedControl) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        if !folded.ranked {
+            return out;
+        }
+        for ch in folded.channels.values().filter(|c| c.private && !c.deleted) {
+            let Some(sealed) = &ch.sealed else { continue };
+            let (Some(key), Some(id)) = (self.channel_key_at(&ch.channel_id_hex, sealed.epoch), hex32(&ch.channel_id_hex)) else { continue };
+            if let Some(creator) = crate::channel_seal::open_channel_seal(sealed, &key, &id).and_then(|o| o.creator) {
+                out.insert(ch.channel_id_hex.clone(), creator);
+            }
+        }
+        out
+    }
 }
 
 fn b32(s: &str) -> Bytes32 {
@@ -280,24 +313,41 @@ impl Membership {
             } else {
                 root_streams.into_iter().chain(channel_streams).collect()
             };
-            // A sealed Private Channel's name is readable only with its key (CORD-03 §2).
-            let sealed_name = def.sealed.as_ref().zip(held).and_then(|(sealed, h)| {
-                let key = if h.epoch == sealed.epoch { Some(h.key.as_str()) } else { h.priors.iter().find(|p| p.epoch == sealed.epoch).map(|p| p.key.as_str()) };
-                crate::channel_seal::open_channel_seal(sealed, &b32(key?), &id)
+            // A sealed Private Channel's details are readable only with its key
+            // (CORD-03 §2): its name, and where it sits — Category, position
+            // key and view all ride inside the seal, not beside it.
+            let opened = def.sealed.as_ref().and_then(|sealed| {
+                let key = self.channel_key_at(&def.channel_id_hex, sealed.epoch)?;
+                crate::channel_seal::open_channel_seal(sealed, &key, &id)
             });
-            let name = match (&sealed_name, held) {
-                (Some(o), _) => o.metadata.get("name").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(),
+            let field = |k: &str| opened.as_ref().and_then(|o| o.metadata.get(k)).and_then(serde_json::Value::as_str).map(str::to_owned);
+            let name = match (&opened, held) {
+                (Some(_), _) => field("name").unwrap_or_default(),
                 (None, Some(h)) if def.name.is_empty() && !h.name.is_empty() => h.name.clone(),
+                // Armada shows an unopenable sealed channel by its id's first eight digits.
+                (None, _) if def.name.is_empty() => def.channel_id_hex[..8].to_owned(),
                 _ => def.name.clone(),
+            };
+            let (category_id, rank, view) = if opened.is_some() {
+                (field("category").map(|c| c.to_lowercase()), field("position"), field("view"))
+            } else {
+                (def.category_id.clone(), def.rank.clone(), def.view.clone())
+            };
+            let category = if opened.is_some() {
+                category_id.as_ref().and_then(|c| folded?.categories.get(c)).filter(|c| !c.deleted).map(|c| c.name.clone()).filter(|n| !n.is_empty())
+            } else {
+                def.category.clone()
             };
             out.push(ChannelView {
                 id_hex: def.channel_id_hex.clone(),
                 name,
                 private: def.private,
-                forum: def.forum,
-                category: def.category.clone(),
+                forum: view.as_deref() == Some("forum"),
+                category,
+                category_id,
                 position: def.position,
-                rank: def.rank.clone(),
+                rank,
+                view,
                 streams,
                 writers: folded
                     .and_then(|f| f.writers.get(&def.channel_id_hex))
@@ -321,15 +371,32 @@ impl Membership {
                 private: true,
                 forum: false,
                 category: None,
+                category_id: None,
                 position: None,
                 rank: None,
+                view: None,
                 streams: private_streams(held, &id),
                 writers: Vec::new(),
             });
         }
         let ranked = folded.is_some_and(|f| f.ranked);
+        // On the ranked Roster position keys order Channels WITHIN a Category,
+        // and Categories by their own keys, uncategorized Channels first, as a
+        // Discord sidebar reads; keys restart per Category, so one flat sort by
+        // channel key interleaves them.
+        let category_key = |c: &ChannelView| -> (u8, Option<String>, Option<String>) {
+            let cat = c.category_id.as_ref().and_then(|id| folded.and_then(|f| f.categories.get(id))).filter(|k| !k.deleted);
+            match cat {
+                None => (0, None, None),
+                Some(k) => (if k.position.is_some() { 1 } else { 2 }, k.position.clone(), Some(k.id_hex.clone())),
+            }
+        };
         out.sort_by(|a, b| {
             if ranked {
+                let by_category = category_key(a).cmp(&category_key(b));
+                if by_category != std::cmp::Ordering::Equal {
+                    return by_category;
+                }
                 return match (&a.rank, &b.rank) {
                     (Some(x), Some(y)) => x.cmp(y).then_with(|| a.name.cmp(&b.name)),
                     (Some(_), None) => std::cmp::Ordering::Less,
