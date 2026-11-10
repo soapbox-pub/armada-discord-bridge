@@ -349,6 +349,9 @@ impl SkippedItem {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OwnerSignPurpose {
+    /// The genesis metadata edition (CORD-02 §1): what a joining client
+    /// authenticates the root against (CORD-05 §2).
+    Metadata,
     /// The switch to the ranked Roster (CORD-04 §2): only the owner can make it.
     Everyone,
     AdminRole,
@@ -419,6 +422,13 @@ pub struct ImportCheckpoints {
     pub owner_join_published_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_everyone_published_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_metadata_published_at: Option<u64>,
+    /// The owner-signed genesis metadata edition's hash, which the op's own
+    /// metadata edition (icon, banner) chains from. Absent on imports prepared
+    /// before the owner signed genesis metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_metadata_hash_hex: Option<String>,
     /// Minted on the ranked Roster (CORD-04 §2). Absent on imports prepared
     /// before it, which finish the legacy way they were signed for.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

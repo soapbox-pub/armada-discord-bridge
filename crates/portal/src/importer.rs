@@ -494,8 +494,25 @@ impl Importer {
             concord::roster::ranked_role_to_json(&admin).context("the Admin Role needs a rank key")?,
             &v1,
         );
-        let grant = MemberGrant { member: op.public_key().to_hex(), role_ids: vec![admin_role_id.clone()], control_wrap: None };
+        // The Admin Role is staff, so the Grant owes the op the staff write key
+        // (CORD-04 §3), wrapped under the owner↔op pairwise key. That key is one
+        // ECDH either side computes, so the portal, holding the op's secret,
+        // wraps it here for the owner to sign. The portal already holds the
+        // secret it delivers; without the wrap the Grant breaks a MUST, and a
+        // client reading the plane sees an op that is staff without the key.
+        let control_root = community.control_root.as_deref().and_then(hex32).context("a fresh community holds its control root")?;
+        let control_wrap = concord::rekey::seal_control_wrap(community.root_epoch, &control_root, op.secret_key(), &PublicKey::from_hex(&owner)?)?;
+        let grant = MemberGrant { member: op.public_key().to_hex(), role_ids: vec![admin_role_id.clone()], control_wrap: Some(control_wrap) };
         let grant_rumor = build_grant_edition(&cid, &grant, &v1)?;
+        // Genesis metadata, the owner's (CORD-02 §1). A joining client
+        // authenticates the invite's root by finding the owner's metadata
+        // edition at the community's own coordinate (CORD-05 §2), and Vector
+        // refuses the join without one, so an op-signed metadata edition alone
+        // left every imported community unjoinable from Vector. The icon and
+        // banner aren't rehosted yet; the op's edition adds them on top.
+        let genesis_metadata = Self::genesis_metadata(&community, &plan);
+        let metadata_rumor = build_metadata_edition(&cid, &genesis_metadata, &v1)?;
+        let metadata_hash = marked_edition_hash(&cid, 1, None, metadata_rumor.content.as_bytes(), &hex32(&owner).expect("owner is hex"));
         let registry_rumor = build_registry_edition(&cid, &owner, &[link.public_key().to_hex()], &v1)?;
         let join_rumor = concord::guestbook::join(&owner, now_ms(), None);
         let op_bytes = hex32(&op.public_key().to_hex()).expect("a pubkey is 32 bytes");
@@ -505,6 +522,7 @@ impl Importer {
         let plaintext = |rumor: &concord::rumor::Rumor| EventTemplate { kind: kinds::SEAL_PLAINTEXT, content: rumor.to_json(), tags: vec![], created_at: rumor.created_at };
         let guestbook = community.current_guestbook_stream();
         let templates = vec![
+            OwnerSignTemplate { purpose: OwnerSignPurpose::Metadata, template: plaintext(&metadata_rumor) },
             OwnerSignTemplate { purpose: OwnerSignPurpose::Everyone, template: plaintext(&everyone_rumor) },
             OwnerSignTemplate { purpose: OwnerSignPurpose::AdminRole, template: plaintext(&role_rumor) },
             OwnerSignTemplate { purpose: OwnerSignPurpose::OpGrant, template: plaintext(&grant_rumor) },
@@ -527,6 +545,7 @@ impl Importer {
         cp.admin_role_id_hex = Some(admin_role_id);
         cp.invite_link_signer_pk = Some(link.public_key().to_hex());
         cp.grant_hash_hex = Some(to_hex(&grant_hash));
+        cp.owner_metadata_hash_hex = Some(to_hex(&metadata_hash));
         cp.owner_templates = Some(templates.clone());
 
         let secrets = CommunitySecrets {
@@ -793,6 +812,7 @@ impl Importer {
 
         // 1. The owner-signed authority chain, control plane first.
         let owner_steps = [
+            (OwnerSignPurpose::Metadata, "genesis metadata edition"),
             (OwnerSignPurpose::Everyone, "the switch to ranked roles"),
             (OwnerSignPurpose::AdminRole, "admin role edition"),
             (OwnerSignPurpose::OpGrant, "operator grant edition"),
@@ -805,7 +825,12 @@ impl Importer {
             if purpose == OwnerSignPurpose::Everyone && !cp.ranked {
                 continue;
             }
+            // Nor, before the owner signed genesis metadata, that.
+            if purpose == OwnerSignPurpose::Metadata && cp.owner_metadata_hash_hex.is_none() {
+                continue;
+            }
             let done = match purpose {
+                OwnerSignPurpose::Metadata => cp.owner_metadata_published_at,
                 OwnerSignPurpose::Everyone => cp.owner_everyone_published_at,
                 OwnerSignPurpose::AdminRole => cp.owner_role_published_at,
                 OwnerSignPurpose::OpGrant => cp.owner_grant_published_at,
@@ -821,6 +846,7 @@ impl Importer {
             let cp = &mut plan.checkpoints;
             let at = Some(now_ms());
             match purpose {
+                OwnerSignPurpose::Metadata => cp.owner_metadata_published_at = at,
                 OwnerSignPurpose::Everyone => cp.owner_everyone_published_at = at,
                 OwnerSignPurpose::AdminRole => cp.owner_role_published_at = at,
                 OwnerSignPurpose::OpGrant => cp.owner_grant_published_at = at,
@@ -1031,8 +1057,17 @@ impl Importer {
 
         if plan.checkpoints.metadata_published_at.is_none() {
             let metadata = self.metadata_json(community, &op_pk, plan)?;
-            let e = seal_edition(&build_metadata_edition(&cid, &metadata, &op_v1)?, &control, op)?;
-            self.publish_verified(relays, &e, "community metadata edition").await?;
+            let genesis = plan.checkpoints.owner_metadata_hash_hex.as_deref().and_then(hex32);
+            // On top of the owner's genesis edition when there is one, and only
+            // when it adds something (an icon, a banner, the emoji pack).
+            if genesis.is_none() || metadata != Self::genesis_metadata(community, plan) {
+                let meta = match &genesis {
+                    Some(prev) => EditionMeta { version: 2, prev: Some(prev), ..op_v1 },
+                    None => op_v1,
+                };
+                let e = seal_edition(&build_metadata_edition(&cid, &metadata, &meta)?, &control, op)?;
+                self.publish_verified(relays, &e, "community metadata edition").await?;
+            }
             plan.checkpoints.metadata_published_at = Some(now_ms());
             self.save_plan(import_id, plan).await?;
         }
@@ -1271,12 +1306,19 @@ impl Importer {
     }
 
     /// The community metadata edition's content.
-    fn metadata_json(&self, community: &Membership, op_pk: &str, plan: &ImportPlan) -> anyhow::Result<Value> {
+    /// The metadata the owner signs at genesis: what's known before the op
+    /// has rehosted anything.
+    fn genesis_metadata(community: &Membership, plan: &ImportPlan) -> Value {
         let mut metadata = json!({ "name": plan.community_name });
         if let Some(d) = &plan.guild.description {
             metadata["description"] = json!(d);
         }
         metadata["relays"] = json!(community.relays);
+        metadata
+    }
+
+    fn metadata_json(&self, community: &Membership, op_pk: &str, plan: &ImportPlan) -> anyhow::Result<Value> {
+        let mut metadata = Self::genesis_metadata(community, plan);
         if let Some(icon) = &plan.checkpoints.icon_pointer {
             metadata["icon"] = serde_json::to_value(icon)?;
         }
@@ -1944,6 +1986,25 @@ mod tests {
         }
         assert!(folded.ranked, "the owner's @everyone switched the community at genesis");
         assert_eq!(folded.metadata.as_ref().unwrap().name, "Lynch Park");
+        // Vector authenticates the invite's root by the OWNER's metadata edition
+        // at the community's own coordinate, and refuses the join without one.
+        let cid_hex = joined.membership.community_id.clone();
+        let control_stream = joined.membership.current_control_stream();
+        let owner_genesis = relay.published().iter().filter_map(|w| concord::stream::open_plane_wrap(w, &control_stream, Plane::Control).ok()).filter_map(|o| concord::edition::parse_edition(o).ok()).any(|e| {
+            e.vsk == kinds::VSK_METADATA && to_hex(&e.entity_id) == cid_hex && e.author == owner.public_key().to_hex() && e.version == 1
+        });
+        assert!(owner_genesis, "the owner signed the genesis metadata edition");
+        let head = &folded.head_editions[&cid_hex];
+        assert_eq!((head.version, head.author.as_str()), (2, cp.op_pk_hex.as_deref().unwrap()), "the op's edition, adding the emoji pack, chains onto the owner's");
+        // The op's Grant carries the staff write key, owner↔op pairwise, as
+        // CORD-04 §3 requires of a staff-making Grant.
+        let op_pk = cp.op_pk_hex.clone().unwrap();
+        let wrap = folded.roster.grants.iter().find(|g| g.member == op_pk).and_then(|g| g.control_wrap.clone()).expect("the op Grant carries control_wrap");
+        let conv = concord::derive::conversation_key(owner.secret_key(), &PublicKey::from_hex(&op_pk).unwrap());
+        let plain = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, concord::nip44::decrypt_str(&conv, &wrap).unwrap()).unwrap();
+        let (epoch, root) = concord::rekey::decode_control_wrap(&plain).unwrap();
+        let derived = concord::derive::control_signer_group_key(&root, &joined.membership.id(), epoch).keys.public_key().to_hex();
+        assert_eq!(Some(derived), joined.membership.control_pk.clone(), "the wrapped root derives to the plane's control_pk");
         let names: Vec<String> = member.channels().into_iter().map(|c| c.name).collect();
         // Uncategorized channels lead (the plan sorts them before every category),
         // a voice room keeps its name, and the private one is folded but unreadable
