@@ -384,8 +384,16 @@ impl ConcordClient {
         if f.restricting_ledger(&channel.id_hex).is_some() && !f.manages_channels(author_pk) {
             return Some(PostRefused("the Armada channel is read-only: only its writers can post there"));
         }
-        if f.ranked && f.channel_permissions(author_pk, &channel.id_hex) & perm::SEND_MESSAGES == 0 {
-            return Some(PostRefused("Send Messages is denied to this member in the Armada channel"));
+        if f.ranked {
+            let p = f.channel_permissions(author_pk, &channel.id_hex);
+            // A private channel lets in only those its overwrites name, and a
+            // puppet is named by none: every post would be collapsed.
+            if p & perm::VIEW_CHANNEL == 0 {
+                return Some(PostRefused("the Armada channel is private, and Discord members aren't let into it"));
+            }
+            if p & perm::SEND_MESSAGES == 0 {
+                return Some(PostRefused("Send Messages is denied to this member in the Armada channel"));
+            }
         }
         None
     }

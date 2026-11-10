@@ -384,7 +384,8 @@ function ReviewStep() {
               You're mirroring a private channel. Its key is handed to the bridge's own identity so it can read the room, and
               everything posted there is copied to Discord in plaintext: a gated room on this side is an ordinary Discord
               channel on the other. You can take the bridge out of the channel's permissions in Armada at any time and rotate
-              its key; from then on it can't read the room.
+              its key; from then on it can't read the room. It mirrors one way: Discord members aren't let into the private
+              channel, so what they post there stays on Discord.
             </AlertDescription>
           </Alert>
         )}

@@ -400,6 +400,11 @@ async fn a_read_only_armada_channel_takes_nothing_from_puppets() {
     h.restrict();
     assert_eq!(h.router.on_discord_message(discord_msg(), &h.link).await.unwrap(), None);
     assert!(h.chats().is_empty(), "a puppet post would be held from every Armada reader");
+    // The Discord channel is told once why, not left talking into nothing.
+    assert_eq!(h.router.on_discord_message(discord_msg(), &h.link).await.unwrap(), None);
+    let sent = h.webhooks.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].content.contains("read-only"), "{}", sent[0].content);
     h.router.on_discord_typing(USER, &h.link).await.unwrap();
     assert!(h.published_of_kind(kinds::WRAP_EPHEMERAL).is_empty(), "nor does its typing go out");
 }
@@ -442,6 +447,21 @@ async fn a_read_only_channel_mirrors_only_what_its_ledger_stands_behind() {
     let rumor = Rumor::new(kinds::MESSAGE, "from the owner", owner_tags, &owner, Some(now_ms()), None);
     let from_owner = OpenedChat { ms: rumor.created_at * 1000, rumor, channel_id_hex: h.channel.id_hex.clone(), epoch: 0, writer_epoch: None };
     assert_eq!(h.router.on_concord_chat(&from_owner, &h.link).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_private_armada_channel_on_ranked_roles_takes_nothing_from_puppets() {
+    let h = harness();
+    h.rank();
+    let mut f = (*h.client.folded().unwrap()).clone();
+    f.channels.get_mut(&h.channel.id_hex).unwrap().private = true;
+    h.client.set_folded(f);
+    // No overwrite lets a puppet in, so Armada would collapse its posts. (The
+    // harness holds no private key, so this asks the client directly.)
+    let puppet = h.puppets.get(USER).unwrap();
+    let refused = h.client.post_refusal(&h.channel, &puppet.pk, kinds::MESSAGE).expect("refused");
+    assert!(refused.to_string().contains("private"), "{refused}");
+    assert!(h.client.post_refusal(&h.channel, &puppet.pk, kinds::REACTION).is_none(), "reactions stay at the read address");
 }
 
 #[tokio::test]

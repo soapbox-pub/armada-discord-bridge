@@ -163,6 +163,8 @@ pub struct BridgeRouter {
     published_profiles: Mutex<HashMap<String, String>>,
     /// discord user ids whose puppet published a Guestbook join this run.
     joined_puppets: Mutex<HashSet<String>>,
+    /// Discord channels already told why their posts don't reach Armada.
+    refusals_noticed: Mutex<HashSet<String>>,
     /// direction key -> last forwarded typing signal.
     last_typing: Mutex<HashMap<String, Instant>>,
     /// Serialises inbound rumors; see [`BridgeRouter::on_concord_chat`].
@@ -194,6 +196,7 @@ impl BridgeRouter {
             options,
             published_profiles: Mutex::default(),
             joined_puppets: Mutex::default(),
+            refusals_noticed: Mutex::default(),
             last_typing: Mutex::default(),
             chat_queue: tokio::sync::Mutex::new(()),
             queued: AtomicUsize::new(0),
@@ -247,6 +250,24 @@ impl BridgeRouter {
         }
     }
 
+    /// Say once, in the Discord channel, why its posts aren't reaching Armada.
+    /// Silent refusal let a Discord channel talk into nothing while every
+    /// message looked delivered. Once per channel per process: a restart may
+    /// say it again, which beats never.
+    async fn notice_refusal(&self, link: &ChannelLink, refused: &crate::client::PostRefused) {
+        if !self.refusals_noticed.lock().unwrap_or_else(|e| e.into_inner()).insert(link.discord_channel_id.clone()) {
+            return;
+        }
+        let message = WebhookMessage {
+            username: "Armada Bridge".into(),
+            content: format!("Messages from this channel aren't reaching Armada: {refused}. Armada messages still arrive here."),
+            ..Default::default()
+        };
+        if let Err(error) = self.webhooks.send(link, message).await {
+            tracing::warn!(channel = %link.discord_channel_id, error = %format!("{error:#}"), "couldn't post the one-way notice");
+        }
+    }
+
     fn channel(&self, link: &ChannelLink) -> Option<ChannelView> {
         self.client.channel(&link.concord_channel_id_hex)
     }
@@ -293,6 +314,7 @@ impl BridgeRouter {
         // Checked before any upload, which would be wasted work.
         if let Some(refused) = self.client.post_refusal(&channel, &puppet.pk, kinds::MESSAGE) {
             tracing::debug!(channel = %link.discord_channel_id, reason = %refused, "not bridging to Armada");
+            self.notice_refusal(link, &refused).await;
             return Ok(None);
         }
         let mut tags = vec![proxy_tag(&msg.guild_id, &msg.channel_id, &msg.id)];
