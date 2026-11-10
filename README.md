@@ -36,7 +36,8 @@ never bridged without its community's consent.
   the bridge says so once in the Discord channel. Checked against Vector's own
   fixtures as well as Armada's code.
 - **Private channel keys** from Direct Invites, access-plane deliveries and
-  channel rotations, read at every start.
+  channel rotations, read at every start and followed while running; a
+  converted channel's public-era history stays readable.
 - **Catch-up backfill** after downtime, from a per-channel cursor.
 - **The portal** (`crates/portal`): Discord OAuth, one "bridge a server" flow
   built around a channel map (pair channels, create missing ones on either
@@ -46,11 +47,11 @@ never bridged without its community's consent.
   Roles v2 — roles in Discord's order, `@everyone`, categories, channel
   overwrites and syncs, private channels (sealed, keyed to the owner),
   read-only channels with their Writers ledger, forum and voice rooms — with
-  genesis signed by the owner's own key in their browser, then backfill history.
+  genesis (metadata included, which Vector's join checks) signed by the owner's
+  own key in their browser, then backfill history.
 
-Not yet: severance detection (ban, refounding, dissolution) is partial; a
-private channel's key rotation is followed at the bridge's next start, not
-while it runs; Discord-side commands are parsed from message text rather than
+Not yet: severance detection (ban, refounding, dissolution) is partial, and a
+Refounding's new root is taken only at the next start; Discord-side commands are parsed from message text rather than
 registered as slash commands. And the owner of an imported community does not
 receive its staff write key: Roles v2 left no protocol path for a custodial
 importer to hand it over, so that needs an upstream change.
