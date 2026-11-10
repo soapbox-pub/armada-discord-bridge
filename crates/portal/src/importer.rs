@@ -1935,6 +1935,13 @@ mod tests {
         let joined = bridge::client::resolve_invite(&invite.unwrap(), &relay).await.unwrap();
         let member = ConcordClient::new(joined.membership.clone(), Arc::new(relay.clone()), Keys::generate());
         let folded = member.sync_control().await.unwrap();
+        // `DUMP_IMPORT=path` writes what the import published, for
+        // tools/vectors/check-import.ts to fold with Armada's own code.
+        if let Ok(path) = std::env::var("DUMP_IMPORT") {
+            let events: Vec<Value> = relay.published().iter().map(|e| serde_json::from_str(&e.as_json()).unwrap()).collect();
+            let dump = json!({ "membership": joined.membership, "events": events, "owner_sk": owner.secret_key().to_secret_hex(), "op": cp.op_pk_hex });
+            std::fs::write(path, dump.to_string()).unwrap();
+        }
         assert!(folded.ranked, "the owner's @everyone switched the community at genesis");
         assert_eq!(folded.metadata.as_ref().unwrap().name, "Lynch Park");
         let names: Vec<String> = member.channels().into_iter().map(|c| c.name).collect();
