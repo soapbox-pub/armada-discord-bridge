@@ -31,11 +31,11 @@ use concord::control::{
     build_channel_edition, build_grant_edition, build_metadata_edition, build_registry_edition, build_role_edition, cap_relays,
     seal_edition, with_channel_category, with_channel_position, ImagePointer,
 };
-use concord::derive::grant_locator;
-use concord::edition::{Citation, EditionMeta, edition_hash};
+use concord::derive::{edition_binding, everyone_locator, grant_locator};
+use concord::edition::{Citation, EditionMeta, build_edition_rumor, marked_edition_hash};
 use concord::invite::{InviteBundle, build_bundle_event, build_invite_url, inbox_relays_from, invite_delivery_relays, mint_token, parse_invite_link, stock_relays};
 use concord::kinds::{self, Plane};
-use concord::roles::{MemberGrant, Role, RoleScope, admin_role};
+use concord::roles::{MemberGrant, Role, RoleScope};
 use concord::stream::{StreamKey, WrapOptions, seal_and_wrap, wrap_seal};
 use concord::{hex32, random32, to_hex};
 use deadpool_postgres::Pool;
@@ -48,7 +48,8 @@ use sha2::{Digest, Sha256};
 use crate::discord_rest::{DiscordRest, RestMessage, bot_install_url};
 use crate::history::{Copied, copy_discord_message, newest_messages};
 use crate::import_plan::{
-    EventTemplate, HISTORY_MESSAGE_CAP, ImportPlan, OwnerSignPurpose, OwnerSignTemplate, PlannedChannel, SignedSeal, build_import_plan,
+    ALL_MAPPED, ChannelKind, EventTemplate, HISTORY_MESSAGE_CAP, ImportPlan, OwnerSignPurpose, OwnerSignTemplate, PlannedChannel, PlannedOverwrite,
+    PlannedTarget, SignedSeal, build_import_plan,
 };
 use crate::manager::{BRIDGE_COLUMNS, BridgeManager, BridgeRow};
 use crate::relay_guard::assert_public_relays;
@@ -442,15 +443,25 @@ impl Importer {
         let op = Keys::generate();
         let community = Membership::mint(&plan.community_name, &owner, plan.relays.clone(), now_ms());
         let cid = community.id();
+        let k = self.env.seal_key_hex.clone();
+        let sealed_secret = || anyhow::Ok(hex::encode(seal(&k, &to_hex(&random32()))?));
         for channel in plan.channels.iter_mut() {
             channel.channel_id_hex = channel.selected.then(|| to_hex(&random32()));
-            // A Private Channel is born with an independent key and the Role
-            // that gates it (CORD-03 §1, CORD-04 §2), minted here so a resumed
-            // import republishes the SAME pair instead of forking the channel.
+            // A Private Channel is born with an independent key (CORD-03 §1),
+            // minted here so a resumed import republishes the SAME key instead
+            // of forking the channel.
             if channel.selected && channel.is_private() {
-                channel.access_role_id_hex = Some(to_hex(&random32()));
-                channel.key_sealed = Some(hex::encode(seal(&self.env.seal_key_hex, &to_hex(&random32()))?));
+                channel.key_sealed = Some(sealed_secret()?);
             }
+            // A read-only channel's writer epoch 1 (CORD-03 §1): its address
+            // secret and its certifier, minted once for the same reason.
+            if channel.selected && channel.restricted {
+                channel.writer_sealed = Some(sealed_secret()?);
+                channel.certifier_sealed = Some(sealed_secret()?);
+            }
+        }
+        for category in plan.categories.iter_mut() {
+            category.category_id_hex = Some(to_hex(&random32()));
         }
         for role in plan.roles.iter_mut() {
             role.role_id_hex = Some(to_hex(&random32()));
@@ -459,21 +470,40 @@ impl Importer {
         let link = Keys::generate();
         let admin_role_id = to_hex(&random32());
 
-        // The owner's genesis signatures: Admin role, the op grant, their
-        // invite registry, their guestbook join.
+        // The owner's genesis signatures, every edition MARKED (CORD-04 §1):
+        // the switch to the ranked Roster, which only the owner can make; the
+        // Admin Role; the op Grant; their invite registry; their guestbook join.
         let now = now_ms() / 1000;
-        let v1 = EditionMeta { created_at: Some(now), ..EditionMeta::first(&owner, None) };
-        let role_rumor = build_role_edition(&admin_role(&admin_role_id), &v1)?;
+        let binding = edition_binding(&cid);
+        let v1 = EditionMeta { created_at: Some(now), ..EditionMeta::first(&owner, None) }.marked(&binding);
+        // No Channel stood before the switch, so its legacy list is empty and an
+        // unmarked Channel edition describes nothing here (CORD-04 §2).
+        let everyone_rumor =
+            build_edition_rumor(concord::roster::VSK_RANKED_ROLE, &everyone_locator(&cid), concord::roster::everyone_to_json(plan.everyone_permissions, Some(&[])), &v1);
+        // Every bit an import maps to: on the ranked Roster an op edition may
+        // carry only bits the op holds through Roles above what it touches.
+        let admin = concord::roles::Role {
+            rank: plan.admin_rank.clone().or_else(|| concord::rank::spread(1).pop()),
+            ..concord::roles::Role::new(&admin_role_id, "Admin", 1, ALL_MAPPED, RoleScope::Server)
+        };
+        let role_rumor = build_edition_rumor(
+            concord::roster::VSK_RANKED_ROLE,
+            &hex32(&admin_role_id).expect("minted hex"),
+            concord::roster::ranked_role_to_json(&admin).context("the Admin Role needs a rank key")?,
+            &v1,
+        );
         let grant = MemberGrant { member: op.public_key().to_hex(), role_ids: vec![admin_role_id.clone()], control_wrap: None };
         let grant_rumor = build_grant_edition(&cid, &grant, &v1)?;
         let registry_rumor = build_registry_edition(&cid, &owner, &[link.public_key().to_hex()], &v1)?;
         let join_rumor = concord::guestbook::join(&owner, now_ms(), None);
         let op_bytes = hex32(&op.public_key().to_hex()).expect("a pubkey is 32 bytes");
-        let grant_hash = edition_hash(&grant_locator(&cid, &op_bytes), 1, None, grant_rumor.content.as_bytes());
+        let grant_hash =
+            marked_edition_hash(&grant_locator(&cid, &op_bytes), 1, None, grant_rumor.content.as_bytes(), &hex32(&owner).expect("owner is hex"));
 
         let plaintext = |rumor: &concord::rumor::Rumor| EventTemplate { kind: kinds::SEAL_PLAINTEXT, content: rumor.to_json(), tags: vec![], created_at: rumor.created_at };
         let guestbook = community.current_guestbook_stream();
         let templates = vec![
+            OwnerSignTemplate { purpose: OwnerSignPurpose::Everyone, template: plaintext(&everyone_rumor) },
             OwnerSignTemplate { purpose: OwnerSignPurpose::AdminRole, template: plaintext(&role_rumor) },
             OwnerSignTemplate { purpose: OwnerSignPurpose::OpGrant, template: plaintext(&grant_rumor) },
             OwnerSignTemplate { purpose: OwnerSignPurpose::InviteRegistry, template: plaintext(&registry_rumor) },
@@ -487,6 +517,7 @@ impl Importer {
                 },
             },
         ];
+        plan.checkpoints.ranked = true;
         let cp = &mut plan.checkpoints;
         cp.community_id_hex = Some(community.community_id.clone());
         cp.owner_pk_hex = Some(owner.clone());
@@ -504,7 +535,7 @@ impl Importer {
             control_root: community.control_root.clone(),
         };
         let invite_url = build_invite_url(&self.env.invite_base_url, &link.public_key(), &token, &community.relays)?;
-        let k = &self.env.seal_key_hex;
+        let k = &k;
         self.pool
             .get()
             .await?
@@ -760,6 +791,7 @@ impl Importer {
 
         // 1. The owner-signed authority chain, control plane first.
         let owner_steps = [
+            (OwnerSignPurpose::Everyone, "the switch to ranked roles"),
             (OwnerSignPurpose::AdminRole, "admin role edition"),
             (OwnerSignPurpose::OpGrant, "operator grant edition"),
             (OwnerSignPurpose::InviteRegistry, "invite registry edition"),
@@ -767,7 +799,12 @@ impl Importer {
         ];
         for (purpose, label) in owner_steps {
             let cp = &plan.checkpoints;
+            // A legacy import was never asked to sign the switch.
+            if purpose == OwnerSignPurpose::Everyone && !cp.ranked {
+                continue;
+            }
             let done = match purpose {
+                OwnerSignPurpose::Everyone => cp.owner_everyone_published_at,
                 OwnerSignPurpose::AdminRole => cp.owner_role_published_at,
                 OwnerSignPurpose::OpGrant => cp.owner_grant_published_at,
                 OwnerSignPurpose::InviteRegistry => cp.owner_registry_published_at,
@@ -782,6 +819,7 @@ impl Importer {
             let cp = &mut plan.checkpoints;
             let at = Some(now_ms());
             match purpose {
+                OwnerSignPurpose::Everyone => cp.owner_everyone_published_at = at,
                 OwnerSignPurpose::AdminRole => cp.owner_role_published_at = at,
                 OwnerSignPurpose::OpGrant => cp.owner_grant_published_at = at,
                 OwnerSignPurpose::InviteRegistry => cp.owner_registry_published_at = at,
@@ -797,7 +835,16 @@ impl Importer {
         // not even to revoke the op grant this chain exists to make revocable.
         // The role set is EMPTY on purpose: the owner's authority is position 0
         // and never came from a grant. This edition delivers a key, claims nothing.
-        if plan.checkpoints.owner_control_key_published_at.is_none()
+        //
+        // On the ranked Roster no such Grant can stand: a Grant naming the owner
+        // stands only when the owner signs it, and carries no `control_wrap`
+        // (CORD-04 §3), so publishing one would only put an edition every
+        // reader refuses on the plane. That leaves no protocol path by which a
+        // custodial importer hands the owner the staff key; it needs one
+        // upstream (an owner-signed delivery, or Armada minting the community
+        // itself and granting the op key), not a workaround here.
+        if !plan.checkpoints.ranked
+            && plan.checkpoints.owner_control_key_published_at.is_none()
             && let Some(control_root) = community.control_root.as_deref().and_then(hex32)
         {
             let owner_pk = PublicKey::from_hex(&community.owner)?;
@@ -828,6 +875,11 @@ impl Importer {
             }
             plan.checkpoints.assets_at = Some(now_ms());
             self.save_plan(import_id, plan).await?;
+        }
+
+        if plan.checkpoints.ranked {
+            self.publish_ranked(import_id, community, op, plan, relays).await?;
+            return self.publish_tail(import_id, community, op, plan, relays).await;
         }
 
         // 3. The op key's editions, each citing the grant.
@@ -929,6 +981,313 @@ impl Importer {
             self.save_plan(import_id, plan).await?;
         }
 
+        self.publish_tail(import_id, community, op, plan, relays).await?;
+
+        // 5. The private-channel keys, handed to the OWNER as a Direct Invite
+        // (CORD-05 §6). They cannot ride the public bundle — every joiner reads
+        // it, so a key there gates nothing — and the owner never receives one
+        // otherwise: they join through that same public link. Only the owner;
+        // everyone else's access is a grant of the channel's Role, made from
+        // Armada once real npubs exist.
+        let private: Vec<&PlannedChannel> = plan.channels.iter().filter(|c| c.selected && c.is_private() && c.key_sealed.is_some()).collect();
+        if !private.is_empty() && plan.checkpoints.owner_channel_keys_sent_at.is_none() {
+            let mut keys = self.public_bundle(community, plan)?;
+            keys.channels = private.iter().map(|c| self.bundle_channel(c)).collect::<anyhow::Result<_>>()?;
+            keys.label = Some("Imported from Discord — private channel keys".into());
+            let owner_pk = PublicKey::from_hex(&community.owner)?;
+            let wrap = concord::direct_invite::send(&keys, op, &owner_pk, None)?;
+            // The owner's giftwrap inbox, not the community relays: that is
+            // where their client scans (10050 DM relays, else NIP-65 reads).
+            let lookup = Filter::new().kinds([Kind::Custom(kinds::DM_RELAYS), Kind::Custom(kinds::RELAY_LIST)]).author(owner_pk).limit(4);
+            let inbox = relays.query(vec![lookup]).await.map(|events| inbox_relays_from(&events, &owner_pk)).unwrap_or_default();
+            let delivery = (self.io.relays)(invite_delivery_relays(&inbox));
+            match delivery.publish(&wrap).await {
+                Ok(()) => plan.checkpoints.owner_channel_keys_sent_at = Some(now_ms()),
+                // Non-fatal: the community is published and the channels gated.
+                // The owner's copy is recoverable by re-running the import —
+                // the keys are checkpointed, not re-minted.
+                Err(error) => plan.checkpoints.owner_channel_keys_error = Some(format!("{error:#}")),
+            }
+            self.save_plan(import_id, plan).await?;
+        }
+        Ok(())
+    }
+
+    /// The op key's editions on the ranked Roster (CORD-04 §2), every one
+    /// marked and citing the owner-signed Grant: metadata, Roles in Discord's
+    /// order, Categories, Channels (a Private one born by a Channel rotation and
+    /// sealed, CORD-03 §2), the Discord overwrites and syncs (CORD-04 §8), and a
+    /// Writers ledger for each read-only channel (CORD-03 §1).
+    async fn publish_ranked(&self, import_id: &str, community: &Membership, op: &Keys, plan: &mut ImportPlan, relays: &dyn RelayLike) -> anyhow::Result<()> {
+        let control = community.control_write_stream().context("the portal does not hold this community's control key")?;
+        let cid = community.id();
+        let binding = edition_binding(&cid);
+        let vac = Self::op_vac(community, op, plan)?;
+        let op_pk = op.public_key().to_hex();
+        let op_v1 = EditionMeta::first(&op_pk, Some(&vac)).marked(&binding);
+        let edition = |vsk: &str, eid: &[u8; 32], content: String| seal_edition(&build_edition_rumor(vsk, eid, content, &op_v1), &control, op);
+
+        if plan.checkpoints.metadata_published_at.is_none() {
+            let metadata = self.metadata_json(community, &op_pk, plan)?;
+            let e = seal_edition(&build_metadata_edition(&cid, &metadata, &op_v1)?, &control, op)?;
+            self.publish_verified(relays, &e, "community metadata edition").await?;
+            plan.checkpoints.metadata_published_at = Some(now_ms());
+            self.save_plan(import_id, plan).await?;
+        }
+
+        for i in 0..plan.roles.len() {
+            if plan.roles[i].published_at.is_some() {
+                continue;
+            }
+            let r = &plan.roles[i];
+            let role = Role {
+                rank: r.rank.clone(),
+                color: r.color,
+                display: r.hoist,
+                mentionable: r.mentionable,
+                ..Role::new(&r.role_id_hex.clone().context("role has no id")?, &r.name, r.position, r.permissions, RoleScope::Server)
+            };
+            let content = concord::roster::ranked_role_to_json(&role).context("an imported Role needs a rank key")?;
+            let e = edition(concord::roster::VSK_RANKED_ROLE, &hex32(&role.role_id).context("role id")?, content)?;
+            self.publish_verified(relays, &e, &format!("role edition \"{}\"", role.name)).await?;
+            plan.roles[i].published_at = Some(now_ms());
+            self.save_plan(import_id, plan).await?;
+        }
+
+        for i in 0..plan.categories.len() {
+            if plan.categories[i].published_at.is_some() {
+                continue;
+            }
+            let c = &plan.categories[i];
+            let id = c.category_id_hex.as_deref().and_then(hex32).context("category has no id")?;
+            let e = edition(concord::roster::VSK_CATEGORY, &id, json!({ "name": c.name, "position": c.rank }).to_string())?;
+            self.publish_verified(relays, &e, &format!("category edition \"{}\"", c.name)).await?;
+            plan.categories[i].published_at = Some(now_ms());
+            self.save_plan(import_id, plan).await?;
+        }
+
+        let root = community.root_key();
+        for i in 0..plan.channels.len() {
+            let c = &plan.channels[i];
+            if !c.selected || c.published_at.is_some() {
+                continue;
+            }
+            let channel_hex = c.channel_id_hex.clone().context("selected channel has no id")?;
+            let id = hex32(&channel_hex).context("channel id is malformed")?;
+            let mut meta = serde_json::Map::new();
+            meta.insert("name".into(), json!(c.name));
+            if let Some(rank) = &c.rank {
+                meta.insert("position".into(), json!(rank));
+            }
+            if let Some(category) = self.category_id_of(plan, c) {
+                meta.insert("category".into(), json!(category));
+            }
+            if let Some(topic) = &c.topic {
+                meta.insert("topic".into(), json!(topic));
+            }
+            match c.kind {
+                Some(ChannelKind::Voice) => drop(meta.insert("view".into(), json!("voice"))),
+                Some(ChannelKind::Forum) => drop(meta.insert("view".into(), json!("forum"))),
+                None => {}
+            }
+            let content = if c.is_private() {
+                let key = self.channel_key(c)?;
+                // Born at epoch 1 by a Channel rotation committing to the
+                // community root at epoch 0 (CORD-03 §2): the rotation hands the
+                // owner the key, and the chain it starts is what a later
+                // rotation proves continuity from.
+                if c.rotation_published_at.is_none() {
+                    let rumors = concord::rekey::build_channel_rotation(op, &id, 1, 0, &root, &key, std::slice::from_ref(&community.owner), now_ms(), Some(&vac))?;
+                    let address: StreamKey = (&concord::derive::channel_rekey_group_key(&root, &id, 1)).into();
+                    for rumor in rumors {
+                        let wrap = seal_and_wrap(&rumor, Plane::Rekey, &address, op, WrapOptions::default())?;
+                        self.publish_verified(relays, &wrap, &format!("key rotation for #{}", c.name)).await?;
+                    }
+                    plan.channels[i].rotation_published_at = Some(now_ms());
+                    self.save_plan(import_id, plan).await?;
+                }
+                concord::channel_seal::seal_channel_metadata(&meta, &key, &id, 1, None, Some(&op_pk))?
+            } else {
+                meta.insert("private".into(), json!(false));
+                Value::Object(meta).to_string()
+            };
+            let name = plan.channels[i].name.clone();
+            let e = edition(concord::kinds::VSK_CHANNEL, &id, content)?;
+            self.publish_verified(relays, &e, &format!("channel edition for #{name}")).await?;
+            plan.channels[i].published_at = Some(now_ms());
+            self.save_plan(import_id, plan).await?;
+        }
+
+        // Overwrites, Category first so a synced channel resolves at once.
+        for i in 0..plan.categories.len() {
+            if plan.categories[i].overwrites_published_at.is_some() {
+                continue;
+            }
+            let scope = plan.categories[i].category_id_hex.clone().context("category has no id")?;
+            for o in plan.categories[i].overwrites.clone() {
+                self.publish_overwrite(relays, &control, op, &op_v1, community, plan, &scope, &o).await?;
+            }
+            plan.categories[i].overwrites_published_at = Some(now_ms());
+            self.save_plan(import_id, plan).await?;
+        }
+        for i in 0..plan.channels.len() {
+            let c = &plan.channels[i];
+            if !c.selected {
+                continue;
+            }
+            let scope = c.channel_id_hex.clone().context("selected channel has no id")?;
+            if c.overwrites_published_at.is_none() {
+                for o in c.overwrites.clone() {
+                    self.publish_overwrite(relays, &control, op, &op_v1, community, plan, &scope, &o).await?;
+                }
+                plan.channels[i].overwrites_published_at = Some(now_ms());
+                self.save_plan(import_id, plan).await?;
+            }
+            let c = &plan.channels[i];
+            if c.synced && c.sync_published_at.is_none() {
+                if let Some(category) = self.category_id_of(plan, c) {
+                    let id = hex32(&scope).context("channel id")?;
+                    let e = edition(concord::roster::VSK_SYNC, &concord::derive::sync_locator(&cid, &id), concord::roster::sync_to_json(&scope, Some(&category)))?;
+                    self.publish_verified(relays, &e, &format!("sync of #{}", c.name)).await?;
+                }
+                plan.channels[i].sync_published_at = Some(now_ms());
+                self.save_plan(import_id, plan).await?;
+            }
+        }
+
+        // Read-only channels: without a Writers ledger every reader keeps
+        // taking posts at the read address whatever the overwrites say, so the
+        // importer, a manager here, mints writer epoch 1 itself (CORD-03 §1).
+        for i in 0..plan.channels.len() {
+            let c = &plan.channels[i];
+            if !c.selected || !c.restricted || c.ledger_published_at.is_some() {
+                continue;
+            }
+            self.mint_writers(relays, &control, op, &op_v1, community, plan, i).await?;
+            plan.channels[i].ledger_published_at = Some(now_ms());
+            self.save_plan(import_id, plan).await?;
+        }
+        Ok(())
+    }
+
+    /// Writer epoch 1 for a read-only channel: the ledger edition naming its
+    /// address and certifier, then the writer secret, certified, to the op key
+    /// and the owner, and the certifier to the owner, on the channel's access
+    /// plane. The owner's posts stand anywhere already; holding the epoch's
+    /// keys is what lets them, as a manager, let writers in from Armada.
+    #[allow(clippy::too_many_arguments)]
+    async fn mint_writers(&self, relays: &dyn RelayLike, control: &StreamKey, op: &Keys, op_v1: &EditionMeta<'_>, community: &Membership, plan: &ImportPlan, i: usize) -> anyhow::Result<()> {
+        use concord::delivery::{WriterDelivery, build_writer_deliveries};
+        use concord::writers::{Spell, cert_digest, empty_ledger, ledger_appended, ledger_to_json, sign_writer_cert};
+        let c = &plan.channels[i];
+        let channel_hex = c.channel_id_hex.clone().context("channel has no id")?;
+        let id = hex32(&channel_hex).context("channel id")?;
+        let cid = community.id();
+        let unsealed = |s: &Option<String>| -> anyhow::Result<[u8; 32]> {
+            hex32(&unseal(&self.env.seal_key_hex, &hex::decode(s.as_deref().context("writer secrets were never minted")?)?)?).context("sealed writer secret")
+        };
+        let (writer_secret, certifier) = (unsealed(&c.writer_sealed)?, Keys::new(SecretKey::from_slice(&unsealed(&c.certifier_sealed)?)?));
+        let writer_pk = concord::derive::channel_writer_group_key(&writer_secret, &id, 1).pk_hex();
+        let op_pk = op.public_key().to_hex();
+        let now = now_ms();
+        let spell = Spell::Writer { epoch: 1, pk: writer_pk.clone(), root: community.root_epoch, by: op_pk.clone(), certifier: Some(certifier.public_key().to_hex()) };
+        let ledger = ledger_appended(&empty_ledger(&channel_hex), now, spell).context("a first ledger entry always fits")?;
+        let meta = EditionMeta { created_at: Some(now / 1000), ..*op_v1 };
+        let rumor = build_edition_rumor(concord::roster::VSK_WRITERS, &concord::derive::writers_locator(&cid, &id), ledger_to_json(&ledger), &meta);
+        self.publish_verified(relays, &seal_edition(&rumor, control, op)?, &format!("writers ledger for #{}", c.name)).await?;
+
+        let writers = vec![op_pk.clone(), community.owner.clone()];
+        let certs = writers
+            .iter()
+            .filter_map(|w| Some((w.clone(), sign_writer_cert(certifier.secret_key(), &cert_digest(&cid, &id, 1, &hex32(w)?)))))
+            .collect();
+        let plane: StreamKey = (&community.access_plane(&id)).into();
+        let at = now / 1000;
+        let writer_scope = concord::derive::writer_scope(&id);
+        let mut rumors = build_writer_deliveries(op, &writer_scope, 1, &writer_secret, &writers, at, &WriterDelivery { writer: Some(writer_pk), certs, mint: true })?;
+        let certifier_bytes = certifier.secret_key().to_secret_bytes();
+        rumors.extend(build_writer_deliveries(
+            op,
+            &concord::derive::certifier_scope(&id),
+            1,
+            &certifier_bytes,
+            std::slice::from_ref(&community.owner),
+            at,
+            &WriterDelivery { writer: Some(certifier.public_key().to_hex()), ..Default::default() },
+        )?);
+        for r in rumors {
+            let wrap = seal_and_wrap(&r, Plane::Rekey, &plane, op, WrapOptions::default())?;
+            self.publish_verified(relays, &wrap, &format!("writer keys for #{}", c.name)).await?;
+        }
+        Ok(())
+    }
+
+    /// One planned overwrite as a marked vsk-14 edition at its coordinate.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_overwrite(
+        &self,
+        relays: &dyn RelayLike,
+        control: &StreamKey,
+        op: &Keys,
+        op_v1: &EditionMeta<'_>,
+        community: &Membership,
+        plan: &ImportPlan,
+        scope: &str,
+        o: &PlannedOverwrite,
+    ) -> anyhow::Result<()> {
+        use concord::roles::{Overwrite, OverwriteTarget};
+        let target = match &o.target {
+            PlannedTarget::Everyone => OverwriteTarget::Everyone,
+            PlannedTarget::Role { discord_id } => match plan.roles.iter().find(|r| &r.discord_id == discord_id).and_then(|r| r.role_id_hex.clone()) {
+                Some(id) => OverwriteTarget::Role(id),
+                None => return Ok(()),
+            },
+        };
+        let ow = Overwrite { scope: scope.to_owned(), target, allow: o.allow, deny: o.deny };
+        let eid = concord::roster::overwrite_locator(&community.id(), &ow.scope, &ow.target).context("overwrite coordinate")?;
+        let e = seal_edition(&build_edition_rumor(concord::roster::VSK_ACL, &eid, concord::roster::overwrite_to_json(&ow), op_v1), control, op)?;
+        self.publish_verified(relays, &e, "channel permission edition").await
+    }
+
+    /// The Category id a planned channel files under.
+    fn category_id_of(&self, plan: &ImportPlan, c: &PlannedChannel) -> Option<String> {
+        let discord = c.category_discord_id.as_deref()?;
+        plan.categories.iter().find(|k| k.discord_id == discord)?.category_id_hex.clone()
+    }
+
+    /// A Private Channel's key, unsealed.
+    fn channel_key(&self, c: &PlannedChannel) -> anyhow::Result<[u8; 32]> {
+        let sealed = hex::decode(c.key_sealed.as_deref().context("private channel has no key")?)?;
+        hex32(&unseal(&self.env.seal_key_hex, &sealed)?).context("sealed channel key is malformed")
+    }
+
+    /// The community metadata edition's content.
+    fn metadata_json(&self, community: &Membership, op_pk: &str, plan: &ImportPlan) -> anyhow::Result<Value> {
+        let mut metadata = json!({ "name": plan.community_name });
+        if let Some(d) = &plan.guild.description {
+            metadata["description"] = json!(d);
+        }
+        metadata["relays"] = json!(community.relays);
+        if let Some(icon) = &plan.checkpoints.icon_pointer {
+            metadata["icon"] = serde_json::to_value(icon)?;
+        }
+        if let Some(banner) = &plan.checkpoints.banner_pointer {
+            metadata["banner"] = serde_json::to_value(banner)?;
+        }
+        // A forward-compatible breadcrumb to the guild emoji pack under a
+        // namespace we own; nothing in Armada reads it yet.
+        if !plan.emojis.is_empty() {
+            metadata["custom"] = json!({ DISCORD_IMPORT_METADATA_KEY: { "emojiPack": format!("30030:{op_pk}:discord-import") } });
+        }
+        Ok(metadata)
+    }
+
+    /// What both Rosters' imports end with: the guild emoji pack, the op key's
+    /// join and profile, and the public invite bundle, read back before it is
+    /// checkpointed because wiring resolves it from the relays.
+    async fn publish_tail(&self, import_id: &str, community: &Membership, op: &Keys, plan: &mut ImportPlan, relays: &dyn RelayLike) -> anyhow::Result<()> {
+        let guestbook = community.current_guestbook_stream();
+        let op_pk = op.public_key().to_hex();
         // Guild custom emoji: one kind-30030 NIP-30 pack members can add to
         // their palette, on stable CDN URLs so bridged reactions round-trip
         // back to the native Discord emoji.
@@ -989,33 +1348,6 @@ impl Importer {
             self.save_plan(import_id, plan).await?;
         }
 
-        // 5. The private-channel keys, handed to the OWNER as a Direct Invite
-        // (CORD-05 §6). They cannot ride the public bundle — every joiner reads
-        // it, so a key there gates nothing — and the owner never receives one
-        // otherwise: they join through that same public link. Only the owner;
-        // everyone else's access is a grant of the channel's Role, made from
-        // Armada once real npubs exist.
-        let private: Vec<&PlannedChannel> = plan.channels.iter().filter(|c| c.selected && c.is_private() && c.key_sealed.is_some()).collect();
-        if !private.is_empty() && plan.checkpoints.owner_channel_keys_sent_at.is_none() {
-            let mut keys = bundle.clone();
-            keys.channels = private.iter().map(|c| self.bundle_channel(c)).collect::<anyhow::Result<_>>()?;
-            keys.label = Some("Imported from Discord — private channel keys".into());
-            let owner_pk = PublicKey::from_hex(&community.owner)?;
-            let wrap = concord::direct_invite::send(&keys, op, &owner_pk, None)?;
-            // The owner's giftwrap inbox, not the community relays: that is
-            // where their client scans (10050 DM relays, else NIP-65 reads).
-            let lookup = Filter::new().kinds([Kind::Custom(kinds::DM_RELAYS), Kind::Custom(kinds::RELAY_LIST)]).author(owner_pk).limit(4);
-            let inbox = relays.query(vec![lookup]).await.map(|events| inbox_relays_from(&events, &owner_pk)).unwrap_or_default();
-            let delivery = (self.io.relays)(invite_delivery_relays(&inbox));
-            match delivery.publish(&wrap).await {
-                Ok(()) => plan.checkpoints.owner_channel_keys_sent_at = Some(now_ms()),
-                // Non-fatal: the community is published and the channels gated.
-                // The owner's copy is recoverable by re-running the import —
-                // the keys are checkpointed, not re-minted.
-                Err(error) => plan.checkpoints.owner_channel_keys_error = Some(format!("{error:#}")),
-            }
-            self.save_plan(import_id, plan).await?;
-        }
         Ok(())
     }
 
@@ -1050,14 +1382,30 @@ impl Importer {
         relays.register_auth_keys(stream_keys(&community.control_streams()));
         let vac = Self::op_vac(&community, &op, &plan)?;
         let op_pk = op.public_key().to_hex();
-        let op_v1 = EditionMeta::first(&op_pk, Some(&vac));
+        let binding = edition_binding(&community.id());
+        // Marked on the ranked Roster: an unmarked Channel edition there
+        // describes only a Channel the switch listed (CORD-04 §2).
+        let op_v1 = if plan.checkpoints.ranked { EditionMeta::first(&op_pk, Some(&vac)).marked(&binding) } else { EditionMeta::first(&op_pk, Some(&vac)) };
         let first_position = plan.channels.iter().filter(|c| c.selected).count() as u64;
+        let mut last_rank = plan.channels.iter().filter(|c| c.selected).filter_map(|c| c.rank.clone()).max();
         let mut ids = Vec::new();
         for (i, (name, category)) in channels.iter().enumerate() {
             let id = random32();
             let mut metadata = json!({ "name": name, "private": false });
-            with_channel_position(&mut metadata, Some(first_position + i as u64));
-            with_channel_category(&mut metadata, category.as_deref());
+            if plan.checkpoints.ranked {
+                // Ordered after every imported channel, filed under the Category
+                // of that name when the import made one.
+                let rank = concord::rank::rank_between(last_rank.as_deref(), None).context("no rank key left after the last channel")?;
+                metadata["position"] = json!(rank);
+                last_rank = Some(rank);
+                let wanted = category.as_deref().map(str::trim).filter(|c| !c.is_empty());
+                if let Some(cat) = wanted.and_then(|w| plan.categories.iter().find(|k| k.name == w)).and_then(|k| k.category_id_hex.clone()) {
+                    metadata["category"] = json!(cat);
+                }
+            } else {
+                with_channel_position(&mut metadata, Some(first_position + i as u64));
+                with_channel_category(&mut metadata, category.as_deref());
+            }
             let edition = seal_edition(&build_channel_edition(&id, &metadata, &op_v1)?, &control, &op)?;
             self.publish_verified(relays.as_ref(), &edition, &format!("channel edition for #{name}")).await?;
             ids.push(to_hex(&id));
@@ -1242,6 +1590,12 @@ impl Importer {
     /// Rotation is still not covered: a rekey after a revoke mints an epoch the
     /// bridge does not follow, so it goes quiet on that channel until
     /// re-granted. That is the known bound on this feature.
+    ///
+    /// On the ranked Roster the access list is the Channel's overwrites and
+    /// the key travels on its access plane (CORD-03 §5, CORD-04 §8): a member
+    /// overwrite lets the bridge's npub view and post, and an access delivery
+    /// hands it the key, which it takes at every start. Rotations it follows
+    /// at its next start too.
     async fn admit_bridge_to_private_channel(&self, community: &Membership, op: &Keys, plan: &ImportPlan, i: usize, bridge_pk: &str) -> anyhow::Result<()> {
         let channel = &plan.channels[i];
         let control = community.control_write_stream().context("the portal does not hold this community's control key")?;
@@ -1249,6 +1603,24 @@ impl Importer {
         relays.register_auth_keys(stream_keys(&community.control_streams()));
         let vac = Self::op_vac(community, op, plan)?;
         let op_pk = op.public_key().to_hex();
+        if plan.checkpoints.ranked {
+            use concord::roles::perm;
+            let binding = edition_binding(&community.id());
+            let op_v1 = EditionMeta::first(&op_pk, Some(&vac)).marked(&binding);
+            let scope = channel.channel_id_hex.clone().context("channel has no id")?;
+            let lets_in = perm::VIEW_CHANNEL | perm::SEND_MESSAGES | perm::SEND_IN_THREADS | perm::READ_MESSAGE_HISTORY | perm::ATTACH_FILES | perm::ADD_REACTIONS;
+            let ow = concord::roles::Overwrite { scope: scope.clone(), target: concord::roles::OverwriteTarget::Member(bridge_pk.to_owned()), allow: lets_in, deny: 0 };
+            let eid = concord::roster::overwrite_locator(&community.id(), &ow.scope, &ow.target).context("overwrite coordinate")?;
+            let e = seal_edition(&build_edition_rumor(concord::roster::VSK_ACL, &eid, concord::roster::overwrite_to_json(&ow), &op_v1), &control, op)?;
+            self.publish_verified(relays.as_ref(), &e, &format!("bridge access to #{}", channel.name)).await?;
+            let id = hex32(&scope).context("channel id")?;
+            let plane: StreamKey = (&community.access_plane(&id)).into();
+            for r in concord::delivery::build_access_deliveries(op, &id, 1, &self.channel_key(channel)?, &[bridge_pk.to_owned()], now_ms() / 1000)? {
+                let wrap = seal_and_wrap(&r, Plane::Rekey, &plane, op, WrapOptions::default())?;
+                self.publish_verified(relays.as_ref(), &wrap, &format!("bridge key for #{}", channel.name)).await?;
+            }
+            return Ok(());
+        }
         let grant = MemberGrant { member: bridge_pk.to_owned(), role_ids: vec![channel.access_role_id_hex.clone().context("no access role")?], control_wrap: None };
         let edition = seal_edition(&build_grant_edition(&community.id(), &grant, &EditionMeta::first(&op_pk, Some(&vac)))?, &control, op)?;
         relays.publish(&edition).await?;
@@ -1356,6 +1728,7 @@ mod tests {
     use bridge::client::ConcordClient;
     use bridge::relays::MemoryRelay;
     use concord::roles::perm;
+    use concord::stream::StreamKey;
 
     const SEAL_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -1419,17 +1792,24 @@ mod tests {
             "guild": {
                 "id": guild_id, "name": "Lynch Park", "icon": "abc", "approximate_member_count": 12,
                 "roles": [
-                    { "id": guild_id, "name": "@everyone", "permissions": "0", "color": 0, "hoist": false, "position": 0, "managed": false },
-                    { "id": "11", "name": "Mods", "permissions": "8192", "color": 255, "hoist": true, "position": 2, "managed": false },
+                    // View, send, react, read history.
+                    { "id": guild_id, "name": "@everyone", "permissions": "68672", "color": 0, "hoist": false, "position": 0, "managed": false },
+                    { "id": "11", "name": "Mods", "permissions": "8192", "color": 255, "hoist": true, "position": 2, "managed": false, "mentionable": true },
                 ],
                 "emojis": [{ "id": "77", "name": "blob" }],
             },
             "channels": [
-                { "id": format!("{p}20"), "name": "Talk", "type": 4, "position": 0 },
-                { "id": format!("{p}21"), "name": "general", "type": 0, "position": 0, "parent_id": format!("{p}20"), "topic": "hi" },
+                // The category denies @everyone reactions; #general follows it, so it imports synced.
+                { "id": format!("{p}20"), "name": "Talk", "type": 4, "position": 0,
+                  "permission_overwrites": [{ "id": guild_id, "type": 0, "allow": "0", "deny": "64" }] },
+                { "id": format!("{p}21"), "name": "general", "type": 0, "position": 0, "parent_id": format!("{p}20"), "topic": "hi",
+                  "permission_overwrites": [{ "id": guild_id, "type": 0, "allow": "0", "deny": "64" }] },
                 { "id": format!("{p}22"), "name": "mods", "type": 0, "position": 1, "parent_id": format!("{p}20"),
-                  "permission_overwrites": [{ "id": guild_id, "type": 0, "allow": "0", "deny": "1024" }] },
+                  "permission_overwrites": [{ "id": guild_id, "type": 0, "allow": "0", "deny": "1024" }, { "id": "11", "type": 0, "allow": "1024", "deny": "0" }] },
                 { "id": format!("{p}23"), "name": "Lounge", "type": 2, "position": 2 },
+                // Only staff post announcements.
+                { "id": format!("{p}24"), "name": "news", "type": 5, "position": 3,
+                  "permission_overwrites": [{ "id": guild_id, "type": 0, "allow": "0", "deny": "2048" }] },
             ],
         }))
         .unwrap()
@@ -1511,43 +1891,103 @@ mod tests {
         let (row, invite) = importer.get(&import_id, &owner_discord).await.unwrap().unwrap();
         let cp = &row.plan.checkpoints;
         assert!(cp.assets_error.is_some(), "an unreachable CDN costs the icon, not the import");
-        assert!(cp.owner_channel_keys_sent_at.is_some());
+        assert!(cp.ranked);
 
-        // A member joining through the minted invite sees what the plan promised.
+        // A member joining through the minted invite sees what the plan promised,
+        // on the ranked Roster (CORD-04 §2).
         let joined = bridge::client::resolve_invite(&invite.unwrap(), &relay).await.unwrap();
         let member = ConcordClient::new(joined.membership.clone(), Arc::new(relay.clone()), Keys::generate());
         let folded = member.sync_control().await.unwrap();
+        assert!(folded.ranked, "the owner's @everyone switched the community at genesis");
         assert_eq!(folded.metadata.as_ref().unwrap().name, "Lynch Park");
         let names: Vec<String> = member.channels().into_iter().map(|c| c.name).collect();
         // Uncategorized channels lead (the plan sorts them before every category),
-        // and the private one is folded but unreadable without its key.
-        assert_eq!(names, ["Lounge-voice", "general"]);
-        let mods = folded.channels.values().find(|c| c.name == "mods").unwrap();
-        assert!(mods.private);
-        assert_eq!(mods.category.as_deref(), Some("Talk"));
-        let general = folded.channels.values().find(|c| c.name == "general").unwrap();
-        assert_eq!(general.raw["custom"]["discord.import"]["topic"], "hi");
+        // a voice room keeps its name, and the private one is folded but unreadable
+        // without its key.
+        assert_eq!(names, ["Lounge", "news", "general"]);
+        let by_name = |n: &str| folded.channels.values().find(|c| c.name == n).unwrap().clone();
+        let (general, news, lounge) = (by_name("general"), by_name("news"), by_name("Lounge"));
+        assert_eq!((general.topic.as_deref(), general.category.as_deref()), (Some("hi"), Some("Talk")));
+        assert_eq!(lounge.view.as_deref(), Some("voice"));
         let op = cp.op_pk_hex.clone().unwrap();
-        assert!(folded.roster.has(&op, perm::ADMIN_ALL), "op holds the owner-granted Admin");
-        assert!(folded.roster.roles.iter().any(|r| r.name == "Mods" && r.permissions == perm::MANAGE_MESSAGES));
+        assert!(folded.roster.has(&op, ALL_MAPPED), "op holds the owner-granted Admin");
+        let mods_role = folded.roster.roles.iter().find(|r| r.name == "Mods").unwrap();
+        assert_eq!(mods_role.permissions, perm::MANAGE_MESSAGES | perm::PIN_MESSAGES);
+        assert!(mods_role.display && mods_role.mentionable);
         assert!(folded.is_public(), "the owner's invite registry is live");
 
-        // The owner can open the staff key the op key handed them.
-        let owner_grant = folded.roster.grants.iter().find(|g| g.member == owner.public_key().to_hex()).unwrap();
-        let conv = concord::derive::conversation_key(owner.secret_key(), &PublicKey::from_hex(&op).unwrap());
-        let plain = concord::nip44::decrypt_str(&conv, owner_grant.control_wrap.as_ref().unwrap()).unwrap();
-        let (epoch, control_root) = concord::rekey::decode_control_wrap(&base64::Engine::decode(&base64::engine::general_purpose::STANDARD, plain).unwrap()).unwrap();
-        let derived = concord::derive::control_signer_group_key(&control_root, &joined.membership.id(), epoch);
-        assert_eq!(Some(derived.pk_hex()), joined.membership.control_pk);
+        // #general follows the Category's overwrites: no reactions for @everyone.
+        let talk = folded.categories.values().find(|c| c.name == "Talk").unwrap();
+        assert_eq!(folded.roster.syncs.get(&general.channel_id_hex), Some(&talk.id_hex));
+        let someone = Keys::generate().public_key().to_hex();
+        let in_general = folded.channel_permissions(&someone, &general.channel_id_hex);
+        assert_eq!((in_general & perm::ADD_REACTIONS, in_general & perm::SEND_MESSAGES), (0, perm::SEND_MESSAGES));
 
-        // And the private channel's key reached them, and only them.
-        let keys = relay
+        // #news is read-only: restricted by a Writers ledger the importer minted,
+        // whose writer key and certificate reached the owner.
+        let ledger = folded.restricting_ledger(&news.channel_id_hex).expect("a Writers ledger restricts #news");
+        let window = concord::writers::current_writer(ledger).unwrap();
+        assert_eq!(folded.channel_permissions(&someone, &news.channel_id_hex) & perm::SEND_MESSAGES, 0);
+        let news_id = hex32(&news.channel_id_hex).unwrap();
+        let plane: StreamKey = (&joined.membership.access_plane(&news_id)).into();
+        let writer_scope = to_hex(&concord::derive::writer_scope(&news_id));
+        let delivery = relay
             .published()
             .iter()
-            .filter_map(|e| concord::direct_invite::unwrap(e, &owner))
-            .find(|d| !d.bundle.channels.is_empty())
-            .expect("the owner's Direct Invite");
-        assert_eq!(keys.bundle.channels[0].name, "mods");
+            .filter(|e| e.pubkey == plane.pk)
+            .filter_map(|e| concord::delivery::parse_delivery(&concord::stream::open_plane_wrap(e, &plane, Plane::Rekey).ok()?))
+            .find(|d| d.scope_hex == writer_scope)
+            .expect("the writer epoch's delivery");
+        let owner_hex = owner.public_key().to_hex();
+        let cert = &delivery.certs.iter().find(|(w, _)| *w == owner_hex).unwrap().1;
+        assert!(concord::writers::verify_writer_cert(
+            window.certifier.as_deref().unwrap(),
+            &concord::writers::cert_digest(&joined.membership.id(), &news_id, 1, &owner.public_key().to_bytes()),
+            cert
+        ));
+        let locator = concord::rekey::my_locator(&delivery.deliverer, &owner_hex, &writer_scope, 1).unwrap();
+        let blob = delivery.blobs.iter().find(|b| b.locator == locator).unwrap();
+        let plain = concord::rekey::open_blob(blob, owner.secret_key(), &PublicKey::from_hex(&op).unwrap()).unwrap();
+        let secret = concord::rekey::decode_channel_blob(&plain, &concord::derive::writer_scope(&news_id), 1).unwrap();
+        assert_eq!(concord::derive::channel_writer_group_key(&secret, &news_id, 1).pk_hex(), window.pk);
+
+        // #mods is private and sealed: born at epoch 1 by a rotation whose blob
+        // hands the owner the key that opens the seal.
+        let mods = folded.channels.values().find(|c| c.private).unwrap();
+        let sealed = mods.sealed.as_ref().expect("its metadata is sealed");
+        let mods_id = hex32(&mods.channel_id_hex).unwrap();
+        let address: StreamKey = (&concord::derive::channel_rekey_group_key(&joined.membership.root_key(), &mods_id, 1)).into();
+        let rotation = relay
+            .published()
+            .iter()
+            .filter(|e| e.pubkey == address.pk)
+            .find_map(|e| concord::rekey::parse_rekey(&concord::stream::open_plane_wrap(e, &address, Plane::Rekey).ok()?).ok())
+            .expect("the birth rotation");
+        assert_eq!((rotation.new_epoch, rotation.prev_epoch), (1, 0));
+        let set = &concord::rekey::group_rotations(vec![rotation])[0];
+        assert_eq!(set.continues_from(0, &joined.membership.root_key()), concord::rekey::Continuity::Ok);
+        let locator = concord::rekey::my_locator(&set.rotator, &owner_hex, &mods.channel_id_hex, 1).unwrap();
+        let plain = concord::rekey::open_blob(set.find_blob(&locator).unwrap(), owner.secret_key(), &PublicKey::from_hex(&op).unwrap()).unwrap();
+        let key = concord::rekey::decode_channel_blob(&plain, &mods_id, 1).unwrap();
+        let opened = concord::channel_seal::open_channel_seal(sealed, &key, &mods_id).unwrap();
+        assert_eq!((opened.metadata["name"].as_str(), opened.metadata["category"].as_str()), (Some("mods"), Some(talk.id_hex.as_str())));
+        // Only the Mods Role and the bridge (ticked for mirroring) may view it.
+        let mods_ow: Vec<_> = folded.roster.overwrites.iter().filter(|o| o.scope == mods.channel_id_hex).collect();
+        assert!(mods_ow.iter().any(|o| o.target == concord::roles::OverwriteTarget::Role(mods_role.role_id.clone()) && o.allow & perm::VIEW_CHANNEL != 0));
+        assert_eq!(folded.channel_permissions(&someone, &mods.channel_id_hex), 0);
+        let bridge_pk: String = pool
+            .get()
+            .await
+            .unwrap()
+            .query_one("SELECT primary_pk FROM bridges WHERE discord_channel_id = $1", &[&format!("{p}22")])
+            .await
+            .unwrap()
+            .get(0);
+        assert_ne!(folded.channel_permissions(&bridge_pk, &mods.channel_id_hex) & perm::VIEW_CHANNEL, 0, "the bridge is let in by a member overwrite");
+
+        // No Grant can hand the owner the staff key on the ranked Roster
+        // (CORD-04 §3), so none is published; see publish_editions.
+        assert!(folded.roster.grants.iter().all(|g| g.member != owner_hex));
 
         // Both text channels were wired; the private one only because it was ticked.
         let bridges = pool

@@ -41,9 +41,11 @@ export interface ImportChannel {
   name: string;
   topic?: string;
   category?: string;
-  kind?: "voice";
+  kind?: "voice" | "forum";
   /** Gated on Discord; imports as a key-gated private channel. */
   private?: boolean;
+  /** @everyone can't post on Discord; imports read-only, with posting by its writers alone. */
+  restricted?: boolean;
   bridgeable: boolean;
   /** The bot lacks Manage Webhooks here, so a live bridge could not post into Discord. */
   botMissingWebhook?: boolean;

@@ -1,4 +1,4 @@
-import { AlertTriangle, Check, ExternalLink, Hash, Loader2, Lock, Plus, RefreshCw, ShieldAlert, Volume2, X } from "lucide-react";
+import { AlertTriangle, Check, ExternalLink, Hash, Loader2, Lock, MessagesSquare, Plus, RefreshCw, ShieldAlert, Volume2, X } from "lucide-react";
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { Navigate, Route, Routes, useNavigate, useSearchParams } from "react-router-dom";
 import type { NostrEvent } from "nostr-tools/pure";
@@ -355,8 +355,14 @@ function ReviewStep() {
           {plan.channels.some((c) => c.private) && (
             <p className="text-xs text-muted-foreground">
               <Lock className="mr-1 inline size-3" />
-              Gated channels import as private: key-gated, and invisible to members without the role. Only you get the key
-              at first; you share it from Armada.
+              Gated channels import as private: key-gated, and visible only to the roles Discord let in. You hold the key;
+              Armada hands it on to members as you give them those roles.
+            </p>
+          )}
+          {selected.some((c) => c.restricted && c.bridge) && (
+            <p className="text-xs text-muted-foreground">
+              Read-only channels stay read-only: only their writers can post there, so they bridge from Armada to Discord
+              only.
             </p>
           )}
         </Section>
@@ -377,8 +383,8 @@ function ReviewStep() {
             <AlertDescription className="text-xs leading-relaxed">
               You're mirroring a private channel. Its key is handed to the bridge's own identity so it can read the room, and
               everything posted there is copied to Discord in plaintext: a gated room on this side is an ordinary Discord
-              channel on the other. You can revoke the bridge's access from the channel's role in Armada at any time; doing so
-              rotates the key, and the bridge stays silent on that channel until you re-grant it.
+              channel on the other. You can take the bridge out of the channel's permissions in Armada at any time and rotate
+              its key; from then on it can't read the room.
             </AlertDescription>
           </Alert>
         )}
@@ -523,14 +529,15 @@ function Section({ title, hint, action, children }: { title: string; hint?: stri
 }
 
 function ChannelRow({ channel: c, onToggle }: { channel: ImportChannel; onToggle: (f: "selected" | "bridge" | "history") => void }) {
-  const Icon = c.private ? Lock : c.kind === "voice" ? Volume2 : Hash;
+  const Icon = c.private ? Lock : c.kind === "voice" ? Volume2 : c.kind === "forum" ? MessagesSquare : Hash;
   return (
     <div className={cn("flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-secondary/50", !c.selected && "opacity-60")}>
       <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2">
         <Checkbox checked={c.selected} onCheckedChange={() => onToggle("selected")} />
         <Icon className="size-3.5 shrink-0 text-muted-foreground" />
         <span className="truncate text-sm">{c.name}</span>
-        {c.kind === "voice" && <span className="shrink-0 text-2xs text-muted-foreground">voice</span>}
+        {c.kind && <span className="shrink-0 text-2xs text-muted-foreground">{c.kind}</span>}
+        {c.restricted && <span className="shrink-0 text-2xs text-muted-foreground">read-only</span>}
         {c.bridge && c.botMissingWebhook && (
           <span title="The bot lacks Manage Webhooks here" className="shrink-0">
             <AlertTriangle className="size-3.5 text-warning" />
