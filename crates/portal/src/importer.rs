@@ -478,8 +478,10 @@ impl Importer {
         let v1 = EditionMeta { created_at: Some(now), ..EditionMeta::first(&owner, None) }.marked(&binding);
         // No Channel stood before the switch, so its legacy list is empty and an
         // unmarked Channel edition describes nothing here (CORD-04 §2).
+        // Masked again here: a plan stored before the mask existed still
+        // carries Discord's Create Invite (see `everyone_bits`).
         let everyone_rumor =
-            build_edition_rumor(concord::roster::VSK_RANKED_ROLE, &everyone_locator(&cid), concord::roster::everyone_to_json(plan.everyone_permissions, Some(&[])), &v1);
+            build_edition_rumor(concord::roster::VSK_RANKED_ROLE, &everyone_locator(&cid), concord::roster::everyone_to_json(plan.everyone_permissions & !concord::roles::perm::STAFF, Some(&[])), &v1);
         // Every bit an import maps to: on the ranked Roster an op edition may
         // carry only bits the op holds through Roles above what it touches.
         let admin = concord::roles::Role {
@@ -1799,8 +1801,8 @@ mod tests {
             "guild": {
                 "id": guild_id, "name": "Lynch Park", "icon": "abc", "approximate_member_count": 12,
                 "roles": [
-                    // View, send, react, read history.
-                    { "id": guild_id, "name": "@everyone", "permissions": "68672", "color": 0, "hoist": false, "position": 0, "managed": false },
+                    // Discord's default: create invite, view, send, react, read history.
+                    { "id": guild_id, "name": "@everyone", "permissions": "68673", "color": 0, "hoist": false, "position": 0, "managed": false },
                     { "id": "11", "name": "Mods", "permissions": "8192", "color": 255, "hoist": true, "position": 2, "managed": false, "mentionable": true },
                 ],
                 "emojis": [{ "id": "77", "name": "blob" }],
@@ -1922,6 +1924,8 @@ mod tests {
         assert_eq!(mods_role.permissions, perm::MANAGE_MESSAGES | perm::PIN_MESSAGES);
         assert!(mods_role.display && mods_role.mentionable);
         assert!(folded.is_public(), "the owner's invite registry is live");
+        let someone_else = Keys::generate().public_key().to_hex();
+        assert!(!folded.roster.is_staff(&someone_else, &owner.public_key().to_hex()), "@everyone carries no staff bit");
 
         // #general follows the Category's overwrites: no reactions for @everyone.
         let talk = folded.categories.values().find(|c| c.name == "Talk").unwrap();

@@ -97,6 +97,17 @@ pub const ALL_MAPPED: u64 = {
     bits | perm::ADMIN_ALL
 };
 
+/// What Discord's `@everyone` becomes. Staff bits are cut: on Concord a staff
+/// bit on `@everyone` makes every member staff (CORD-04 §3), owed the staff
+/// write key and exempt from a pause. Discord's DEFAULT `@everyone` carries
+/// Create Invite, which maps to the staff bit CREATE_INVITE, so without the
+/// mask nearly every import would hand every member the Control Plane. Only
+/// Roles may carry staff bits; an owner who wants otherwise can say so in
+/// Armada, knowingly.
+pub fn everyone_bits(discord_bits: u64) -> u64 {
+    map_bits(discord_bits) & !perm::STAFF
+}
+
 /// Map Discord permission bits to Concord's, with no reporting.
 pub fn map_bits(discord_bits: u64) -> u64 {
     if discord_bits & d::ADMINISTRATOR != 0 {
@@ -808,7 +819,7 @@ pub fn build_import_plan(snapshot: &GuildSnapshot) -> ImportPlan {
     let mut skipped = Vec::new();
     let roles = plan_roles(snapshot, &mut skipped);
     let everyone_discord = snapshot.guild.roles.iter().find(|r| r.id == snapshot.guild.id).map_or(0, |r| bits(&r.permissions));
-    let everyone_permissions = map_bits(everyone_discord);
+    let everyone_permissions = everyone_bits(everyone_discord);
     let (mut channels, categories) = plan_channels(snapshot, &roles, everyone_permissions, &mut skipped);
 
     let member_count = snapshot.guild.approximate_member_count;
@@ -1003,7 +1014,8 @@ mod tests {
             ],
             vec![role("2", "Staff", 1)],
         );
-        snap.guild.roles[0].permissions = ((1u64 << 10) | (1u64 << 11)).to_string();
+        // Discord's default @everyone carries Create Invite, a staff bit on Concord.
+        snap.guild.roles[0].permissions = ((1u64 << 0) | (1u64 << 10) | (1u64 << 11)).to_string();
         let plan = build_import_plan(&snap);
         assert_eq!(plan.everyone_permissions, perm::VIEW_CHANNEL | perm::SEND_MESSAGES);
         assert_eq!(plan.categories.len(), 1);
