@@ -16,15 +16,22 @@
 //! bridge needs no key custody of its own. The bound: a relay that has dropped
 //! the wrap takes the key with it, and re-granting from Armada re-delivers.
 //!
-//! Rotation is NOT handled here. A rekey (CORD-06) delivers a new channel epoch
-//! at the rekey addresses, which nothing subscribes to yet: after a
-//! revoke-driven rotation the bridge keeps a superseded key and goes quiet on
-//! that channel until it is re-invited.
+//! On a Community on the ranked Roster (CORD-04 §2) keys travel differently: a
+//! member an overwrite lets into a Private Channel is handed its key on the
+//! Channel's access plane (CORD-03 §5), and a Private Channel is born, and
+//! re-keyed after a ban, by a Channel rotation at its rekey address (CORD-06).
+//! [`intake_access_keys`] reads both. Like a Direct Invite, each is a durable
+//! relay event addressed to us, so a scan at every start recovers them and
+//! nothing is persisted.
 
 use std::collections::HashMap;
 
 use concord::community::Membership;
-use concord::kinds;
+use concord::control::FoldedControl;
+use concord::delivery::{access_delivery_admits, access_key_refuted, open_access_key, parse_delivery};
+use concord::kinds::{self, Plane};
+use concord::rekey::{group_rotations, parse_rekey};
+use concord::stream::{StreamKey, open_plane_wrap};
 use nostr::prelude::*;
 
 use crate::relays::RelayLike;
@@ -106,5 +113,80 @@ pub async fn intake_direct_invite_keys(
         }
     }
     next.relays = community.relays.clone();
+    KeyIntake { community: next, learned }
+}
+
+/// Take the Private Channel keys the ranked Roster hands this identity: access
+/// deliveries on each Private Channel's access plane, then the Channel
+/// rotations that carry the keys it holds forward (CORD-03 §5, CORD-06).
+///
+/// A delivered key is taken only as Armada takes one: this identity's fold
+/// lets it view the Channel, the deliverer holds the Channel and isn't banned,
+/// the epoch is the sealed head's or the next (the next only from the owner or
+/// a manager), and at the sealed head's epoch the key must open the seal. The
+/// seal is what authenticates a key; without these checks anyone who can
+/// reach the plane could hand the bridge a key of their own and read
+/// everything it mirrors.
+pub async fn intake_access_keys(relays: &dyn RelayLike, identity: &Keys, community: &Membership, folded: &FoldedControl) -> KeyIntake {
+    let me = identity.public_key().to_hex();
+    let mut next = community.clone();
+    let mut learned: Vec<String> = Vec::new();
+    if folded.ranked {
+        let wanted: Vec<(String, StreamKey)> = folded
+            .channels
+            .values()
+            .filter(|c| c.private && !c.deleted)
+            .filter(|c| folded.roster.channel_permissions(&folded.owner, &me, &c.channel_id_hex, true) & concord::roles::perm::VIEW_CHANNEL != 0)
+            .filter_map(|c| Some((c.channel_id_hex.clone(), (&community.access_plane(&concord::hex32(&c.channel_id_hex)?)).into())))
+            .collect();
+        if !wanted.is_empty() {
+            let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).authors(wanted.iter().map(|(_, s)| s.pk).collect::<Vec<_>>()).limit(SCAN_LIMIT);
+            let mut wraps = relays.query_settled(vec![filter]).await.unwrap_or_default();
+            wraps.sort_by_key(|w| w.created_at);
+            for wrap in &wraps {
+                let Some((channel_hex, plane)) = wanted.iter().find(|(_, s)| s.pk == wrap.pubkey) else { continue };
+                let Some(d) = open_plane_wrap(wrap, plane, Plane::Rekey).ok().and_then(|o| parse_delivery(&o)) else { continue };
+                if d.form != "access" || d.scope_hex != *channel_hex {
+                    continue;
+                }
+                let sealed = folded.channels.get(channel_hex).and_then(|c| c.sealed.as_ref());
+                if !access_delivery_admits(folded, sealed, channel_hex, &me, &d.deliverer, d.new_epoch) {
+                    continue;
+                }
+                let Some(id) = concord::hex32(channel_hex) else { continue };
+                let Some((epoch, key)) = open_access_key(&d, identity, &id) else { continue };
+                if access_key_refuted(sealed, &id, epoch, &key) {
+                    tracing::warn!(channel = %&channel_hex[..8], deliverer = %&d.deliverer[..8], "refusing a delivered key that doesn't open the channel's seal");
+                    continue;
+                }
+                if next.adopt_channel_key(channel_hex, epoch, &key) && !learned.contains(channel_hex) {
+                    learned.push(channel_hex.clone());
+                }
+            }
+        }
+    }
+    // Rotations carry every held key forward: a birth at epoch 1, or the
+    // re-key a ban or revoke triggers, which would otherwise leave the bridge
+    // on a superseded key, silent.
+    let addresses = next.channel_rekey_addresses();
+    if !addresses.is_empty() {
+        let streams: Vec<StreamKey> = addresses.iter().map(|(g, _, _)| g.into()).collect();
+        let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).authors(streams.iter().map(|s| s.pk).collect::<Vec<_>>()).limit(SCAN_LIMIT);
+        let wraps = relays.query_settled(vec![filter]).await.unwrap_or_default();
+        let parsed = wraps
+            .iter()
+            .filter_map(|w| {
+                let stream = streams.iter().find(|s| s.pk == w.pubkey)?;
+                parse_rekey(&open_plane_wrap(w, stream, Plane::Rekey).ok()?).ok()
+            })
+            .collect();
+        for (id, epoch) in next.apply_channel_rotations(&group_rotations(parsed), folded, identity) {
+            match epoch {
+                Some(_) if !learned.contains(&id) => learned.push(id),
+                Some(_) => {}
+                None => tracing::warn!(channel = %&id[..8], "a channel rotation cut this bridge out"),
+            }
+        }
+    }
     KeyIntake { community: next, learned }
 }

@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use bridge::client::{BotCommand, BotCommandArg, ConcordClient, OpenedChat, SendChat, now_ms, resolve_invite};
 use bridge::community::{Attachment, CommunityRuntime};
 use bridge::discord::{CommandMessage, DiscordAdapter, DiscordEvents, TypingEvent};
-use bridge::key_intake::intake_direct_invite_keys;
+use bridge::key_intake::{intake_access_keys, intake_direct_invite_keys};
 use bridge::profiles::Kind0ProfileResolver;
 use bridge::puppets::PuppetCache;
 use bridge::relays::{Hub, RelayLike, Relays};
@@ -746,6 +746,12 @@ impl BridgeManager {
                 folded.roster.is_authorized(pk, &owner, perm::MANAGE_CHANNELS)
             })
             .await)
+        })
+        .await?;
+        // The ranked Roster's deliveries and rotations, on top of what Direct
+        // Invites carried.
+        let intake = stage("reading channel key deliveries", STAGE_RELAY, async {
+            Ok(intake_access_keys(relays, &primary, &intake.community, &folded).await)
         })
         .await?;
         // This bridge's keys only: see bridge::community on why they are never pooled.

@@ -238,3 +238,78 @@ fn guestbook_wraps_open_under_the_guestbook_stream_only() {
     assert!(open_plane_wrap(&wrap, &gb, Plane::Guestbook).is_ok());
     assert!(open_plane_wrap(&wrap, &w.community.current_control_stream(), Plane::Control).is_err());
 }
+
+// ── Ranked Roster key intake (CORD-03 §5, CORD-06) ─────────────────────────
+
+/// A fold on the ranked Roster with one sealed Private Channel at epoch 1,
+/// opened to `viewer` by a member overwrite.
+fn ranked_fold(w: &World, id: [u8; 32], key: [u8; 32], viewer: &Keys) -> concord::control::FoldedControl {
+    use concord::roles::{Overwrite, OverwriteTarget, perm};
+    let owner = w.owner.public_key().to_hex();
+    let mut meta = serde_json::Map::new();
+    meta.insert("name".into(), json!("mods"));
+    let content = concord::channel_seal::seal_channel_metadata(&meta, &key, &id, 1, None, Some(&owner)).unwrap();
+    let (raw, sealed) = concord::control::read_channel_content(&content).unwrap();
+    let mut f = concord::control::FoldedControl { owner: owner.clone(), ranked: true, ..Default::default() };
+    f.roster.everyone = Some(perm::EVERYONE_DEFAULT);
+    f.roster.overwrites.push(Overwrite { scope: hex::encode(id), target: OverwriteTarget::Member(viewer.public_key().to_hex()), allow: perm::VIEW_CHANNEL, deny: 0 });
+    f.channels.insert(
+        hex::encode(id),
+        concord::control::FoldedChannel { channel_id_hex: hex::encode(id), private: true, sealed, raw: serde_json::Value::Object(raw), ..Default::default() },
+    );
+    f
+}
+
+impl World {
+    fn deliver(&self, from: &Keys, to: &Keys, id: [u8; 32], epoch: u64, key: [u8; 32]) {
+        let rumors = concord::delivery::build_access_deliveries(from, &id, epoch, &key, &[to.public_key().to_hex()], now_ms() / 1000).unwrap();
+        let plane: StreamKey = (&self.community.access_plane(&id)).into();
+        for r in rumors {
+            self.relay.inject(seal_and_wrap(&r, Plane::Rekey, &plane, from, Default::default()).unwrap());
+        }
+    }
+}
+
+#[tokio::test]
+async fn takes_a_channel_key_from_an_access_delivery_and_follows_its_rotation() {
+    let w = world();
+    let bridge = Keys::generate();
+    let (id, key) = ([0x31; 32], [0x32; 32]);
+    let folded = ranked_fold(&w, id, key, &bridge);
+
+    // A stranger's delivery of a key of their own is refused; the owner's is taken.
+    let stranger = Keys::generate();
+    w.deliver(&stranger, &bridge, id, 1, [0x66; 32]);
+    let intake = bridge::key_intake::intake_access_keys(&w.relay, &bridge, &w.community, &folded).await;
+    assert!(intake.learned.is_empty(), "a delivery from someone who doesn't hold the channel");
+    w.deliver(&w.owner, &bridge, id, 1, key);
+    let intake = bridge::key_intake::intake_access_keys(&w.relay, &bridge, &w.community, &folded).await;
+    assert_eq!(intake.learned, [hex::encode(id)]);
+    let held = intake.community.private_channels.iter().find(|c| c.id == hex::encode(id)).unwrap();
+    assert_eq!((held.key.as_str(), held.epoch), (hex::encode(key).as_str(), 1));
+    let view = intake.community.channels(Some(&folded)).into_iter().find(|c| c.id_hex == hex::encode(id)).unwrap();
+    assert_eq!(view.name, "mods", "the sealed name opens with the delivered key");
+
+    // The owner re-keys the channel to epoch 2, keeping the bridge.
+    let next = [0x33; 32];
+    let rumors = concord::rekey::build_channel_rotation(&w.owner, &id, 2, 1, &key, &next, &[bridge.public_key().to_hex()], now_ms(), None).unwrap();
+    let address: StreamKey = (&concord::derive::channel_rekey_group_key(&w.community.root_key(), &id, 2)).into();
+    for r in rumors {
+        w.relay.inject(seal_and_wrap(&r, Plane::Rekey, &address, &w.owner, Default::default()).unwrap());
+    }
+    let after = bridge::key_intake::intake_access_keys(&w.relay, &bridge, &intake.community, &folded).await;
+    let held = after.community.private_channels.iter().find(|c| c.id == hex::encode(id)).unwrap();
+    assert_eq!((held.key.as_str(), held.epoch), (hex::encode(next).as_str(), 2));
+    assert_eq!(held.priors[0].epoch, 1, "the old key stays for history");
+}
+
+#[tokio::test]
+async fn takes_no_delivered_key_for_a_channel_the_bridge_may_not_view() {
+    let w = world();
+    let (bridge, other) = (Keys::generate(), Keys::generate());
+    let (id, key) = ([0x41; 32], [0x42; 32]);
+    let folded = ranked_fold(&w, id, key, &other);
+    w.deliver(&w.owner, &bridge, id, 1, key);
+    let intake = bridge::key_intake::intake_access_keys(&w.relay, &bridge, &w.community, &folded).await;
+    assert!(intake.learned.is_empty());
+}

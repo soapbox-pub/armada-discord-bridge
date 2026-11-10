@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use bridge::client::{ConcordClient, OpenedChat, now_ms, resolve_invite};
 use bridge::config::BridgeConfig;
 use bridge::discord::{DiscordAdapter, DiscordEvents, TypingEvent};
-use bridge::key_intake::intake_direct_invite_keys;
+use bridge::key_intake::{intake_access_keys, intake_direct_invite_keys};
 use bridge::relays::{Hub, RelayLike};
 use bridge::router::{BridgeRouter, RouterOptions, SelfIds};
 use bridge::store::{MappingStore, PgMappingStore};
@@ -135,8 +135,12 @@ async fn main() -> anyhow::Result<()> {
         folded.roster.is_authorized(pk, &owner, perm::MANAGE_CHANNELS)
     })
     .await;
+    let mut learned = intake.learned;
+    let intake = intake_access_keys(&relays, &primary, &intake.community, &folded).await;
+    learned.extend(intake.learned.iter().cloned());
+    let intake = bridge::key_intake::KeyIntake { learned, ..intake };
     if !intake.learned.is_empty() {
-        tracing::info!(count = intake.learned.len(), "learned private-channel keys from direct invites");
+        tracing::info!(count = intake.learned.len(), "learned private-channel keys");
     }
     let client = if intake.learned.is_empty() {
         preflight
