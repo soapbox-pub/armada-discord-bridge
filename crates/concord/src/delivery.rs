@@ -55,7 +55,11 @@ pub fn parse_delivery(opened: &Opened) -> Option<ParsedDelivery> {
     if r.kind != kinds::REKEY || opened.seal_kind() != kinds::SEAL_ENCRYPTED {
         return None;
     }
-    let form = unique_tag(r, "delivery").ok()??;
+    let form = unique_tag(r, "delivery").ok()??.to_owned();
+    // An empty form names no delivery (Armada `parseDelivery`).
+    if form.is_empty() {
+        return None;
+    }
     let scope = unique_tag(r, "scope").ok()?.filter(|s| is_hex64(s))?;
     let new_epoch = unique_tag(r, "newepoch").ok()?.and_then(parse_tag_decimal)?;
     let writer = match unique_tag(r, "writer").ok()? {
@@ -80,7 +84,7 @@ pub fn parse_delivery(opened: &Opened) -> Option<ParsedDelivery> {
         }
         blobs.push(Blob { locator: b.get("locator")?.as_str()?.to_owned(), wrapped: b.get("wrapped")?.as_str()?.to_owned() });
     }
-    Some(ParsedDelivery { deliverer: r.pubkey.clone(), form: form.to_owned(), scope_hex: scope.to_lowercase(), new_epoch, writer, certs, blobs })
+    Some(ParsedDelivery { deliverer: r.pubkey.clone(), form, scope_hex: scope.to_lowercase(), new_epoch, writer, certs, blobs })
 }
 
 /// Whether a reader adopts a Channel key `deliverer` handed over (CORD-03 §5):

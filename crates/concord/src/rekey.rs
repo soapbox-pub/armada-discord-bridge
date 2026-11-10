@@ -202,7 +202,13 @@ pub fn group_rotations(parsed: Vec<ParsedRekey>) -> Vec<Rotation> {
         set.chunk_count = set.chunk_count.max(p.chunk_count);
         set.severed |= p.severed;
         match set.chunks.get_mut(&p.chunk_index) {
-            Some(held) => held.blobs.extend(p.blobs),
+            // A rotation published when its earliest chunk did (Armada takes the
+            // earliest of all, extensions included): keeping the first one met
+            // could date it after a member joined, reading as a cut it isn't.
+            Some(held) => {
+                held.ms = held.ms.min(p.ms);
+                held.blobs.extend(p.blobs);
+            }
             None => {
                 set.chunks.insert(p.chunk_index, p);
             }

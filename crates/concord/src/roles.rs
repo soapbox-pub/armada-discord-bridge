@@ -381,15 +381,14 @@ impl Roster {
     /// way: server bits, the `@everyone` overwrite, a Private Channel closed to
     /// `@everyone`, the Roles' denies then allows, the sealed creator let in,
     /// the member's own overwrite last, and nothing at all without
-    /// VIEW_CHANNEL. The owner holds everything. On the legacy Roster there are
-    /// no overwrites, so this is the server bits — except that a legacy Private
-    /// Channel's access is key possession, which the caller decides.
+    /// VIEW_CHANNEL. The owner holds everything. The same steps run on the
+    /// legacy Roster, as Armada runs them: no legacy Role carries View Channel,
+    /// so there it answers 0 for everyone but the owner. A legacy Private
+    /// Channel's access is key possession, which [`Roster::entitled_to_channel`]
+    /// answers instead.
     pub fn channel_permissions(&self, owner: &str, member: &str, channel_id_hex: &str, is_private: bool) -> u64 {
         if member == owner {
             return u64::MAX;
-        }
-        if !self.is_ranked() {
-            return self.permissions(member);
         }
         let held: Vec<&Role> = self.roles_of(member).collect();
         let mut p = held.iter().fold(self.everyone.unwrap_or(0), |acc, r| acc | r.permissions);

@@ -882,7 +882,11 @@ fn fold_once<'e>(
             }
         };
         let admissible = |p: &Edition| bans(p) && (sealed_ban(p) || citation_ok(p)) && parse_list(p).is_some();
-        let cands = candidates_of(&by_vsk_linked, kinds::VSK_BANLIST, Some(&admissible), &mut gap_held).remove(&eid).unwrap_or_default();
+        // The chain walk takes Armada's authority pre-filter (BAN on the bit
+        // alone, and a citation), not the full gate: a malformed or
+        // @everyone-only edition still links, and the gate then picks the head.
+        let walk = holders(perm::BAN);
+        let cands = candidates_of(&by_vsk_linked, kinds::VSK_BANLIST, Some(&walk), &mut gap_held).remove(&eid).unwrap_or_default();
         // The head's list alone, each entry its author may name, the first 500.
         if let Some(head) = pick_head(&cands, &mut heads, &mut head_editions, &admissible, &rank_of) {
             for pk in parse_list(head).unwrap_or_default().into_iter().filter(|pk| entitled(&head.author, pk, head)).take(MAX_BANLIST) {

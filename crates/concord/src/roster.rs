@@ -369,7 +369,7 @@ fn link_run(cands: &[Cand], start: &str, ver: u64, by_hash: &HashMap<&str, Vec<u
     let mut h = start.to_owned();
     for _ in 0..LINK_RUN_CAP {
         let js = by_hash.get(h.as_str())?;
-        if cands[js[0]].e.version + 1 != at {
+        if cands[js[0]].e.version.checked_add(1) != Some(at) {
             return None;
         }
         if let Some(&k) = js.iter().find(|&&x| conf[x].is_some()) {
