@@ -97,7 +97,7 @@ const msgRumor = stream.buildRumor({
   ms: 1_700_000_000_417,
 });
 const msgSeal = await stream.sealRumor(msgRumor, 20013, chan, signer(aliceSk));
-const msgWrap = stream.wrapSeal(msgSeal, chan);
+const msgWrap = await stream.wrapSeal(msgSeal, chan);
 out.chat_wrap = { wrap: msgWrap, rumor: msgRumor };
 
 // The Control Plane: owner genesis (metadata + #general), a role, a grant to Alice,
@@ -165,7 +165,7 @@ out.invite = {
   url: invite.buildInviteUrl("https://armada.buzz", linkSigner, token, ["wss://relay.ditto.pub", "wss://relay.example.com"]),
   link_signer: linkSigner,
   token: bytesToHex(token),
-  bundle_event: invite.buildBundleEvent(bundle, token, linkSignerSk),
+  bundle_event: await invite.buildBundleEvent(bundle, token, linkSignerSk),
   bundle,
 };
 
@@ -225,7 +225,7 @@ out.builders = {
 
 // A Direct Invite sealed by Armada to Bob, carrying a private channel key.
 out.direct_invite = {
-  wrap: directInvite.wrapDirectInvite(
+  wrap: await directInvite.wrapDirectInvite(
     await directInvite.sealDirectInvite(directInvite.buildDirectInviteRumor(bundle, owner), bob, {
       ...signer(ownerSk),
       nip44: { encrypt: async (pk: string, text: string) => nip44Encrypt(text, getConversationKey(ownerSk, pk)) },
