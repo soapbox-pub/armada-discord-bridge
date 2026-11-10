@@ -31,7 +31,10 @@ never bridged without its community's consent.
   channels). The bridge mirrors only what Armada itself shows: a timed-out
   member's posts, posts during a pause, posts from a member denied Send
   Messages, and anything a read-only channel's Writers ledger doesn't stand
-  behind stay on Armada. Read-only channels bridge Armada → Discord only.
+  behind stay on Armada. Read-only channels, and private channels on Roles
+  v2 (no overwrite lets Discord members in), bridge Armada → Discord only, and
+  the bridge says so once in the Discord channel. Checked against Vector's own
+  fixtures as well as Armada's code.
 - **Private channel keys** from Direct Invites, access-plane deliveries and
   channel rotations, read at every start.
 - **Catch-up backfill** after downtime, from a per-channel cursor.
