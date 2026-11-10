@@ -1,17 +1,27 @@
 //! The Control Plane fold — CORD-04. Replays opened editions into current state:
-//! the owner-rooted Roster first (a delegation fixpoint), then every gated entity
-//! (metadata, channels, banlist, invite registries, pins, signals) judged against
-//! it. A port of Armada's `control.ts`; the comments there carry the reasoning.
+//! the owner-rooted Roster first (the legacy delegation fixpoint, or the ranked
+//! vsk-13 fold once `@everyone` stands), then every gated entity (metadata,
+//! Channels, Banlist, invite registries, pins, signals, and on the ranked Roster
+//! Categories, overwrites, syncs and Writers ledgers) judged against it. A port
+//! of Armada's `control.ts`; the comments there carry the reasoning.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use nostr::prelude::{Event, Keys};
 use serde_json::Value;
 
-use crate::derive::{banlist_locator, grant_locator, invite_links_locator, signal_locator};
+use crate::channel_seal::{SealedChannelMeta, sanitize_channel_fields};
+use crate::derive::{banlist_locator, edition_binding, everyone_locator, grant_locator, invite_links_locator, signal_locator, sync_locator, writers_locator};
 use crate::edition::{Citation, Edition, EditionMeta, Head, bootstrap_head, build_edition_rumor, fold_chain};
 use crate::kinds::{self, SIGNAL_PAUSE};
-use crate::roles::{MAX_ROLES_PER_COMMUNITY, MemberGrant, NAME_MAX_BYTES, Role, Roster, perm};
+use crate::rank::is_rank_key;
+use crate::roles::{BENEATH_EVERY_ROLE, MAX_ROLES_PER_COMMUNITY, MemberGrant, NAME_MAX_BYTES, Overwrite, Role, Roster, cut_name, perm};
+use crate::roster::{
+    ALWAYS_MARKED_VSKS, SealedBy, VSK_ACL, VSK_CATEGORY, VSK_RANKED_ROLE, VSK_SYNC, VSK_TENURE, VSK_WRITERS, fold_ranked_roster, is_listed, may_swap_overwrites,
+    overwrite_authorized, overwrite_locator, parse_overwrite, parse_sync, roster_activated, seal_of,
+};
+use crate::strict;
+use crate::writers::{LEDGER_ENTRY_SKEW_MS, LEDGER_HORIZON_MS, Ledger, Spell, ledger_extends, parse_ledger};
 use crate::rumor::Rumor;
 use crate::stream::{Opened, StreamError, StreamKey, WrapOptions, seal_and_wrap};
 use crate::{Bytes32, hex32, is_hex64, to_hex};
@@ -51,18 +61,40 @@ pub struct CommunityMetadata {
 }
 
 /// Channel metadata (vsk 2), folded.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct FoldedChannel {
     pub channel_id_hex: String,
+    /// Empty for a sealed Private Channel this reader holds no key to open.
     pub name: String,
     pub private: bool,
     pub deleted: bool,
     /// `"forum"` channels open thread-first (CORD-03 §2 `view`).
     pub forum: bool,
-    /// Armada sidebar extensions (CORD.md).
+    /// The `view` as carried: `"chat"`, `"forum"`, `"voice"`, or unknown (read as chat).
+    pub view: Option<String>,
+    pub topic: Option<String>,
+    /// The sidebar category's NAME: the Category entity's on the ranked Roster
+    /// (resolved from `category_id`), Armada's `custom["armada.category"]` before.
     pub category: Option<String>,
+    /// The Category entity this Channel files under (CORD-03 §4).
+    pub category_id: Option<String>,
+    /// Armada's legacy sidebar position (`custom["armada.order"]`).
     pub position: Option<f64>,
+    /// The rank-key position (CORD-03 §2), ordering Channels on the ranked Roster.
+    pub rank: Option<String>,
+    /// A Private Channel's sealed details (CORD-03 §2), opened with its key.
+    pub sealed: Option<SealedChannelMeta>,
     pub raw: Value,
+}
+
+/// A Category (vsk 15, CORD-03 §4).
+#[derive(Clone, Debug)]
+pub struct FoldedCategory {
+    pub id_hex: String,
+    pub name: String,
+    /// Rank key ordering Categories; absent sorts after every keyed one.
+    pub position: Option<String>,
+    pub deleted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -91,6 +123,15 @@ pub struct FoldedControl {
     pub head_editions: HashMap<String, Edition>,
     /// Floored entities the served set couldn't account for (data availability only).
     pub incomplete: Vec<String>,
+    /// On the vsk-13 Roster (CORD-04 §2): `roster.everyone` stands and the
+    /// Channel permission entities fold.
+    pub ranked: bool,
+    /// Categories by id, deleted ones included and flagged.
+    pub categories: BTreeMap<String, FoldedCategory>,
+    /// Each member's sealed standings (CORD-04 §9), from the Tenures admitted.
+    pub tenure: SealedBy,
+    /// Restricted Channels' Writers ledgers (CORD-03 §1), by Channel id.
+    pub writers: HashMap<String, Ledger>,
 }
 
 impl FoldedControl {
@@ -115,6 +156,37 @@ impl FoldedControl {
             return None;
         }
         Some((head.at, until))
+    }
+
+    /// A member's permissions in one Channel (CORD-04 §8). See
+    /// [`Roster::channel_permissions`]; the Channel's privacy is the fold's.
+    pub fn channel_permissions(&self, member: &str, channel_id_hex: &str) -> u64 {
+        let private = self.channels.get(channel_id_hex).is_some_and(|c| c.private);
+        self.roster.channel_permissions(&self.owner, member, channel_id_hex, private)
+    }
+
+    /// Whether a member manages Channels: the owner, or an unbanned holder of
+    /// MANAGE_CHANNELS. Their posts stand in a restricted Channel anywhere (CORD-03 §1).
+    pub fn manages_channels(&self, member: &str) -> bool {
+        member == self.owner || (!self.banned.contains(member) && self.roster.has(member, perm::MANAGE_CHANNELS))
+    }
+
+    /// May `actor` hide `author`'s message in this Channel (CORD-03 §3)?
+    /// MANAGE_MESSAGES resolves through the Channel's overwrites on the ranked
+    /// Roster, server-wide on the legacy one; the outrank is server-wide either way.
+    pub fn may_hide_in(&self, actor: &str, author: &str, channel_id_hex: &str) -> bool {
+        if !self.ranked {
+            return self.roster.can_act_on_member(actor, &self.owner, author, perm::MANAGE_MESSAGES);
+        }
+        if author == self.owner || !self.roster.outranks_member(actor, &self.owner, author) {
+            return false;
+        }
+        self.channel_permissions(actor, channel_id_hex) & perm::MANAGE_MESSAGES != 0
+    }
+
+    /// The live Writers ledger restricting a Channel, if one does now.
+    pub fn restricting_ledger(&self, channel_id_hex: &str) -> Option<&Ledger> {
+        self.writers.get(channel_id_hex).filter(|l| crate::writers::ledger_restricted(l))
     }
 }
 
@@ -153,31 +225,54 @@ pub fn cap_relays(relays: impl IntoIterator<Item = String>) -> Vec<String> {
     out
 }
 
+/// The editions `admit` keeps, plus every edition a kept one builds on
+/// (transitively): an author who has since lost the permission still wrote a
+/// real link of the chain, and the authorized edition citing it vouches for it.
+fn admitted_chain<'a>(editions: &[&'a Edition], admit: &dyn Fn(&Edition) -> bool) -> Vec<&'a Edition> {
+    let mut kept: HashSet<Bytes32> = editions.iter().filter(|e| admit(e)).map(|e| e.rumor_id).collect();
+    let mut frontier: Vec<&Edition> = editions.iter().copied().filter(|e| kept.contains(&e.rumor_id)).collect();
+    while !frontier.is_empty() {
+        let cited: HashSet<Bytes32> = frontier.iter().filter_map(|e| e.prev).collect();
+        frontier = editions.iter().copied().filter(|e| !kept.contains(&e.rumor_id) && cited.contains(&e.self_hash)).collect();
+        for e in &frontier {
+            kept.insert(e.rumor_id);
+        }
+    }
+    editions.iter().copied().filter(|e| kept.contains(&e.rumor_id)).collect()
+}
+
 /// Order one entity's editions into head candidates: the chain-verified head
-/// first, then the rest version-descending (see Armada's `headCandidates`).
-fn head_candidates<'a>(editions: &[&'a Edition], floor: Option<&Head>, snapshot: bool, gapped_out: &mut bool) -> Vec<&'a Edition> {
+/// first, then the rest version-descending (Armada's `headCandidates`). With
+/// `admit`, editions it refuses never enter the walk unless an admitted one
+/// builds on them: any keyholder can seal a skipped version, and counting junk
+/// would freeze the entity.
+fn head_candidates<'a>(editions: &[&'a Edition], floor: Option<&Head>, snapshot: bool, gapped_out: &mut bool, admit: Option<&dyn Fn(&Edition) -> bool>) -> Vec<&'a Edition> {
+    let walked: Vec<&Edition> = match admit {
+        Some(a) => admitted_chain(editions, a),
+        None => editions.to_vec(),
+    };
     let mut ordered: Vec<&Edition> = Vec::new();
     let mut seen: HashSet<Bytes32> = HashSet::new();
     let mut gapped = false;
     if snapshot {
-        match bootstrap_head(editions, floor.map_or(0, |f| f.version)) {
+        match bootstrap_head(&walked, floor.map_or(0, |f| f.version)) {
             Some(idx) => {
-                ordered.push(editions[idx]);
-                seen.insert(editions[idx].rumor_id);
+                ordered.push(walked[idx]);
+                seen.insert(walked[idx].rumor_id);
             }
             None if floor.is_some() => gapped = true,
             None => {}
         }
     } else {
-        let r = fold_chain(editions, floor.map_or(0, |f| f.version), floor.map(|f| &f.hash));
+        let r = fold_chain(&walked, floor.map_or(0, |f| f.version), floor.map(|f| &f.hash));
         gapped = floor.is_some() && (r.gap || r.head.is_none());
         if let (Some(h), false) = (r.head, gapped) {
-            ordered.push(editions[h]);
-            seen.insert(editions[h].rumor_id);
+            ordered.push(walked[h]);
+            seen.insert(walked[h].rumor_id);
         }
     }
     *gapped_out = gapped;
-    let mut rest: Vec<&Edition> = editions
+    let mut rest: Vec<&Edition> = walked
         .iter()
         .copied()
         .filter(|e| {
@@ -205,14 +300,14 @@ fn settle(heads: &mut HashMap<String, Head>, head_editions: &mut HashMap<String,
     head_editions.insert(e.eid_hex(), e.clone());
 }
 
-/// Pick the first candidate passing `gate`; equal-version siblings are settled by
-/// authority (`rank_of`) rather than the grindable rumor id.
+/// Pick the first candidate passing `gate`; equal-version siblings are settled
+/// by authority (`rank_of`) rather than the grindable rumor id.
 fn pick_head<'a>(
     candidates: &[&'a Edition],
     heads: &mut HashMap<String, Head>,
     head_editions: &mut HashMap<String, Edition>,
-    mut gate: impl FnMut(&Edition) -> bool,
-    rank_of: impl Fn(&str) -> i64,
+    gate: &dyn Fn(&Edition) -> bool,
+    rank_of: &dyn Fn(&str) -> i64,
 ) -> Option<&'a Edition> {
     let mut head: Option<&Edition> = None;
     for &p in candidates {
@@ -261,11 +356,13 @@ struct GrantCand<'a> {
 }
 
 fn rank(roster: &Roster, owner: &str, author: &str) -> i64 {
-    if author == owner { -1 } else { roster.highest_position(author).map_or(i64::MAX, i64::from) }
+    if author == owner { -1 } else { i64::from(roster.highest_position(author).unwrap_or(BENEATH_EVERY_ROLE)) }
 }
 
-/// The delegation fixpoint (CORD-04 §2): from the owner outward, admit role and
-/// grant entities whose signer is authorized, until stable.
+/// The legacy delegation fixpoint (CORD-04 §2): from the owner outward, admit
+/// role and grant entities whose signer is authorized, until stable. Editing
+/// acts on a target: a non-owner draws only on bits from Roles strictly above
+/// both what an edition mints and what it replaces (downward support).
 fn authorize_delegation(
     role_cands: &BTreeMap<String, Vec<RoleCand>>,
     grant_cands: &BTreeMap<String, Vec<GrantCand>>,
@@ -273,6 +370,7 @@ fn authorize_delegation(
     owner: &str,
     heads: &mut HashMap<String, Head>,
     head_editions: &mut HashMap<String, Edition>,
+    excluded: &HashSet<String>,
 ) -> Roster {
     let mut roster = Roster::default();
     let mut settled_roles: HashSet<&str> = HashSet::new();
@@ -300,6 +398,11 @@ fn authorize_delegation(
                 None => false,
             }
         };
+        // A citation is a sync floor, not the verdict: one that doesn't resolve
+        // refuses, while an uncited edition declared no floor to wait for.
+        let cited_ok = |heads: &HashMap<String, Head>, e: &Edition| {
+            e.authority.is_none() || citation_satisfied(heads, owner, community_id, &e.author, e.authority.as_ref())
+        };
 
         for (eid, cands) in role_cands {
             if settled_roles.contains(eid.as_str()) {
@@ -315,9 +418,9 @@ fn authorize_delegation(
                 group.sort_by(|a, b| rank(&roster, owner, &a.e.author).cmp(&rank(&roster, owner, &b.e.author)).then(a.e.rumor_id.cmp(&b.e.rumor_id)));
                 for c in group {
                     let author = c.e.author.as_str();
-                    let mint_ok = author == owner || roster.can_act_on_position(author, owner, c.role.position, perm::MANAGE_ROLES);
-                    let replace_ok = author == owner || standing.is_none_or(|s| roster.outranks(author, owner, s));
-                    if !mint_ok || !replace_ok || !citation_satisfied(heads, owner, community_id, author, c.e.authority.as_ref()) {
+                    let support = roster.permissions_above(author, c.role.position.min(standing.unwrap_or(u32::MAX)));
+                    let ok = author == owner || (c.role.position != 0 && support & perm::MANAGE_ROLES != 0 && c.role.permissions & !support == 0);
+                    if !ok || !cited_ok(heads, c.e) {
                         continue;
                     }
                     admissible.insert(c.e.rumor_id);
@@ -350,14 +453,14 @@ fn authorize_delegation(
                 group.sort_by(|a, b| rank(&roster, owner, &a.e.author).cmp(&rank(&roster, owner, &b.e.author)).then(a.e.rumor_id.cmp(&b.e.rumor_id)));
                 for c in group {
                     let author = c.e.author.as_str();
+                    // Judged on the Roles it names that resolve, never on whether the rest do.
                     let positions: Vec<u32> = c.grant.role_ids.iter().filter_map(|rid| roster.role(rid).map(|r| r.position)).collect();
-                    let all_known = positions.len() == c.grant.role_ids.len();
+                    let reach = positions.iter().copied().chain(standing).min().unwrap_or(u32::MAX);
+                    // An uncited Grant naming no published Role is a strip, and a strip must cite.
+                    let strip = c.grant.role_ids.iter().all(|rid| !role_cands.contains_key(rid));
                     let ok = author == owner
-                        || (all_known
-                            && roster.has(author, perm::MANAGE_ROLES)
-                            && positions.iter().all(|p| roster.outranks(author, owner, *p))
-                            && standing.is_none_or(|s| roster.outranks(author, owner, s)));
-                    if !ok || !citation_satisfied(heads, owner, community_id, author, c.e.authority.as_ref()) {
+                        || (c.grant.member != owner && roster.permissions_above(author, reach) & perm::MANAGE_ROLES != 0 && !(c.e.authority.is_none() && strip));
+                    if !ok || !cited_ok(heads, c.e) {
                         continue;
                     }
                     admissible.insert(c.e.rumor_id);
@@ -366,7 +469,10 @@ fn authorize_delegation(
                 }
             }
             let Some(pick) = cands.iter().find(|c| admissible.contains(&c.e.rumor_id)) else { continue };
-            roster.grants.push(pick.grant.clone());
+            // A Grant to a banned member links its chain but confers nothing (CORD-04 §4).
+            if !excluded.contains(&pick.grant.member) {
+                roster.grants.push(pick.grant.clone());
+            }
             settled_grants.insert(eid.as_str());
             settle(heads, head_editions, pick.e);
             changed = true;
@@ -395,21 +501,54 @@ fn parse_metadata(content: &str) -> Option<Value> {
         return None;
     }
     match v.get("description") {
-        None | Some(Value::Null) => {}
+        None => {}
         Some(Value::String(d)) if utf8_len_ok(d, DESCRIPTION_MAX_BYTES) => {}
         _ => return None,
     }
     Some(v)
 }
 
-fn channel_meta_ok(content: &str) -> bool {
-    serde_json::from_str::<Value>(content)
-        .ok()
-        .and_then(|v| v.get("name").and_then(Value::as_str).map(|n| !n.is_empty() && utf8_len_ok(n, NAME_MAX_BYTES)))
-        .unwrap_or(false)
+/// A Channel edition's content (CORD-03 §2), or `None` when it breaks its form.
+/// A Private Channel may carry the SEALED form, whose details only its key opens.
+pub fn read_channel_content(content: &str) -> Option<(serde_json::Map<String, Value>, Option<SealedChannelMeta>)> {
+    let raw: Value = serde_json::from_str(content).ok()?;
+    let c = raw.as_object()?;
+    if c.get("deleted").is_some_and(|d| !d.is_boolean()) {
+        return None;
+    }
+    if c.get("private") == Some(&Value::Bool(true))
+        && let Some(sealed) = c.get("sealed").and_then(Value::as_str) {
+            let epoch = c.get("epoch")?.as_str().and_then(crate::parse_tag_decimal)?;
+            let mut meta = serde_json::Map::new();
+            meta.insert("name".into(), Value::String(String::new()));
+            meta.insert("private".into(), Value::Bool(true));
+            if c.get("deleted") == Some(&Value::Bool(true)) {
+                meta.insert("deleted".into(), Value::Bool(true));
+            }
+            return Some((meta, Some(SealedChannelMeta { epoch, sealed: sealed.to_owned(), prev_hex: None })));
+        }
+    if !c.get("private").is_some_and(Value::is_boolean) {
+        return None;
+    }
+    Some((sanitize_channel_fields(c.clone())?, None))
 }
 
-fn folded_channel(eid: &str, raw: Value, ever_deleted: bool) -> FoldedChannel {
+/// A Category edition's content (CORD-03 §4), or `None` when it breaks its form.
+fn read_category(content: &str) -> Option<FoldedCategory> {
+    let raw: Value = serde_json::from_str(content).ok()?;
+    let c = raw.as_object()?;
+    if c.get("deleted") == Some(&Value::Bool(true)) {
+        return Some(FoldedCategory { id_hex: String::new(), name: String::new(), position: None, deleted: true });
+    }
+    Some(FoldedCategory {
+        id_hex: String::new(),
+        name: c.get("name").and_then(Value::as_str).map(cut_name).unwrap_or_default(),
+        position: c.get("position").and_then(Value::as_str).filter(|p| is_rank_key(p)).map(str::to_owned),
+        deleted: false,
+    })
+}
+
+fn folded_channel(eid: &str, raw: Value, ever_deleted: bool, sealed: Option<SealedChannelMeta>) -> FoldedChannel {
     let custom = raw.get("custom");
     let category = custom
         .and_then(|c| c.get("armada.category"))
@@ -419,22 +558,22 @@ fn folded_channel(eid: &str, raw: Value, ever_deleted: bool) -> FoldedChannel {
         .filter(|n| !n.is_empty() && n.len() <= NAME_MAX_BYTES)
         .map(str::to_owned);
     let position = custom.and_then(|c| c.get("armada.order")).and_then(|o| o.get("position")).and_then(Value::as_f64).filter(|p| p.is_finite());
+    let view = raw.get("view").and_then(Value::as_str).map(str::to_owned);
     FoldedChannel {
         channel_id_hex: eid.to_owned(),
         name: raw.get("name").and_then(Value::as_str).unwrap_or_default().to_owned(),
         private: raw.get("private") == Some(&Value::Bool(true)),
         deleted: raw.get("deleted") == Some(&Value::Bool(true)) || ever_deleted,
-        forum: raw.get("view").and_then(Value::as_str) == Some("forum"),
+        forum: view.as_deref() == Some("forum"),
+        view,
+        topic: raw.get("topic").and_then(Value::as_str).map(str::to_owned),
         category,
+        category_id: raw.get("category").and_then(Value::as_str).map(str::to_lowercase),
         position,
+        rank: raw.get("position").and_then(Value::as_str).map(str::to_owned),
+        sealed,
         raw,
     }
-}
-
-fn parse_hex_list(content: &str) -> Option<Vec<String>> {
-    let v: Value = serde_json::from_str(content).ok()?;
-    let list = v.as_array()?;
-    Some(list.iter().filter_map(Value::as_str).filter(|s| is_hex64(s)).map(str::to_lowercase).collect())
 }
 
 fn validate_signal(signal_id: &str, content: &str, created_at: u64) -> bool {
@@ -457,9 +596,15 @@ fn validate_signal(signal_id: &str, content: &str, created_at: u64) -> bool {
     false
 }
 
+/// The most entries a Banlist stands for (CORD-04 §4).
+pub const MAX_BANLIST: usize = 500;
+/// The most Categories a reader folds (CORD-03 §4).
+pub const MAX_CATEGORIES: usize = 100;
+
 /// Replay opened control editions into current state. `prior_heads` floors a
-/// tracking client's fold; `snapshot_ids` (rumor ids that arrived under the
-/// current post-Refounding epoch) switch those entities to bootstrap folding.
+/// tracking client's legacy fold; `snapshot_ids` (rumor ids that arrived under
+/// the current post-Refounding epoch) switch those entities to bootstrap
+/// folding. The ranked Roster is always folded fresh (see `roster.rs`).
 pub fn fold_control(
     editions: &[Edition],
     community_id: &Bytes32,
@@ -467,100 +612,156 @@ pub fn fold_control(
     prior_heads: Option<&HashMap<String, Head>>,
     snapshot_ids: Option<&HashSet<Bytes32>>,
 ) -> FoldedControl {
-    let refs: Vec<&Edition> = editions.iter().collect();
-    let first = fold_once(&refs, community_id, owner, prior_heads, snapshot_ids);
-    // The owner is supreme: never bannable.
+    // CORD-04 §1: a marked edition bound to another Community is refused (a
+    // replay from elsewhere), and so is an unmarked edition of a kind no older
+    // client wrote.
+    let binding = edition_binding(community_id);
+    let refs: Vec<&Edition> = editions
+        .iter()
+        .filter(|e| match &e.binding {
+            Some(b) => *b == binding,
+            None => !ALWAYS_MARKED_VSKS.contains(&e.vsk.as_str()),
+        })
+        .collect();
+    let first = fold_once(&refs, &refs, community_id, owner, prior_heads, snapshot_ids, &HashSet::new());
+    // The owner is supreme: never bannable, or a BAN holder could silence them everywhere.
     let banned: HashSet<String> = first.banned.iter().filter(|pk| pk.as_str() != owner).cloned().collect();
-    if !banned.is_empty() && editions.iter().any(|e| banned.contains(&e.author)) {
-        let kept: Vec<&Edition> = editions.iter().filter(|e| !banned.contains(&e.author)).collect();
-        let mut second = fold_once(&kept, community_id, owner, prior_heads, snapshot_ids);
-        second.banned = banned;
-        second.banned_at = first.banned_at;
-        second.incomplete = first.incomplete;
-        return second;
+    if banned.is_empty() {
+        return FoldedControl { banned, ..first };
     }
-    FoldedControl { banned, ..first }
+    // A ban takes what its target wrote, except what a Tenure keeps (CORD-04 §4,
+    // §9). The Roster still links what it refuses, so it folds every edition
+    // with the banned excluded.
+    let kept: Vec<&Edition> = refs.iter().copied().filter(|e| !banned.contains(&e.author) || is_listed(&first.tenure, &e.author, &to_hex(&e.self_hash))).collect();
+    let mut second = fold_once(&kept, &refs, community_id, owner, prior_heads, snapshot_ids, &banned);
+    // The Banlist's head is the one judged before the ban took anyone's support.
+    let banlist_eid = to_hex(&banlist_locator(community_id));
+    match (first.heads.get(&banlist_eid), first.head_editions.get(&banlist_eid)) {
+        (Some(h), Some(e)) => {
+            second.heads.insert(banlist_eid.clone(), *h);
+            second.head_editions.insert(banlist_eid, e.clone());
+        }
+        _ => {
+            second.heads.remove(&banlist_eid);
+            second.head_editions.remove(&banlist_eid);
+        }
+    }
+    second.banned = banned;
+    second.banned_at = first.banned_at;
+    second.incomplete = first.incomplete;
+    second
 }
 
-fn fold_once(
-    editions: &[&Edition],
+/// Ordered head candidates per entity of one vsk, floored per prior head.
+fn candidates<'e>(
+    source: &HashMap<String, BTreeMap<String, Vec<&'e Edition>>>,
+    vsk: &str,
+    admit: Option<&dyn Fn(&Edition) -> bool>,
+    gap_held: &mut HashSet<String>,
+    prior_heads: Option<&HashMap<String, Head>>,
+    snapshot_ids: Option<&HashSet<Bytes32>>,
+) -> BTreeMap<String, Vec<&'e Edition>> {
+    let mut out = BTreeMap::new();
+    if let Some(m) = source.get(vsk) {
+        for (eid, list) in m {
+            let snapshot = snapshot_ids.is_some_and(|ids| list.iter().any(|e| ids.contains(&e.rumor_id)));
+            let mut gapped = false;
+            let cands = head_candidates(list, prior_heads.and_then(|h| h.get(eid)), snapshot, &mut gapped, admit);
+            if gapped {
+                gap_held.insert(eid.clone());
+            }
+            out.insert(eid.clone(), cands);
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fold_once<'e>(
+    editions: &[&'e Edition],
+    roster_editions: &[&'e Edition],
     community_id: &Bytes32,
     owner: &str,
     prior_heads: Option<&HashMap<String, Head>>,
     snapshot_ids: Option<&HashSet<Bytes32>>,
+    excluded: &HashSet<String>,
 ) -> FoldedControl {
     let cid_hex = to_hex(community_id);
-    let mut by_vsk: HashMap<&str, BTreeMap<String, Vec<&Edition>>> = HashMap::new();
-    for &e in editions {
-        by_vsk.entry(e.vsk.as_str()).or_default().entry(e.eid_hex()).or_default().push(e);
-    }
+    let group = |list: &[&'e Edition]| {
+        let mut out: HashMap<String, BTreeMap<String, Vec<&'e Edition>>> = HashMap::new();
+        for &e in list {
+            out.entry(e.vsk.clone()).or_default().entry(e.eid_hex()).or_default().push(e);
+        }
+        out
+    };
+    let by_vsk = group(editions);
+    // The Banlist, overwrites and syncs still link a banned member's editions, refused.
+    let by_vsk_linked = group(roster_editions);
     let mut heads: HashMap<String, Head> = HashMap::new();
     let mut head_editions: HashMap<String, Edition> = HashMap::new();
     let mut gap_held: HashSet<String> = HashSet::new();
 
-    let candidates_of = |vsk: &str, gap_held: &mut HashSet<String>| -> BTreeMap<String, Vec<&Edition>> {
-        let mut out = BTreeMap::new();
-        if let Some(m) = by_vsk.get(vsk) {
-            for (eid, list) in m {
-                let snapshot = snapshot_ids.is_some_and(|ids| list.iter().any(|e| ids.contains(&e.rumor_id)));
-                let mut gapped = false;
-                let cands = head_candidates(list, prior_heads.and_then(|h| h.get(eid)), snapshot, &mut gapped);
-                if gapped {
-                    gap_held.insert(eid.clone());
-                }
-                out.insert(eid.clone(), cands);
-            }
-        }
-        out
+    let candidates_of = |source: &HashMap<String, BTreeMap<String, Vec<&'e Edition>>>, vsk: &str, admit: Option<&dyn Fn(&Edition) -> bool>, gap_held: &mut HashSet<String>| {
+        candidates(source, vsk, admit, gap_held, prior_heads, snapshot_ids)
     };
 
-    // Roster.
-    let mut role_cands: BTreeMap<String, Vec<RoleCand>> = BTreeMap::new();
-    for (eid, cands) in candidates_of(kinds::VSK_ROLE, &mut gap_held) {
-        let parsed: Vec<RoleCand> = cands
-            .into_iter()
-            .filter_map(|e| Role::from_json(&e.content).filter(|r| r.role_id == eid).map(|role| RoleCand { role, e }))
-            .collect();
-        if !parsed.is_empty() {
-            role_cands.insert(eid, parsed);
+    // 1. The Roster: the vsk-13 one once an owner-rooted `@everyone` stands, the
+    // legacy fixpoint before.
+    let ranked = roster_activated(roster_editions, community_id, owner);
+    let mut sealed: SealedBy = HashMap::new();
+    let mut roster = if ranked {
+        let folded = fold_ranked_roster(roster_editions, community_id, owner, excluded);
+        for (_, e) in folded.heads {
+            settle(&mut heads, &mut head_editions, e);
         }
-    }
-    let mut grant_cands: BTreeMap<String, Vec<GrantCand>> = BTreeMap::new();
-    for (eid, cands) in candidates_of(kinds::VSK_GRANT, &mut gap_held) {
-        let parsed: Vec<GrantCand> = cands
-            .into_iter()
-            .filter_map(|e| {
-                let grant = MemberGrant::from_json(&e.content)?;
-                let member = hex32(&grant.member)?;
-                (to_hex(&grant_locator(community_id, &member)) == eid).then_some(GrantCand { grant, e })
-            })
-            .collect();
-        if !parsed.is_empty() {
-            grant_cands.insert(eid, parsed);
+        sealed = folded.sealed;
+        folded.roster
+    } else {
+        let mut role_cands: BTreeMap<String, Vec<RoleCand>> = BTreeMap::new();
+        for (eid, cands) in candidates_of(&by_vsk, kinds::VSK_ROLE, None, &mut gap_held) {
+            let parsed: Vec<RoleCand> = cands.into_iter().filter_map(|e| Role::from_json(&e.content).filter(|r| r.role_id == eid).map(|role| RoleCand { role, e })).collect();
+            if !parsed.is_empty() {
+                role_cands.insert(eid, parsed);
+            }
         }
-    }
-    let roster = authorize_delegation(&role_cands, &grant_cands, community_id, owner, &mut heads, &mut head_editions);
-    let rank_of = |author: &str| rank(&roster, owner, author);
-    // Citations name Grant heads, which the roster pass has now settled for good.
-    let grant_heads = heads.clone();
-    let cited = |p: &Edition| citation_satisfied(&grant_heads, owner, community_id, &p.author, p.authority.as_ref());
+        let mut grant_cands: BTreeMap<String, Vec<GrantCand>> = BTreeMap::new();
+        for (eid, cands) in candidates_of(&by_vsk, kinds::VSK_GRANT, None, &mut gap_held) {
+            let parsed: Vec<GrantCand> = cands
+                .into_iter()
+                .filter_map(|e| {
+                    let grant = MemberGrant::from_json(&e.content)?;
+                    let member = hex32(&grant.member)?;
+                    (to_hex(&grant_locator(community_id, &member)) == eid).then_some(GrantCand { grant, e })
+                })
+                .collect();
+            if !parsed.is_empty() {
+                grant_cands.insert(eid, parsed);
+            }
+        }
+        authorize_delegation(&role_cands, &grant_cands, community_id, owner, &mut heads, &mut head_editions, excluded)
+    };
 
-    // Metadata.
+    // Citations name Grant heads, which the Roster pass has now settled for good.
+    let grant_heads = heads.clone();
+    let roster_ref = roster.clone();
+    let rank_of = |author: &str| rank(&roster_ref, owner, author);
+    // A Tenure-listed edition stands without its citation (CORD-04 §9).
+    let listed = |p: &Edition| ranked && is_listed(&sealed, &p.author, &to_hex(&p.self_hash));
+    let citation_ok = |p: &Edition| listed(p) || citation_satisfied(&grant_heads, owner, community_id, &p.author, p.authority.as_ref());
+    // Whether `p`'s signer may write it under `bits`, judged on the bit alone:
+    // the Roster as it stands, `@everyone`'s bits counted, or a sealed standing.
+    let may = |p: &Edition, bits: u64| {
+        roster_ref.is_authorized(&p.author, owner, bits) || (ranked && seal_of(&sealed, &p.author, &to_hex(&p.self_hash), BENEATH_EVERY_ROLE) & bits == bits)
+    };
+    let holders = |bits: u64| move |p: &Edition| may(p, bits) && citation_ok(p);
+
+    // 2. Metadata (vsk 0): the Community's own entity and an authorized actor.
     let mut metadata = None;
     {
-        let cands = candidates_of(kinds::VSK_METADATA, &mut gap_held).remove(&cid_hex).unwrap_or_default();
-        let head = pick_head(
-            &cands,
-            &mut heads,
-            &mut head_editions,
-            |p| {
-                roster.is_authorized(&p.author, owner, perm::MANAGE_METADATA)
-                    && cited(p)
-                    && parse_metadata(&p.content).is_some()
-            },
-            rank_of,
-        );
-        if let Some(head) = head {
+        let admit = holders(perm::MANAGE_METADATA);
+        let cands = candidates_of(&by_vsk, kinds::VSK_METADATA, Some(&admit), &mut gap_held).remove(&cid_hex).unwrap_or_default();
+        let gate = |p: &Edition| may(p, perm::MANAGE_METADATA) && citation_ok(p) && parse_metadata(&p.content).is_some();
+        if let Some(head) = pick_head(&cands, &mut heads, &mut head_editions, &gate, &rank_of) {
             let raw = parse_metadata(&head.content).expect("gated");
             let relays = raw
                 .get("relays")
@@ -578,65 +779,115 @@ fn fold_once(
             });
         }
     }
-    // Channels, gated by MANAGE_CHANNELS. Deletion is terminal.
+
+    // An edition aimed at another entity's coordinate is no Channel or Category
+    // (CORD-03 §2, §4): the Community's own, `@everyone`'s, the Banlist's, or one
+    // an edition of another kind claims, signed by a holder of that kind's bit.
+    let claim_bit = |vsk: &str| -> Option<u64> {
+        Some(match vsk {
+            kinds::VSK_METADATA => perm::MANAGE_METADATA,
+            kinds::VSK_CHANNEL | VSK_CATEGORY | VSK_WRITERS => perm::MANAGE_CHANNELS,
+            kinds::VSK_ROLE | kinds::VSK_GRANT | VSK_RANKED_ROLE | VSK_ACL | VSK_TENURE | VSK_SYNC => perm::MANAGE_ROLES,
+            kinds::VSK_BANLIST => perm::BAN,
+            kinds::VSK_INVITE_REGISTRY => perm::CREATE_INVITE,
+            kinds::VSK_PINS => perm::PIN_MESSAGES,
+            _ => return None,
+        })
+    };
+    let taken_by = |kind: &str| -> HashSet<String> {
+        let mut out: HashSet<String> = [cid_hex.clone(), to_hex(&everyone_locator(community_id)), to_hex(&banlist_locator(community_id))].into_iter().collect();
+        for (vsk, by_eid) in &by_vsk {
+            let Some(bit) = claim_bit(vsk) else { continue };
+            if vsk == kind {
+                continue;
+            }
+            for (eid, list) in by_eid {
+                if list.iter().any(|e| roster_ref.is_authorized(&e.author, owner, bit)) {
+                    out.insert(eid.clone());
+                }
+            }
+        }
+        out
+    };
+
+    // 3. Channels (vsk 2), each gated by MANAGE_CHANNELS. On the ranked Roster an
+    // unmarked edition counts only for a Channel the switch listed, so an old
+    // client can't add Channels the new rules never judged.
+    let legacy_channels: Option<HashSet<String>> = if ranked { roster.legacy_channels.as_ref().map(|l| l.iter().cloned().collect()) } else { None };
+    let not_channels = taken_by(kinds::VSK_CHANNEL);
     let mut channels = BTreeMap::new();
-    for (eid, cands) in candidates_of(kinds::VSK_CHANNEL, &mut gap_held) {
-        let gate = |p: &Edition| {
-            roster.is_authorized(&p.author, owner, perm::MANAGE_CHANNELS)
-                && cited(p)
-                && channel_meta_ok(&p.content)
-        };
-        let Some(head) = pick_head(&cands, &mut heads, &mut head_editions, gate, rank_of) else { continue };
-        let raw: Value = serde_json::from_str(&head.content).unwrap_or(Value::Null);
-        let ever_deleted = cands.iter().any(|p| {
-            gate(p) && serde_json::from_str::<Value>(&p.content).ok().and_then(|v| v.get("deleted").cloned()) == Some(Value::Bool(true))
-        });
-        channels.insert(eid.clone(), folded_channel(&eid, raw, ever_deleted));
+    {
+        let admit = holders(perm::MANAGE_CHANNELS);
+        for (eid, cands) in candidates_of(&by_vsk, kinds::VSK_CHANNEL, Some(&admit), &mut gap_held) {
+            if not_channels.contains(&eid) {
+                continue;
+            }
+            let gate = |p: &Edition| {
+                may(p, perm::MANAGE_CHANNELS) && citation_ok(p) && !(legacy_channels.as_ref().is_some_and(|l| p.binding.is_none() && !l.contains(&eid)))
+            };
+            // A malformed edition still links and stands as the head, applying
+            // nothing: the Channel reads as the newest standing edition with its form.
+            let Some(head) = pick_head(&cands, &mut heads, &mut head_editions, &gate, &rank_of) else { continue };
+            let applied = if read_channel_content(&head.content).is_some() {
+                Some(head)
+            } else {
+                cands.iter().copied().find(|p| p.version <= head.version && gate(p) && read_channel_content(&p.content).is_some())
+            };
+            let Some(applied) = applied else { continue };
+            let (meta, sealed_meta) = read_channel_content(&applied.content).expect("checked");
+            // Deletion is terminal across every served edition the gate admits.
+            let deletions: Vec<&Edition> = by_vsk
+                .get(kinds::VSK_CHANNEL)
+                .and_then(|m| m.get(&eid))
+                .map(|l| l.iter().copied().filter(|p| gate(p) && read_channel_content(&p.content).is_some_and(|(m, _)| m.get("deleted") == Some(&Value::Bool(true)))).collect())
+                .unwrap_or_default();
+            if let Some(d) = deletions.iter().copied().min_by(|a, b| b.version.cmp(&a.version).then(a.rumor_id.cmp(&b.rumor_id))) {
+                settle(&mut heads, &mut head_editions, d);
+            }
+            let sealed_meta = sealed_meta.map(|s| SealedChannelMeta { prev_hex: applied.prev.map(|p| to_hex(&p)), ..s });
+            channels.insert(eid.clone(), folded_channel(&eid, Value::Object(meta), !deletions.is_empty(), sealed_meta));
+        }
     }
 
-    // Banlist (vsk 4): BAN and strict outrank per named member.
+    // 4. Banlist (vsk 4): the one anti-roster; an unauthorized head → empty.
     let mut banned = HashSet::new();
     let mut banned_at: HashMap<String, u64> = HashMap::new();
     {
         let eid = to_hex(&banlist_locator(community_id));
-        let cands = candidates_of(kinds::VSK_BANLIST, &mut gap_held).remove(&eid).unwrap_or_default();
-        let entitled = |author: &str, pk: &str| roster.can_act_on_member(author, owner, pk, perm::BAN);
-        let well_formed = |p: &Edition| {
-            roster.is_authorized(&p.author, owner, perm::BAN)
-                && cited(p)
-                && parse_hex_list(&p.content).is_some()
+        let parse_list = |p: &Edition| strict::parse_string_array(&p.content).map(|l| l.into_iter().map(|s| s.to_lowercase()).collect::<Vec<_>>());
+        let is_key = |pk: &str| pk.len() == 64 && pk.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+        let sealed_ban = |p: &Edition| ranked && seal_of(&sealed, &p.author, &to_hex(&p.self_hash), BENEATH_EVERY_ROLE) & perm::BAN != 0;
+        // Banning acts on a member: BAN and a strict outrank, so a Moderator can't ban Admins.
+        let entitled = |author: &str, pk: &str, p: &Edition| {
+            roster_ref.can_act_on_member(author, owner, pk, perm::BAN)
+                || (ranked && pk != owner && seal_of(&sealed, author, &to_hex(&p.self_hash), roster_ref.highest_position(pk).unwrap_or(BENEATH_EVERY_ROLE)) & perm::BAN != 0)
         };
-        let mut standing_at: HashMap<Bytes32, HashSet<String>> = HashMap::new();
-        let mut admissible: HashSet<Bytes32> = HashSet::new();
-        let mut standing: HashSet<String> = HashSet::new();
-        for group in version_groups(&cands, |e| e.version) {
-            let mut group = group;
-            group.sort_by(|a, b| rank_of(&a.author).cmp(&rank_of(&b.author)).then(a.rumor_id.cmp(&b.rumor_id)));
-            for p in group {
-                if !well_formed(p) || standing.contains(&p.author) {
-                    continue;
+        // On the ranked Roster the bit must come from the author's Roles:
+        // `@everyone`'s bits author no Banlist (CORD-04 §2).
+        let bans = |p: &Edition| {
+            if ranked {
+                p.author == owner || roster_ref.permissions_above(&p.author, BENEATH_EVERY_ROLE) & perm::BAN != 0 || sealed_ban(p)
+            } else {
+                roster_ref.is_authorized(&p.author, owner, perm::BAN)
+            }
+        };
+        let admissible = |p: &Edition| bans(p) && (sealed_ban(p) || citation_ok(p)) && parse_list(p).is_some();
+        let cands = candidates_of(&by_vsk_linked, kinds::VSK_BANLIST, Some(&admissible), &mut gap_held).remove(&eid).unwrap_or_default();
+        // The head's list alone, each entry its author may name, the first 500.
+        if let Some(head) = pick_head(&cands, &mut heads, &mut head_editions, &admissible, &rank_of) {
+            for pk in parse_list(head).unwrap_or_default().into_iter().filter(|pk| entitled(&head.author, pk, head)).take(MAX_BANLIST) {
+                if is_key(&pk) {
+                    banned.insert(pk);
                 }
-                let mut named: HashSet<String> = parse_hex_list(&p.content).unwrap().into_iter().filter(|pk| entitled(&p.author, pk)).collect();
-                for pk in &standing {
-                    if !entitled(&p.author, pk) {
-                        named.insert(pk.clone());
-                    }
-                }
-                standing = named.clone();
-                standing_at.insert(p.rumor_id, named);
-                admissible.insert(p.rumor_id);
-                break;
             }
         }
-        if let Some(head) = pick_head(&cands, &mut heads, &mut head_editions, |p| admissible.contains(&p.rumor_id), rank_of) {
-            banned.extend(standing_at.get(&head.rumor_id).cloned().unwrap_or_default());
-        }
-        for p in &cands {
-            if !admissible.contains(&p.rumor_id) {
+        // Ban history: the newest admissible edition naming each npub its author may ban.
+        for p in by_vsk_linked.get(kinds::VSK_BANLIST).and_then(|m| m.get(&eid)).into_iter().flatten() {
+            if !admissible(p) {
                 continue;
             }
-            for pk in parse_hex_list(&p.content).unwrap_or_default() {
-                if !entitled(&p.author, &pk) {
+            for pk in parse_list(p).unwrap_or_default() {
+                if pk == owner || !is_key(&pk) || !entitled(&p.author, &pk, p) {
                     continue;
                 }
                 let e = banned_at.entry(pk).or_insert(p.created_at);
@@ -645,49 +896,197 @@ fn fold_once(
         }
     }
 
-    // Invite registries (vsk 8): each creator's own list, while they hold CREATE_INVITE.
+    // 5. Invite registries (vsk 8): each creator's own list, while they hold
+    // CREATE_INVITE. The bit alone, no citation (Vector reads no floor here).
     let mut live_invite_links = HashSet::new();
     let mut registries_by_creator = HashMap::new();
-    for (eid, cands) in candidates_of(kinds::VSK_INVITE_REGISTRY, &mut gap_held) {
-        let gate = |p: &Edition| {
-            hex32(&p.author).is_some_and(|a| to_hex(&invite_links_locator(community_id, &a)) == eid)
-                && roster.is_authorized(&p.author, owner, perm::CREATE_INVITE)
-                && cited(p)
-                && serde_json::from_str::<Value>(&p.content).is_ok_and(|v| v.is_array())
-        };
-        let Some(head) = pick_head(&cands, &mut heads, &mut head_editions, gate, rank_of) else { continue };
-        let list = parse_hex_list(&head.content).unwrap_or_default();
-        live_invite_links.extend(list.iter().cloned());
-        registries_by_creator.insert(head.author.clone(), list);
-    }
-
-    // Pin Lists (vsk 11), gated by PIN_MESSAGES; content carried verbatim.
-    let mut pin_lists = HashMap::new();
-    for (eid, cands) in candidates_of(kinds::VSK_PINS, &mut gap_held) {
-        let gate = |p: &Edition| {
-            roster.is_authorized(&p.author, owner, perm::PIN_MESSAGES)
-                && cited(p)
-        };
-        if let Some(head) = pick_head(&cands, &mut heads, &mut head_editions, gate, rank_of) {
-            pin_lists.insert(eid, (head.content.clone(), head.author.clone()));
+    {
+        let own = |p: &Edition| hex32(&p.author).is_some_and(|a| to_hex(&invite_links_locator(community_id, &a)) == p.eid_hex());
+        let admit = |p: &Edition| may(p, perm::CREATE_INVITE) && own(p);
+        for (_, cands) in candidates_of(&by_vsk, kinds::VSK_INVITE_REGISTRY, Some(&admit), &mut gap_held) {
+            let gate = |p: &Edition| own(p) && may(p, perm::CREATE_INVITE) && serde_json::from_str::<Value>(&p.content).is_ok_and(|v| v.is_array());
+            let Some(head) = pick_head(&cands, &mut heads, &mut head_editions, &gate, &rank_of) else { continue };
+            let list: Vec<String> = serde_json::from_str::<Value>(&head.content)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|s| is_hex64(s))
+                .map(str::to_owned)
+                .collect();
+            live_invite_links.extend(list.iter().map(|s| s.to_lowercase()));
+            registries_by_creator.insert(head.author.clone(), list);
         }
     }
 
-    // Community Signals (vsk 12): only implemented signal ids have a coordinate.
+    // 6. Pin Lists (vsk 11), gated by PIN_MESSAGES; content carried verbatim.
+    let mut pin_lists = HashMap::new();
+    {
+        let admit = holders(perm::PIN_MESSAGES);
+        for (eid, cands) in candidates_of(&by_vsk, kinds::VSK_PINS, Some(&admit), &mut gap_held) {
+            if let Some(head) = pick_head(&cands, &mut heads, &mut head_editions, &admit, &rank_of) {
+                pin_lists.insert(eid, (head.content.clone(), head.author.clone()));
+            }
+        }
+    }
+
+    // 7. Community Signals (vsk 12): only implemented signal ids have a coordinate.
     let mut signals = HashMap::new();
-    let signal_cands = candidates_of(kinds::VSK_SIGNALS, &mut gap_held);
-    for &(signal_id, gate_bits) in SIGNAL_GATES {
-        let cands = signal_cands.get(&to_hex(&signal_locator(community_id, signal_id))).cloned().unwrap_or_default();
-        let gate = |p: &Edition| {
-            roster.is_authorized(&p.author, owner, gate_bits)
-                && cited(p)
-                && validate_signal(signal_id, &p.content, p.created_at)
-        };
-        if let Some(head) = pick_head(&cands, &mut heads, &mut head_editions, gate, rank_of) {
-            signals.insert(
-                signal_id.to_owned(),
-                FoldedSignal { content: serde_json::from_str(&head.content).unwrap_or(Value::Null), author: head.author.clone(), at: head.created_at },
-            );
+    {
+        let admit = |p: &Edition| SIGNAL_GATES.iter().any(|(_, bits)| may(p, *bits)) && citation_ok(p);
+        let signal_cands = candidates_of(&by_vsk, kinds::VSK_SIGNALS, Some(&admit), &mut gap_held);
+        for &(signal_id, gate_bits) in SIGNAL_GATES {
+            let cands = signal_cands.get(&to_hex(&signal_locator(community_id, signal_id))).cloned().unwrap_or_default();
+            let gate = |p: &Edition| may(p, gate_bits) && citation_ok(p) && validate_signal(signal_id, &p.content, p.created_at);
+            if let Some(head) = pick_head(&cands, &mut heads, &mut head_editions, &gate, &rank_of) {
+                signals.insert(
+                    signal_id.to_owned(),
+                    FoldedSignal { content: serde_json::from_str(&head.content).unwrap_or(Value::Null), author: head.author.clone(), at: head.created_at },
+                );
+            }
+        }
+    }
+
+    // 8. On the ranked Roster: Writers ledgers (vsk 18), overwrites (vsk 14) and syncs (vsk 17).
+    let mut writers: HashMap<String, Ledger> = HashMap::new();
+    if ranked {
+        let now_ms = crate::now_secs() * 1000;
+        for (eid, list) in by_vsk.get(VSK_WRITERS).into_iter().flatten() {
+            let ledger_of = |p: &Edition| parse_ledger(&p.content).filter(|l| hex32(&l.channel).is_some_and(|c| to_hex(&writers_locator(community_id, &c)) == *eid));
+            let by_hash: HashMap<Bytes32, &Edition> = list.iter().rev().map(|e| (e.self_hash, *e)).collect();
+            // Judged along the chain: an edition stands only on a predecessor
+            // that stands, appending exactly one entry dated within ten minutes
+            // of its own time and at most an hour past the clock, a writer entry
+            // naming its signer as minter (CORD-03 §1).
+            let memo: std::cell::RefCell<HashMap<Bytes32, bool>> = Default::default();
+            fn judge(p: &Edition, memo: &std::cell::RefCell<HashMap<Bytes32, bool>>, by_hash: &HashMap<Bytes32, &Edition>, base: &dyn Fn(&Edition) -> Option<Ledger>) -> bool {
+                if let Some(v) = memo.borrow().get(&p.rumor_id) {
+                    return *v;
+                }
+                memo.borrow_mut().insert(p.rumor_id, false);
+                let ok = (|| {
+                    let l = base(p)?;
+                    match p.prev {
+                        None => (p.version == 1 && l.entries.len() == 1 && l.retired.is_empty()).then_some(()),
+                        Some(prev) => match by_hash.get(&prev) {
+                            // A predecessor not served: a fresh reader takes the link on trust.
+                            None => Some(()),
+                            Some(before) => {
+                                let before_l = parse_ledger(&before.content)?;
+                                (judge(before, memo, by_hash, base) && ledger_extends(&l, &before_l)).then_some(())
+                            }
+                        },
+                    }
+                })()
+                .is_some();
+                memo.borrow_mut().insert(p.rumor_id, ok);
+                ok
+            }
+            let base = |p: &Edition| -> Option<Ledger> {
+                let l = ledger_of(p)?;
+                if !may(p, perm::MANAGE_CHANNELS) || !citation_ok(p) {
+                    return None;
+                }
+                let last = l.entries.last()?;
+                if last.at.abs_diff(p.created_at * 1000) > LEDGER_ENTRY_SKEW_MS || last.at > now_ms + LEDGER_HORIZON_MS {
+                    return None;
+                }
+                if let Spell::Writer { by, .. } = &last.spell
+                    && *by != p.author {
+                        return None;
+                    }
+                Some(l)
+            };
+            let gate = |p: &Edition| judge(p, &memo, &by_hash, &base);
+            let mut gapped = false;
+            let ordered = head_candidates(list, None, false, &mut gapped, Some(&gate));
+            if let Some(head) = pick_head(&ordered, &mut heads, &mut head_editions, &gate, &|_| 0)
+                && let Some(l) = ledger_of(head) {
+                    writers.insert(l.channel.clone(), l);
+                }
+        }
+
+        // Overwrites, each judged on itself by downward support (CORD-04 §8).
+        let mut overwrites: Vec<Overwrite> = Vec::new();
+        for (eid, all) in by_vsk_linked.get(VSK_ACL).into_iter().flatten() {
+            let overwrite_of = |p: &Edition| parse_overwrite(&p.content).filter(|o| overwrite_locator(community_id, &o.scope, &o.target).is_some_and(|l| to_hex(&l) == *eid));
+            let list: Vec<&Edition> = all.iter().copied().filter(|p| overwrite_of(p).is_some()).collect();
+            let ok = |p: &Edition| overwrite_of(p).is_some_and(|o| overwrite_authorized(&roster_ref, owner, &banned, &sealed, &o, &p.author, &to_hex(&p.self_hash)));
+            let mut gapped = false;
+            let ordered = head_candidates(&list, None, false, &mut gapped, Some(&ok));
+            if let Some(o) = pick_head(&ordered, &mut heads, &mut head_editions, &ok, &rank_of).and_then(overwrite_of)
+                && (o.allow != 0 || o.deny != 0) {
+                    overwrites.push(o);
+                }
+        }
+        roster.overwrites = overwrites;
+
+        // Syncs: the signer must be able to write every overwrite the sync swaps,
+        // the Category it leaves included (named by its served predecessor).
+        let mut syncs: HashMap<String, String> = HashMap::new();
+        for (eid, all) in by_vsk_linked.get(VSK_SYNC).into_iter().flatten() {
+            let sync_of = |p: &Edition| parse_sync(&p.content).filter(|(c, _)| hex32(c).is_some_and(|c| to_hex(&sync_locator(community_id, &c)) == *eid));
+            let list: Vec<&Edition> = all.iter().copied().filter(|p| sync_of(p).is_some()).collect();
+            let ok = |p: &Edition| {
+                let Some((channel, category)) = sync_of(p) else { return false };
+                let hash = to_hex(&p.self_hash);
+                if banned.contains(&p.author) && p.author != owner && !is_listed(&sealed, &p.author, &hash) {
+                    return false;
+                }
+                let left = match p.prev {
+                    None => None,
+                    Some(prev) => match list.iter().find(|x| x.self_hash == prev) {
+                        None => return false,
+                        Some(x) => sync_of(x).and_then(|(_, c)| c),
+                    },
+                };
+                let scopes: Vec<&str> = std::iter::once(channel.as_str()).chain(category.as_deref()).chain(left.as_deref()).collect();
+                may_swap_overwrites(&roster, owner, &p.author, &scopes, &|r| seal_of(&sealed, &p.author, &hash, r))
+            };
+            let mut gapped = false;
+            let ordered = head_candidates(&list, None, false, &mut gapped, Some(&ok));
+            if let Some((channel, Some(category))) = pick_head(&ordered, &mut heads, &mut head_editions, &ok, &rank_of).and_then(sync_of) {
+                syncs.insert(channel, category);
+            }
+        }
+        roster.syncs = syncs;
+    }
+
+    // 9. Categories (vsk 15), edited under MANAGE_CHANNELS like any Channel, on either Roster.
+    let not_categories = taken_by(VSK_CATEGORY);
+    let mut categories: BTreeMap<String, FoldedCategory> = BTreeMap::new();
+    {
+        let admit = holders(perm::MANAGE_CHANNELS);
+        for (eid, cands) in candidates_of(&by_vsk, VSK_CATEGORY, Some(&admit), &mut gap_held) {
+            if not_categories.contains(&eid) {
+                continue;
+            }
+            let Some(head) = pick_head(&cands, &mut heads, &mut head_editions, &admit, &rank_of) else { continue };
+            let applied = if read_category(&head.content).is_some() {
+                Some(head)
+            } else {
+                cands.iter().copied().find(|p| p.version <= head.version && admit(p) && read_category(&p.content).is_some())
+            };
+            let Some(applied) = applied else { continue };
+            let mut read = read_category(&applied.content).expect("checked");
+            let ever_deleted = by_vsk
+                .get(VSK_CATEGORY)
+                .and_then(|m| m.get(&eid))
+                .is_some_and(|l| l.iter().any(|p| admit(p) && read_category(&p.content).is_some_and(|c| c.deleted)));
+            read.id_hex = eid.clone();
+            read.deleted |= ever_deleted;
+            categories.insert(eid, read);
+        }
+        let live: Vec<String> = categories.values().filter(|c| !c.deleted).map(|c| c.id_hex.clone()).collect();
+        for id in live.into_iter().skip(MAX_CATEGORIES) {
+            categories.remove(&id);
+        }
+    }
+    // On the ranked Roster a Channel's sidebar category is the Category entity's name.
+    if ranked {
+        for ch in channels.values_mut() {
+            ch.category = ch.category_id.as_ref().and_then(|id| categories.get(id)).filter(|c| !c.deleted).map(|c| c.name.clone()).filter(|n| !n.is_empty());
         }
     }
 
@@ -716,6 +1115,10 @@ fn fold_once(
         heads,
         head_editions,
         incomplete,
+        ranked,
+        categories,
+        tenure: sealed,
+        writers,
     }
 }
 

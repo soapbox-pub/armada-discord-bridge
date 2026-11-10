@@ -6,6 +6,7 @@
 //! module is a port of Armada's `src/concord/lib`, checked against vectors that
 //! Armada's own code generates (`tools/vectors`).
 
+pub mod channel_seal;
 pub mod chat;
 pub mod community;
 pub mod control;
@@ -17,10 +18,14 @@ pub mod invite;
 pub mod kinds;
 pub mod media;
 pub mod nip44;
+pub mod rank;
 pub mod rekey;
 pub mod roles;
+pub mod roster;
 pub mod rumor;
+pub mod strict;
 pub mod stream;
+pub mod writers;
 
 pub use nostr;
 

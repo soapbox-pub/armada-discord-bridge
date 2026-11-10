@@ -94,6 +94,8 @@ pub struct ChannelView {
     pub forum: bool,
     pub category: Option<String>,
     pub position: Option<f64>,
+    /// The rank-key position, ordering Channels on the ranked Roster (CORD-03 §2).
+    pub rank: Option<String>,
     /// Newest first; `streams[0]` is where writes go.
     pub streams: Vec<ChannelStream>,
 }
@@ -267,13 +269,24 @@ impl Membership {
             } else {
                 root_streams.into_iter().chain(channel_streams).collect()
             };
+            // A sealed Private Channel's name is readable only with its key (CORD-03 §2).
+            let sealed_name = def.sealed.as_ref().zip(held).and_then(|(sealed, h)| {
+                let key = if h.epoch == sealed.epoch { Some(h.key.as_str()) } else { h.priors.iter().find(|p| p.epoch == sealed.epoch).map(|p| p.key.as_str()) };
+                crate::channel_seal::open_channel_seal(sealed, &b32(key?), &id)
+            });
+            let name = match (&sealed_name, held) {
+                (Some(o), _) => o.metadata.get("name").and_then(serde_json::Value::as_str).unwrap_or_default().to_owned(),
+                (None, Some(h)) if def.name.is_empty() && !h.name.is_empty() => h.name.clone(),
+                _ => def.name.clone(),
+            };
             out.push(ChannelView {
                 id_hex: def.channel_id_hex.clone(),
-                name: def.name.clone(),
+                name,
                 private: def.private,
                 forum: def.forum,
                 category: def.category.clone(),
                 position: def.position,
+                rank: def.rank.clone(),
                 streams,
             });
         }
@@ -289,14 +302,26 @@ impl Membership {
                 forum: false,
                 category: None,
                 position: None,
+                rank: None,
                 streams: private_streams(held, &id),
             });
         }
-        out.sort_by(|a, b| match (a.position, b.position) {
-            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.name.cmp(&b.name)),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.name.cmp(&b.name),
+        let ranked = folded.is_some_and(|f| f.ranked);
+        out.sort_by(|a, b| {
+            if ranked {
+                return match (&a.rank, &b.rank) {
+                    (Some(x), Some(y)) => x.cmp(y).then_with(|| a.name.cmp(&b.name)),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.name.cmp(&b.name),
+                };
+            }
+            match (a.position, b.position) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.name.cmp(&b.name)),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.name.cmp(&b.name),
+            }
         });
         out
     }

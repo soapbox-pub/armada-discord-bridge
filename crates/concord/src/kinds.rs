@@ -17,6 +17,7 @@ pub const TIMER_NOTICE: u16 = 1740;
 pub const WEBXDC: u16 = 3310;
 pub const TYPING: u16 = 23311;
 pub const VOICE_PRESENCE: u16 = 23313;
+pub const VOICE_DIRECTIVE: u16 = 23314;
 // Armada extensions on the chat plane (CORD.md)
 pub const ZAP: u16 = 9735;
 pub const ONCHAIN_ZAP: u16 = 8333;
@@ -30,10 +31,14 @@ pub const CALENDAR_RSVP: u16 = 31925;
 pub const JOIN_LEAVE: u16 = 3306;
 pub const KICK: u16 = 3309;
 pub const SNAPSHOT: u16 = 3312;
+pub const TIMEOUT: u16 = 3314;
+pub const NICKNAME: u16 = 3315;
 
 // Control and rekey planes
 pub const CONTROL: u16 = 3308;
 pub const REKEY: u16 = 3303;
+/// A writer certificate's preimage (CORD-03 §1): never published.
+pub const WRITER_CERT: u16 = 3320;
 
 // Person-addressed
 pub const DIRECT_INVITE: u16 = 3313;
@@ -86,9 +91,9 @@ impl Plane {
     pub fn admits(self, kind: u16) -> bool {
         match self {
             Plane::Control => kind == CONTROL,
-            Plane::Guestbook => matches!(kind, JOIN_LEAVE | KICK | SNAPSHOT),
+            Plane::Guestbook => matches!(kind, JOIN_LEAVE | KICK | SNAPSHOT | TIMEOUT | NICKNAME),
             Plane::Rekey => kind == REKEY,
-            Plane::Chat => !matches!(kind, CONTROL | JOIN_LEAVE | KICK | SNAPSHOT | REKEY),
+            Plane::Chat => !matches!(kind, CONTROL | JOIN_LEAVE | KICK | SNAPSHOT | TIMEOUT | NICKNAME | REKEY | WRITER_CERT),
         }
     }
 }

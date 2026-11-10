@@ -7,6 +7,7 @@
 //! ["ev",  n]               this edition's version, climbing from 1
 //! ["ep",  hex32]           the previous edition's hash (absent on the first)
 //! ["vac", eid, ver, hash]  the authority citation (absent when the owner acts)
+//! ["eh", "2"], ["eb", hex] MARKED: the hash covers the signer, bound to a Community
 //! ```
 
 use sha2::{Digest, Sha256};
@@ -41,6 +42,34 @@ pub fn edition_hash(entity_id: &Bytes32, version: u64, prev: Option<&Bytes32>, c
     h.finalize().into()
 }
 
+const EDITION_SIGNER_LABEL: &[u8] = b"concord/edition-signer";
+
+/// A MARKED edition's hash (CORD-04 §1): the unmarked preimage, then the raw
+/// label and the signer, so a copy re-signed under another key is another
+/// edition and its `ep` links can't be borrowed by someone else's chain.
+pub fn marked_edition_hash(entity_id: &Bytes32, version: u64, prev: Option<&Bytes32>, content: &[u8], signer: &Bytes32) -> Bytes32 {
+    let mut h = Sha256::new();
+    h.update((EDITION_LABEL.len() as u64).to_be_bytes());
+    h.update(EDITION_LABEL.as_bytes());
+    h.update(entity_id);
+    h.update(version.to_be_bytes());
+    match prev {
+        Some(p) => {
+            h.update([1]);
+            h.update(p);
+        }
+        None => {
+            h.update([0]);
+            h.update([0u8; 32]);
+        }
+    }
+    h.update((content.len() as u64).to_be_bytes());
+    h.update(content);
+    h.update(EDITION_SIGNER_LABEL);
+    h.update(signer);
+    h.finalize().into()
+}
+
 /// The exact Grant edition an actor claims authority under (CORD-04 §5).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Citation {
@@ -54,6 +83,7 @@ impl Citation {
         vec!["vac".into(), to_hex(&self.entity_id), self.version.to_string(), to_hex(&self.edition_hash)]
     }
 
+    /// The first `vac` tag with four parts; a malformed one reads as absent.
     pub fn from_tags(tags: &[Vec<String>]) -> Option<Self> {
         let t = tags.iter().find(|t| t.len() >= 4 && t[0] == "vac")?;
         Some(Citation { entity_id: hex32(&t[1])?, version: parse_tag_decimal(&t[2])?, edition_hash: hex32(&t[3])? })
@@ -69,6 +99,8 @@ pub struct Edition {
     pub prev: Option<Bytes32>,
     pub content: String,
     pub self_hash: Bytes32,
+    /// The Community a MARKED edition binds itself to (`eb`); `None` when unmarked.
+    pub binding: Option<Bytes32>,
     pub created_at: u64,
     /// The rumor id — the equal-version tiebreak (lower wins).
     pub rumor_id: Bytes32,
@@ -104,7 +136,7 @@ pub fn parse_edition(opened: Opened) -> Result<Edition, EditionError> {
     if opened.seal_kind() != kinds::SEAL_PLAINTEXT {
         return Err(EditionError::SealKind);
     }
-    for name in ["vsk", "eid", "ev", "ep", "vac"] {
+    for name in ["vsk", "eid", "ev", "ep", "vac", "eh", "eb"] {
         if r.tags_named(name).count() > 1 {
             return Err(EditionError::Duplicate(name));
         }
@@ -116,7 +148,20 @@ pub fn parse_edition(opened: Opened) -> Result<Edition, EditionError> {
         Some(ep) => Some(hex32(ep).ok_or(EditionError::Field("ep"))?),
         None => None,
     };
-    let self_hash = edition_hash(&entity_id, version, prev.as_ref(), r.content.as_bytes());
+    // A marked edition is bound and covers its signer; any other marker is a form
+    // this reader doesn't know. An `eb` without `eh` is ignored (CORD-04 §1).
+    let binding = match r.tag_value("eh") {
+        None => None,
+        Some("2") => Some(r.tag_value("eb").and_then(hex32).ok_or(EditionError::Field("eb"))?),
+        Some(_) => return Err(EditionError::Field("eh")),
+    };
+    let self_hash = match &binding {
+        Some(_) => {
+            let signer = hex32(&r.pubkey).ok_or(EditionError::Field("pubkey"))?;
+            marked_edition_hash(&entity_id, version, prev.as_ref(), r.content.as_bytes(), &signer)
+        }
+        None => edition_hash(&entity_id, version, prev.as_ref(), r.content.as_bytes()),
+    };
     let rumor_id = hex32(&r.id).ok_or(EditionError::Field("id"))?;
     Ok(Edition {
         author: r.pubkey.clone(),
@@ -126,6 +171,7 @@ pub fn parse_edition(opened: Opened) -> Result<Edition, EditionError> {
         prev,
         content: r.content.clone(),
         self_hash,
+        binding,
         created_at: r.created_at,
         rumor_id,
         authority: Citation::from_tags(&r.tags),
@@ -143,12 +189,20 @@ pub struct EditionMeta<'a> {
     pub authority: Option<&'a Citation>,
     /// Defaults to now.
     pub created_at: Option<u64>,
+    /// `edition_binding(community_id)`: when given, the edition is MARKED
+    /// (CORD-04 §1), as every edition of a Community on the vsk-13 Roster is.
+    pub binding: Option<&'a Bytes32>,
 }
 
 impl<'a> EditionMeta<'a> {
     /// A first edition (version 1, no predecessor).
     pub fn first(actor: &'a str, authority: Option<&'a Citation>) -> Self {
-        EditionMeta { actor, version: 1, prev: None, authority, created_at: None }
+        EditionMeta { actor, version: 1, prev: None, authority, created_at: None, binding: None }
+    }
+
+    /// This edition, marked and bound to a Community.
+    pub fn marked(self, binding: &'a Bytes32) -> Self {
+        EditionMeta { binding: Some(binding), ..self }
     }
 }
 
@@ -164,6 +218,10 @@ pub fn build_edition_rumor(vsk: &str, entity_id: &Bytes32, content: String, meta
     }
     if let Some(a) = meta.authority {
         tags.push(a.to_tag());
+    }
+    if let Some(b) = meta.binding {
+        tags.push(vec!["eh".into(), "2".into()]);
+        tags.push(vec!["eb".into(), to_hex(b)]);
     }
     Rumor::new(kinds::CONTROL, content, tags, meta.actor, None, meta.created_at)
 }
@@ -194,12 +252,15 @@ pub(crate) struct FoldResult {
     pub gap: bool,
 }
 
-/// Fold ONE entity's editions into its chain-checked head (CORD-04 §1).
-/// `floor` is the highest version already accepted (0 = none). Every sibling of a
-/// version is kept, since the rumor-id tiebreak is publisher-chosen: the `prev`
-/// link decides which one continues the chain.
+/// Fold ONE entity's editions into its chain-checked head (CORD-04 §1, Armada
+/// `version.fold`). `floor` is the highest version already accepted (0 = none).
+/// Every sibling of a version is kept, since the rumor-id tiebreak is
+/// publisher-chosen, and the walk follows EVERY sibling that links to one already
+/// reached (CORD-02 §2): a branch the chain went on to extend is followed, never
+/// stranded behind a sibling that won the tiebreak and went nowhere. The head is
+/// the highest version reached, its tiebreak winner first.
 pub(crate) fn fold_chain(editions: &[&Edition], floor: u64, floor_hash: Option<&Bytes32>) -> FoldResult {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     let mut by_version: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
     for (i, e) in editions.iter().enumerate() {
         if e.version >= floor {
@@ -213,36 +274,61 @@ pub(crate) fn fold_chain(editions: &[&Edition], floor: u64, floor_hash: Option<&
     let Some(&first) = versions.first() else {
         return FoldResult { head: None, gap: false };
     };
-    let base = &by_version[&first];
-    let anchor = if floor == 0 {
-        if first == 1 { base.iter().copied().find(|&i| editions[i].prev.is_none()) } else { None }
-    } else if let Some(fh) = floor_hash {
-        if first == floor {
-            base.iter().copied().find(|&i| &editions[i].self_hash == fh)
-        } else if first == floor + 1 {
-            base.iter().copied().find(|&i| editions[i].prev.as_ref() == Some(fh))
-        } else {
-            None
+    if floor > 0
+        && let Some(fh) = floor_hash {
+            return fold_from_floor(editions, &by_version, &versions, floor, fh);
         }
-    } else {
-        None
-    };
+    let base = &by_version[&first];
+    let anchor = if floor == 0 && first == 1 { base.iter().copied().find(|&i| editions[i].prev.is_none()) } else { None };
     let mut gap = anchor.is_none();
-    let mut head = anchor.unwrap_or(base[0]);
+    let mut reached = vec![anchor.unwrap_or(base[0])];
     for w in versions.windows(2) {
         if w[1] != w[0] + 1 {
             gap = true;
             break;
         }
-        let next = by_version[&w[1]].iter().copied().find(|&i| editions[i].prev.as_ref() == Some(&editions[head].self_hash));
-        match next {
-            Some(n) => head = n,
-            None => {
-                gap = true;
-                break;
+        let held: HashSet<Bytes32> = reached.iter().map(|&i| editions[i].self_hash).collect();
+        let next: Vec<usize> = by_version[&w[1]].iter().copied().filter(|&i| editions[i].prev.is_some_and(|p| held.contains(&p))).collect();
+        if next.is_empty() {
+            gap = true;
+            break;
+        }
+        reached = next;
+    }
+    FoldResult { head: Some(reached[0]), gap }
+}
+
+/// The walk from a held head (Armada `foldFromFloor`, Vector `fold_linked`): the
+/// version above links to the held hash whether or not it is served.
+fn fold_from_floor(editions: &[&Edition], by_version: &std::collections::BTreeMap<u64, Vec<usize>>, versions: &[u64], floor: u64, floor_hash: &Bytes32) -> FoldResult {
+    use std::collections::{HashMap, HashSet};
+    let held_served = by_version.get(&floor).is_some_and(|l| l.iter().any(|&i| &editions[i].self_hash == floor_hash));
+    let mut reached_at: HashMap<u64, HashSet<Bytes32>> = HashMap::new();
+    let mut reached: Vec<usize> = Vec::new();
+    for &v in versions {
+        for &i in &by_version[&v] {
+            let e = editions[i];
+            let linked = if v == floor {
+                &e.self_hash == floor_hash || held_served
+            } else {
+                (v == floor + 1 && e.prev.as_ref() == Some(floor_hash))
+                    || e.prev.is_some_and(|p| reached_at.get(&(v - 1)).is_some_and(|s| s.contains(&p)))
+            };
+            if !linked {
+                continue;
             }
+            reached.push(i);
+            reached_at.entry(v).or_default().insert(e.self_hash);
         }
     }
+    let Some(&first) = reached.first() else { return FoldResult { head: None, gap: true } };
+    let mut head = first;
+    for &i in &reached {
+        if editions[i].version > editions[head].version {
+            head = i;
+        }
+    }
+    let gap = versions.last().is_some_and(|&top| top > editions[head].version);
     FoldResult { head: Some(head), gap }
 }
 

@@ -109,10 +109,7 @@ fn folded(owner: &str, channel_id: &str) -> FoldedControl {
         name: "general".into(),
         private: false,
         deleted: false,
-        forum: false,
-        category: None,
-        position: None,
-        raw: serde_json::Value::Null,
+        ..Default::default()
     };
     FoldedControl { owner: owner.into(), channels: BTreeMap::from([(channel_id.to_owned(), channel)]), ..Default::default() }
 }
@@ -205,7 +202,7 @@ impl Harness {
     fn promote(&self, member: &Keys) {
         let mut f = (*self.client.folded().unwrap()).clone();
         let role_id = hex::encode([9u8; 32]);
-        f.roster.roles.push(Role { role_id: role_id.clone(), name: "Mod".into(), position: 2, permissions: perm::MANAGE_MESSAGES, scope: RoleScope::Server, color: 0 });
+        f.roster.roles.push(Role::new(&role_id, "Mod", 2, perm::MANAGE_MESSAGES, RoleScope::Server));
         f.roster.grants.push(MemberGrant { member: member.public_key().to_hex(), role_ids: vec![role_id], control_wrap: None });
         self.client.set_folded(f);
     }

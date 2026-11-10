@@ -155,6 +155,146 @@ fn control_fold_matches_armada() {
 }
 
 #[test]
+fn v2_derivations_match() {
+    let v = vectors();
+    let k = &v["keys"];
+    let d = &v["derive_v2"];
+    let (root, cid, chan, alice, owner) = (h(&k["community_root"]), h(&k["community_id"]), h(&k["channel_id"]), h(&k["alice"]), h(&k["owner"]));
+    let s = |v: &Value| v.as_str().unwrap().to_owned();
+    assert_eq!(to_hex(&everyone_locator(&cid)), s(&d["everyone_locator"]));
+    assert_eq!(to_hex(&edition_binding(&cid)), s(&d["edition_binding"]));
+    assert_eq!(to_hex(&tenure_locator(&cid, &alice, &owner)), s(&d["tenure_locator"]));
+    let acl = |kind, id: Option<&[u8; 32]>| to_hex(&acl_locator(&cid, &chan, &overwrite_target_bytes(&cid, kind, id)));
+    assert_eq!(acl(OverwriteTargetKind::Everyone, None), s(&d["acl_everyone"]));
+    assert_eq!(acl(OverwriteTargetKind::Role, Some(&[0x03; 32])), s(&d["acl_role"]));
+    assert_eq!(acl(OverwriteTargetKind::Member, Some(&alice)), s(&d["acl_member"]));
+    assert_eq!(to_hex(&sync_locator(&cid, &chan)), s(&d["sync_locator"]));
+    assert_eq!(to_hex(&writers_locator(&cid, &chan)), s(&d["writers_locator"]));
+    assert_eq!(to_hex(&writer_scope(&chan)), s(&d["writer_scope"]));
+    assert_eq!(to_hex(&certifier_scope(&chan)), s(&d["certifier_scope"]));
+    assert_eq!(to_hex(&history_scope(&chan)), s(&d["history_scope"]));
+    let check = |g: GroupKey, want: &Value| {
+        assert_eq!(g.pk_hex(), want["pk"].as_str().unwrap());
+        assert_eq!(to_hex(&g.conv_key), want["conv_key"].as_str().unwrap());
+    };
+    check(channel_writer_group_key(&[0x71; 32], &chan, 1), &d["channel_writer_e1"]);
+    check(channel_access_group_key(&root, &chan, 0), &d["channel_access_e0"]);
+    let address = channel_group_key(&root, &chan, 0).pubkey().to_bytes();
+    assert_eq!(wrap_owner_key(keys(&k["alice_sk"]).secret_key(), &address, &[0x09; 32]).public_key().to_hex(), s(&d["wrap_owner"]));
+    let marked = concord::edition::marked_edition_hash(&[0x11; 32], 2, Some(&[0x22; 32]), br#"{"name":"Mods"}"#, &[0x33; 32]);
+    assert_eq!(to_hex(&marked), s(&d["marked_hash"]));
+    // The spec's own vector (CORD-04 §1).
+    assert!(to_hex(&marked).starts_with("462cc8"));
+}
+
+#[test]
+fn ranked_fold_matches_armada() {
+    use concord::roles::OverwriteTarget;
+    let v = vectors();
+    let r = &v["ranked"];
+    let k = &v["keys"];
+    let cid = h(&r["community_id"]);
+    let owner = k["owner"].as_str().unwrap();
+    let read = control_group_key(&h(&k["community_root"]), &cid, 0);
+    let stream = StreamKey { pk: concord::nostr::prelude::PublicKey::from_hex(r["control_pk"].as_str().unwrap()).unwrap(), conv_key: read.conv_key, sk: None, restricted: true };
+    let editions: Vec<_> = r["wraps"].as_array().unwrap().iter().map(|w| parse_edition(open_plane_wrap(&event(w), &stream, Plane::Control).unwrap()).unwrap()).collect();
+    let folded = fold_control(&editions, &cid, owner, None, None);
+    let want = &r["expect"];
+
+    assert_eq!(folded.ranked, want["ranked"].as_bool().unwrap());
+    assert_eq!(folded.roster.everyone.map(|e| e.to_string()), want["everyone"].as_str().map(str::to_owned));
+    let legacy: Vec<String> = want["legacy"].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_owned()).collect();
+    assert_eq!(folded.roster.legacy_channels.as_ref(), Some(&legacy));
+
+    let mut got_roles: Vec<Value> = folded
+        .roster
+        .roles
+        .iter()
+        .map(|x| serde_json::json!({ "id": x.role_id, "name": x.name, "rank": x.rank, "position": x.position, "permissions": x.permissions.to_string(), "mentionable": x.mentionable, "display": x.display }))
+        .collect();
+    let mut want_roles = want["roles"].as_array().unwrap().clone();
+    let by_id = |a: &Value, b: &Value| a["id"].as_str().cmp(&b["id"].as_str());
+    got_roles.sort_by(by_id);
+    want_roles.sort_by(by_id);
+    assert_eq!(got_roles, want_roles);
+
+    let mut got_grants: Vec<(String, Vec<String>)> = folded.roster.grants.iter().map(|g| (g.member.clone(), g.role_ids.clone())).collect();
+    let mut want_grants: Vec<(String, Vec<String>)> = serde_json::from_value(want["grants"].clone()).unwrap();
+    got_grants.sort();
+    want_grants.sort();
+    assert_eq!(got_grants, want_grants);
+
+    let mut got_ow: Vec<Value> = folded
+        .roster
+        .overwrites
+        .iter()
+        .map(|o| {
+            let (kind, id) = match &o.target {
+                OverwriteTarget::Everyone => ("everyone", None),
+                OverwriteTarget::Role(i) => ("role", Some(i.clone())),
+                OverwriteTarget::Member(i) => ("member", Some(i.clone())),
+            };
+            serde_json::json!([o.scope, kind, id, o.allow.to_string(), o.deny.to_string()])
+        })
+        .collect();
+    let mut want_ow = want["overwrites"].as_array().unwrap().clone();
+    let key = |a: &Value| a.to_string();
+    got_ow.sort_by_key(key);
+    want_ow.sort_by_key(key);
+    assert_eq!(got_ow, want_ow);
+
+    let want_syncs: std::collections::HashMap<String, String> = serde_json::from_value(want["syncs"].clone()).unwrap();
+    assert_eq!(folded.roster.syncs, want_syncs);
+    let got_cats: Vec<Value> = folded.categories.values().map(|c| serde_json::json!([c.id_hex, c.name, c.position, c.deleted])).collect();
+    assert_eq!(Value::Array(got_cats), want["categories"]);
+
+    for (id, c) in want["channels"].as_object().unwrap() {
+        let got = &folded.channels[id];
+        assert_eq!(got.name, c["name"].as_str().unwrap(), "{id}");
+        assert_eq!(got.private, c["private"].as_bool().unwrap());
+        assert_eq!(got.deleted, c["deleted"].as_bool().unwrap());
+        assert_eq!(got.category_id.as_deref(), c["category"].as_str());
+        assert_eq!(got.rank.as_deref(), c["position"].as_str());
+        assert_eq!(got.sealed.is_some(), c["sealed"].as_bool().unwrap());
+    }
+    assert_eq!(folded.channels.len(), want["channels"].as_object().unwrap().len());
+    let got_writers: HashSet<String> = folded.writers.keys().cloned().collect();
+    let want_writers: HashSet<String> = serde_json::from_value(want["writers"].clone()).unwrap();
+    assert_eq!(got_writers, want_writers);
+
+    for (cn, id) in r["channels"].as_object().unwrap() {
+        let id = id.as_str().unwrap();
+        assert_eq!(folded.roster.everyone_sends(id), want["everyone_sends"][cn].as_bool().unwrap(), "everyone_sends {cn}");
+        for (mn, pk) in r["members"].as_object().unwrap() {
+            assert_eq!(folded.channel_permissions(pk.as_str().unwrap(), id).to_string(), want["permissions"][mn][cn].as_str().unwrap(), "{mn} in {cn}");
+        }
+    }
+
+    // The sealed Private Channel opens with its key and names its creator.
+    let secret = r["channels"]["secret"].as_str().unwrap();
+    let sealed = folded.channels[secret].sealed.as_ref().unwrap();
+    let opened = concord::channel_seal::open_channel_seal(sealed, &h(&r["secret_key"]), &hex32(secret).unwrap()).unwrap();
+    assert_eq!(opened.metadata["name"], "secret-plans");
+    assert_eq!(opened.creator.as_deref(), Some(owner));
+
+    // A post at the writer address opens under the read key and stands on its
+    // certificate; a roleless member's post at the read address doesn't.
+    let ann = r["channels"]["announcements"].as_str().unwrap();
+    let ledger = folded.restricting_ledger(ann).unwrap();
+    let read_key = channel_group_key(&h(&k["community_root"]), &hex32(ann).unwrap(), 0);
+    let writer = StreamKey { pk: concord::nostr::prelude::PublicKey::from_hex(r["writer_pk"].as_str().unwrap()).unwrap(), conv_key: read_key.conv_key, sk: None, restricted: false };
+    let post = open_plane_wrap(&event(&r["post_wrap"]), &writer, Plane::Chat).unwrap();
+    check_channel_binding(&post.rumor, ann, 0).unwrap();
+    let stands = concord::writers::post_stands(ledger, &cid, post.author(), post.ms, &post.rumor.tags);
+    assert_eq!(stands, want["post_stands"].as_bool().unwrap());
+    assert!(stands);
+    let stray = open_plane_wrap(&event(&r["stray_wrap"]), &(&read_key).into(), Plane::Chat).unwrap();
+    let stray_stands = concord::writers::post_stands(ledger, &cid, stray.author(), stray.ms, &stray.rumor.tags);
+    assert_eq!(stray_stands, want["stray_stands"].as_bool().unwrap());
+    assert!(!stray_stands);
+}
+
+#[test]
 fn invites_match() {
     let v = vectors();
     let i = &v["invite"];
@@ -243,14 +383,7 @@ fn builders_match_armada() {
     check(grant_rumor, &b["grant"]);
 
     check(build_role_edition(&admin_role(&role_id), &owner_meta).unwrap(), &b["admin_role"]);
-    let access = Role {
-        role_id: to_hex(&[0x04; 32]),
-        name: "mods".into(),
-        position: 7,
-        permissions: 0,
-        scope: RoleScope::Channel(s(&k["channel_id"])),
-        color: 0,
-    };
+    let access = Role::new(&to_hex(&[0x04; 32]), "mods", 7, 0, RoleScope::Channel(s(&k["channel_id"])));
     check(build_role_edition(&access, &op_meta).unwrap(), &b["access_role"]);
     assert!(build_role_edition(&Role { position: 0, ..access }, &op_meta).is_err());
 

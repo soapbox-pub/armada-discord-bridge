@@ -25,6 +25,19 @@ const LABEL_INVITE_LINKS: &str = "concord/invite-links";
 const LABEL_PINS: &str = "concord/pins";
 const LABEL_SIGNAL: &str = "concord/signal";
 const LABEL_INVITE_KEY: &str = "concord/invite-key";
+const LABEL_CHANNEL_ACCESS: &str = "concord/channel-access";
+const LABEL_CHANNEL_WRITER: &str = "concord/channel-writer";
+const LABEL_EVERYONE: &str = "concord/everyone";
+const LABEL_TENURE: &str = "concord/tenure";
+const LABEL_ACL: &str = "concord/acl";
+const LABEL_SYNC: &str = "concord/sync";
+const LABEL_WRITERS: &str = "concord/writers";
+const LABEL_EDITION_BINDING: &str = "concord/edition-binding";
+const LABEL_WRAP_OWNER: &str = "concord/wrap-owner";
+// A.7: plain SHA-256 scopes, outside the hkdf shape.
+const LABEL_WRITER_SCOPE: &str = "concord/writer-scope";
+const LABEL_CERTIFIER_SCOPE: &str = "concord/certifier-scope";
+const LABEL_HISTORY_SCOPE: &str = "concord/history-scope";
 const LABEL_COMMUNITY: &str = "concord/community";
 const LABEL_EPOCH_COMMITMENT: &str = "concord/epoch-key-commitment";
 
@@ -158,6 +171,109 @@ pub fn pins_locator(community_id: &Bytes32, channel_id: &Bytes32) -> Bytes32 {
 
 pub fn banlist_locator(community_id: &Bytes32) -> Bytes32 {
     hkdf32(community_id, &build_info(LABEL_BANLIST, &ZERO32, None))
+}
+
+/// The `@everyone` Role's coordinate (CORD-04 §2); an owner edition here moves
+/// a Community to the vsk-13 Roster.
+pub fn everyone_locator(community_id: &Bytes32) -> Bytes32 {
+    hkdf32(community_id, &build_info(LABEL_EVERYONE, &ZERO32, None))
+}
+
+/// What a marked edition names in `eb` to bind itself to its Community (CORD-04 §1).
+pub fn edition_binding(community_id: &Bytes32) -> Bytes32 {
+    hkdf32(community_id, &build_info(LABEL_EDITION_BINDING, &ZERO32, None))
+}
+
+fn sha256_concat(parts: &[&[u8]]) -> Bytes32 {
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update(p);
+    }
+    h.finalize().into()
+}
+
+/// A member's Tenure from one sealer (CORD-04 §9): id `SHA-256(member ‖ sealer)`.
+pub fn tenure_locator(community_id: &Bytes32, member: &Bytes32, sealer: &Bytes32) -> Bytes32 {
+    hkdf32(community_id, &build_info(LABEL_TENURE, &sha256_concat(&[member, sealer]), None))
+}
+
+/// Who an overwrite targets, for its coordinate (CORD-04 §8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverwriteTargetKind {
+    Everyone,
+    Role,
+    Member,
+}
+
+impl OverwriteTargetKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OverwriteTargetKind::Everyone => "everyone",
+            OverwriteTargetKind::Role => "role",
+            OverwriteTargetKind::Member => "member",
+        }
+    }
+}
+
+/// The 32 bytes a target contributes to its overwrite's coordinate:
+/// `SHA-256(utf8(kind) ‖ target)`, `target` being the `@everyone` coordinate for
+/// `everyone`, so a Role and a member sharing 32 bytes never share an overwrite.
+pub fn overwrite_target_bytes(community_id: &Bytes32, kind: OverwriteTargetKind, id: Option<&Bytes32>) -> Bytes32 {
+    let everyone = everyone_locator(community_id);
+    let target = match kind {
+        OverwriteTargetKind::Everyone => &everyone,
+        _ => id.expect("a role or member overwrite names its target"),
+    };
+    sha256_concat(&[kind.as_str().as_bytes(), target])
+}
+
+/// One overwrite's coordinate (CORD-04 §8): id `SHA-256(scope ‖ target_bytes)`.
+pub fn acl_locator(community_id: &Bytes32, scope: &Bytes32, target_bytes: &Bytes32) -> Bytes32 {
+    hkdf32(community_id, &build_info(LABEL_ACL, &sha256_concat(&[scope, target_bytes]), None))
+}
+
+/// A Channel's sync coordinate (CORD-04 §8).
+pub fn sync_locator(community_id: &Bytes32, channel_id: &Bytes32) -> Bytes32 {
+    hkdf32(community_id, &build_info(LABEL_SYNC, channel_id, None))
+}
+
+/// A restricted Channel's Writers ledger coordinate (CORD-03 §1).
+pub fn writers_locator(community_id: &Bytes32, channel_id: &Bytes32) -> Bytes32 {
+    hkdf32(community_id, &build_info(LABEL_WRITERS, channel_id, None))
+}
+
+/// A restricted Channel's writer scope (A.7).
+pub fn writer_scope(channel_id: &Bytes32) -> Bytes32 {
+    sha256_concat(&[LABEL_WRITER_SCOPE.as_bytes(), channel_id])
+}
+
+/// A restricted Channel's certifier scope (A.7).
+pub fn certifier_scope(channel_id: &Bytes32) -> Bytes32 {
+    sha256_concat(&[LABEL_CERTIFIER_SCOPE.as_bytes(), channel_id])
+}
+
+/// A Channel's read-only history scope (A.7, CORD-03 §5).
+pub fn history_scope(channel_id: &Bytes32) -> Bytes32 {
+    sha256_concat(&[LABEL_HISTORY_SCOPE.as_bytes(), channel_id])
+}
+
+/// A restricted Channel's writer address and wrap signer for a writer epoch (CORD-03 §1).
+pub fn channel_writer_group_key(writer_secret: &Bytes32, channel_id: &Bytes32, writer_epoch: u64) -> GroupKey {
+    group_key(LABEL_CHANNEL_WRITER, writer_secret, channel_id, Some(writer_epoch))
+}
+
+/// A Channel's access plane for a root epoch, where keys are delivered (CORD-03 §5).
+pub fn channel_access_group_key(community_root: &Bytes32, channel_id: &Bytes32, root_epoch: u64) -> GroupKey {
+    group_key(LABEL_CHANNEL_ACCESS, community_root, channel_id, Some(root_epoch))
+}
+
+/// The `p` key of an author's own wrap at `address` (CORD-01 §Deletions):
+/// `group_key(author_secret, "concord/wrap-owner", SHA-256(address ‖ rumor_id))`,
+/// so any of the author's clients can delete it later, and nobody else can tie
+/// the wrap to them.
+pub fn wrap_owner_key(author_secret: &SecretKey, address: &Bytes32, rumor_id: &Bytes32) -> Keys {
+    let id = sha256_concat(&[address, rumor_id]);
+    Keys::new(hkdf_to_secret_key(&author_secret.to_secret_bytes(), &build_info(LABEL_WRAP_OWNER, &id, None)))
 }
 
 pub fn invite_links_locator(community_id: &Bytes32, creator: &Bytes32) -> Bytes32 {

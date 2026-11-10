@@ -874,14 +874,13 @@ impl Importer {
             // never appeared is inert, while a private channel whose Role mint
             // then failed is a room with no access list at all.
             if plan.channels[i].is_private() && plan.channels[i].access_role_published_at.is_none() {
-                let role = Role {
-                    role_id: plan.channels[i].access_role_id_hex.clone().context("private channel has no access role")?,
-                    name: plan.channels[i].name.clone(),
-                    position: access_role_position,
-                    permissions: 0,
-                    scope: RoleScope::Channel(channel_id.clone()),
-                    color: 0,
-                };
+                let role = Role::new(
+                    &plan.channels[i].access_role_id_hex.clone().context("private channel has no access role")?,
+                    &plan.channels[i].name,
+                    access_role_position,
+                    0,
+                    RoleScope::Channel(channel_id.clone()),
+                );
                 let edition = seal_edition(&build_role_edition(&role, &op_v1)?, &control, op)?;
                 self.publish_verified(relays, &edition, &format!("access role edition for #{}", role.name)).await?;
                 plan.channels[i].access_role_published_at = Some(now_ms());
@@ -923,14 +922,7 @@ impl Importer {
                 continue;
             }
             let r = &plan.roles[i];
-            let role = Role {
-                role_id: r.role_id_hex.clone().context("role has no id")?,
-                name: r.name.clone(),
-                position: r.position,
-                permissions: r.permissions,
-                scope: RoleScope::Server,
-                color: r.color,
-            };
+            let role = Role { color: r.color, ..Role::new(&r.role_id_hex.clone().context("role has no id")?, &r.name, r.position, r.permissions, RoleScope::Server) };
             let edition = seal_edition(&build_role_edition(&role, &op_v1)?, &control, op)?;
             self.publish_verified(relays, &edition, &format!("role edition \"{}\"", role.name)).await?;
             plan.roles[i].published_at = Some(now_ms());
