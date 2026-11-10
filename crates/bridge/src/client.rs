@@ -312,9 +312,19 @@ impl ConcordClient {
     /// which replays the whole plane from every relay and re-folds within
     /// CONTROL_REFOLD of it arriving. A start that misses a channel this way
     /// re-folds once, then retries on backoff.
+    ///
+    /// The Guestbook's Timeouts ride the same query. Catch-up backfill runs
+    /// on this first fold, before the live subscription has delivered
+    /// anything, so without them a timed-out member's posts from while the
+    /// bridge was down were mirrored.
     pub async fn sync_control(&self) -> anyhow::Result<Arc<FoldedControl>> {
-        let wraps = self.relays.query_settled(vec![self.control_filter()]).await?;
-        Ok(self.fold(&self.open_editions(&wraps)))
+        let (guestbook, guestbook_filter) = self.guestbook_filter();
+        let wraps = self.relays.query_settled(vec![self.control_filter(), guestbook_filter]).await?;
+        let (timeouts, control): (Vec<Event>, Vec<Event>) = wraps.into_iter().partition(|w| guestbook.iter().any(|s| s.pk == w.pubkey));
+        for wrap in &timeouts {
+            self.take_timeout(wrap, &guestbook);
+        }
+        Ok(self.fold(&self.open_editions(&control)))
     }
 
     /// Channels readable with held keys, per the current fold.

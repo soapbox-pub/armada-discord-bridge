@@ -401,3 +401,24 @@ async fn a_sealed_channels_creator_and_layout_open_with_the_held_key() {
     let view = client.channel(&hex::encode(id)).unwrap();
     assert_eq!((view.name.as_str(), view.category.as_deref(), view.rank.as_deref(), view.forum), ("plans", Some("Staff"), Some("W"), true));
 }
+
+#[tokio::test]
+async fn the_first_fold_reads_running_timeouts_so_catch_up_judges_by_them() {
+    use concord::judge::Verdict;
+    let w = world();
+    let chan = [2u8; 32];
+    w.channel(chan, "general", false);
+    let alice = Keys::generate();
+    let now = now_ms();
+    let tags = vec![vec!["p".to_string(), alice.public_key().to_hex()], vec!["until".into(), (now / 1000 + 3600).to_string()]];
+    let timeout = concord::rumor::Rumor::new(kinds::TIMEOUT, String::new(), tags, &w.owner.public_key().to_hex(), Some(now - 60_000), None);
+    let gb: StreamKey = w.community.current_guestbook_stream();
+    w.relay.inject(seal_and_wrap(&timeout, Plane::Guestbook, &gb, &w.owner, Default::default()).unwrap());
+
+    let client = w.client(Keys::generate());
+    client.sync_control().await.unwrap();
+    let channel = client.channel(&hex::encode(chan)).unwrap();
+    let (rumor, _) = client.send_chat(&channel, SendChat::message(&alice, "while timed out")).await.unwrap();
+    let chat = OpenedChat { ms: rumor.created_at * 1000, rumor, channel_id_hex: channel.id_hex.clone(), epoch: 0, writer_epoch: None };
+    assert_eq!(client.judge(&chat), Verdict::Collapsed);
+}
