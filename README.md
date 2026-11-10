@@ -26,17 +26,31 @@ never bridged without its community's consent.
   mapping rows.
 - **Live control-plane folds** — role and ban changes on the Armada side take
   effect without a restart, and stream-key rotation re-subscribes.
+- **Both Rosters** — legacy communities and ones on Roles v2 (ranked roles,
+  `@everyone`, channel permission overwrites, Categories, sealed private
+  channels). The bridge mirrors only what Armada itself shows: a timed-out
+  member's posts, posts during a pause, posts from a member denied Send
+  Messages, and anything a read-only channel's Writers ledger doesn't stand
+  behind stay on Armada. Read-only channels bridge Armada → Discord only.
+- **Private channel keys** from Direct Invites, access-plane deliveries and
+  channel rotations, read at every start.
 - **Catch-up backfill** after downtime, from a per-channel cursor.
 - **The portal** (`crates/portal`): Discord OAuth, one "bridge a server" flow
   built around a channel map (pair channels, create missing ones on either
   side, copy history either way), approval by an Armada admin's signature or an
   in-channel confirmation, and a dashboard to pause, resume, and unlink.
-- **Server import**: mint a whole Armada community from a Discord server —
-  channels, roles, and grants, with genesis signed by the owner's own key in
-  their browser — then backfill history.
-Not yet: severance detection (ban, refounding, dissolution) is partial, and
-Discord-side commands are parsed from message text rather than registered as
-slash commands.
+- **Server import**: mint a whole Armada community from a Discord server on
+  Roles v2 — roles in Discord's order, `@everyone`, categories, channel
+  overwrites and syncs, private channels (sealed, keyed to the owner),
+  read-only channels with their Writers ledger, forum and voice rooms — with
+  genesis signed by the owner's own key in their browser, then backfill history.
+
+Not yet: severance detection (ban, refounding, dissolution) is partial; a
+private channel's key rotation is followed at the bridge's next start, not
+while it runs; Discord-side commands are parsed from message text rather than
+registered as slash commands. And the owner of an imported community does not
+receive its staff write key: Roles v2 left no protocol path for a custodial
+importer to hand it over, so that needs an upstream change.
 
 ## Layout
 
