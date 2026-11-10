@@ -1093,15 +1093,22 @@ impl Importer {
             let content = if c.is_private() {
                 let key = self.channel_key(c)?;
                 // Born at epoch 1 by a Channel rotation committing to the
-                // community root at epoch 0 (CORD-03 §2): the rotation hands the
-                // owner the key, and the chain it starts is what a later
-                // rotation proves continuity from.
+                // community root at epoch 0 (CORD-03 §2): the chain it starts is
+                // what a later rotation proves continuity from. Armada follows
+                // rotations only of channels a member already holds, so the
+                // owner's key also goes out as an access delivery, which is how
+                // Armada takes a Private Channel it doesn't hold yet (CORD-03 §5).
                 if c.rotation_published_at.is_none() {
                     let rumors = concord::rekey::build_channel_rotation(op, &id, 1, 0, &root, &key, std::slice::from_ref(&community.owner), now_ms(), Some(&vac))?;
                     let address: StreamKey = (&concord::derive::channel_rekey_group_key(&root, &id, 1)).into();
                     for rumor in rumors {
                         let wrap = seal_and_wrap(&rumor, Plane::Rekey, &address, op, WrapOptions::default())?;
                         self.publish_verified(relays, &wrap, &format!("key rotation for #{}", c.name)).await?;
+                    }
+                    let plane: StreamKey = (&community.access_plane(&id)).into();
+                    for rumor in concord::delivery::build_access_deliveries(op, &id, 1, &key, std::slice::from_ref(&community.owner), now_ms() / 1000)? {
+                        let wrap = seal_and_wrap(&rumor, Plane::Rekey, &plane, op, WrapOptions::default())?;
+                        self.publish_verified(relays, &wrap, &format!("the owner's key for #{}", c.name)).await?;
                     }
                     plan.channels[i].rotation_published_at = Some(now_ms());
                     self.save_plan(import_id, plan).await?;
@@ -1971,6 +1978,12 @@ mod tests {
         let key = concord::rekey::decode_channel_blob(&plain, &mods_id, 1).unwrap();
         let opened = concord::channel_seal::open_channel_seal(sealed, &key, &mods_id).unwrap();
         assert_eq!((opened.metadata["name"].as_str(), opened.metadata["category"].as_str()), (Some("mods"), Some(talk.id_hex.as_str())));
+        // The same key reaches the owner on the access plane, where Armada takes
+        // a Private Channel it doesn't hold yet; the bridge's arrives there too.
+        let owner_keys = Keys::new(owner.secret_key().clone());
+        let owner_intake = bridge::key_intake::intake_access_keys(&relay, &owner_keys, &joined.membership, &folded).await;
+        assert_eq!(owner_intake.learned, std::slice::from_ref(&mods.channel_id_hex));
+        assert_eq!(owner_intake.community.private_channels[0].key, to_hex(&key));
         // Only the Mods Role and the bridge (ticked for mirroring) may view it.
         let mods_ow: Vec<_> = folded.roster.overwrites.iter().filter(|o| o.scope == mods.channel_id_hex).collect();
         assert!(mods_ow.iter().any(|o| o.target == concord::roles::OverwriteTarget::Role(mods_role.role_id.clone()) && o.allow & perm::VIEW_CHANNEL != 0));
