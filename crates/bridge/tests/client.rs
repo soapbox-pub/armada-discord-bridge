@@ -180,14 +180,35 @@ async fn backfill_returns_chats_oldest_first_with_the_newest_wrap_time() {
 
 const PRIVATE: [u8; 32] = [5u8; 32];
 
+/// A legacy fold where PRIVATE is a private channel whose access Role is
+/// granted to each of `entitled`, and `managers` hold Manage Channels.
+fn legacy_fold(w: &World, entitled: &[&Keys], managers: &[&Keys]) -> concord::control::FoldedControl {
+    use concord::roles::{MemberGrant, Role, RoleScope, perm};
+    let mut f = concord::control::FoldedControl { owner: w.owner.public_key().to_hex(), ..Default::default() };
+    f.channels.insert(
+        hex::encode(PRIVATE),
+        concord::control::FoldedChannel { channel_id_hex: hex::encode(PRIVATE), name: "mods".into(), private: true, ..Default::default() },
+    );
+    let (access, staff) = (hex::encode([0xa0; 32]), hex::encode([0xa1; 32]));
+    f.roster.roles.push(Role::new(&access, "mods", 3, 0, RoleScope::Channel(hex::encode(PRIVATE))));
+    f.roster.roles.push(Role::new(&staff, "staff", 2, perm::MANAGE_CHANNELS, RoleScope::Server));
+    for k in entitled {
+        f.roster.grants.push(MemberGrant { member: k.public_key().to_hex(), role_ids: vec![access.clone()], control_wrap: None });
+    }
+    for k in managers {
+        f.roster.grants.push(MemberGrant { member: k.public_key().to_hex(), role_ids: vec![staff.clone()], control_wrap: None });
+    }
+    f
+}
+
 #[tokio::test]
 async fn merges_a_key_vended_by_an_entitled_sender() {
     let w = world();
     w.channel(PRIVATE, "mods", true);
     let bridge = Keys::generate();
     w.vend(&w.owner, &bridge, &w.community, PRIVATE, [6u8; 32], 0);
-    let owner = w.community.owner.clone();
-    let intake = intake_direct_invite_keys(&[&w.relay as &dyn RelayLike], &bridge, &w.community, |pk| pk == owner).await;
+    let folded = legacy_fold(&w, &[&bridge], &[]);
+    let intake = intake_direct_invite_keys(&[&w.relay as &dyn RelayLike], &bridge, &w.community, &folded).await;
     assert_eq!(intake.learned, [hex::encode(PRIVATE)]);
     let client = ConcordClient::new(intake.community, Arc::new(w.relay.clone()), bridge);
     client.sync_control().await.unwrap();
@@ -207,21 +228,54 @@ async fn refuses_strangers_other_communities_and_other_recipients() {
     w.vend(&w.owner, &bridge, &other, PRIVATE, [8u8; 32], 0);
     // An invite sealed to somebody else.
     w.vend(&w.owner, &Keys::generate(), &w.community, PRIVATE, [9u8; 32], 0);
-    let owner = w.community.owner.clone();
-    let intake = intake_direct_invite_keys(&[&w.relay as &dyn RelayLike], &bridge, &w.community, |pk| pk == owner).await;
+    let folded = legacy_fold(&w, &[&bridge], &[]);
+    let intake = intake_direct_invite_keys(&[&w.relay as &dyn RelayLike], &bridge, &w.community, &folded).await;
     assert!(intake.learned.is_empty());
     assert!(intake.community.private_channels.is_empty());
+}
+
+#[tokio::test]
+async fn refuses_a_banned_manager_an_implausible_epoch_and_an_unentitled_recipient() {
+    let w = world();
+    let (bridge, manager, outsider) = (Keys::generate(), Keys::generate(), Keys::generate());
+    // A manager since banned: the Roster still names their Role until someone strips it.
+    let mut folded = legacy_fold(&w, &[&bridge], &[&manager]);
+    folded.banned.insert(manager.public_key().to_hex());
+    w.vend(&manager, &bridge, &w.community, PRIVATE, [7u8; 32], 1);
+    // The owner, but claiming an epoch no rotation could have reached.
+    w.vend(&w.owner, &bridge, &w.community, PRIVATE, [8u8; 32], 5000);
+    let intake = intake_direct_invite_keys(&[&w.relay as &dyn RelayLike], &bridge, &w.community, &folded).await;
+    assert!(intake.learned.is_empty(), "{:?}", intake.learned);
+
+    // A key vended to a member the fold doesn't entitle isn't taken either.
+    w.vend(&w.owner, &outsider, &w.community, PRIVATE, [9u8; 32], 0);
+    let intake = intake_direct_invite_keys(&[&w.relay as &dyn RelayLike], &outsider, &w.community, &folded).await;
+    assert!(intake.learned.is_empty());
+}
+
+#[tokio::test]
+async fn on_ranked_roles_a_vended_key_must_open_the_channel_seal() {
+    let w = world();
+    let bridge = Keys::generate();
+    let (id, key) = ([0x51; 32], [0x52; 32]);
+    let folded = ranked_fold(&w, id, key, &bridge);
+    w.vend(&w.owner, &bridge, &w.community, id, [0x99; 32], 1);
+    let intake = intake_direct_invite_keys(&[&w.relay as &dyn RelayLike], &bridge, &w.community, &folded).await;
+    assert!(intake.learned.is_empty(), "a key that doesn't open the seal at its epoch");
+    w.vend(&w.owner, &bridge, &w.community, id, key, 1);
+    let intake = intake_direct_invite_keys(&[&w.relay as &dyn RelayLike], &bridge, &w.community, &folded).await;
+    assert_eq!(intake.learned, [hex::encode(id)]);
 }
 
 #[tokio::test]
 async fn adopts_a_re_vend_that_advances_the_epoch_and_keeps_the_old_key_for_history() {
     let w = world();
     let bridge = Keys::generate();
-    let owner = w.community.owner.clone();
+    let folded = legacy_fold(&w, &[&bridge], &[]);
     w.vend(&w.owner, &bridge, &w.community, PRIVATE, [6u8; 32], 0);
-    let first = intake_direct_invite_keys(&[&w.relay as &dyn RelayLike], &bridge, &w.community, |pk| pk == owner).await;
+    let first = intake_direct_invite_keys(&[&w.relay as &dyn RelayLike], &bridge, &w.community, &folded).await;
     w.vend(&w.owner, &bridge, &w.community, PRIVATE, [7u8; 32], 1);
-    let second = intake_direct_invite_keys(&[&w.relay as &dyn RelayLike], &bridge, &first.community, |pk| pk == owner).await;
+    let second = intake_direct_invite_keys(&[&w.relay as &dyn RelayLike], &bridge, &first.community, &folded).await;
     assert_eq!(second.learned, [hex::encode(PRIVATE)]);
     let held = &second.community.private_channels[0];
     assert_eq!((held.epoch, held.key.as_str()), (1, hex::encode([7u8; 32]).as_str()));

@@ -21,7 +21,6 @@ use bridge::router::{BridgeRouter, RouterOptions, SelfIds};
 use bridge::store::{MappingStore, PgMappingStore};
 use bridge::types::{ChannelLink, DiscordInboundMessage, DiscordMessageDelete, DiscordReaction};
 use concord::invite::{invite_delivery_relays, parse_invite_link, stock_relays};
-use concord::roles::perm;
 use nostr::prelude::*;
 use serde_json::json;
 
@@ -130,11 +129,7 @@ async fn main() -> anyhow::Result<()> {
     // floor is scanned too: it is where a sender delivers to an npub with no
     // published inbox (which we were, until the 10050 below).
     let floor = relays.with_urls(invite_delivery_relays(&[]));
-    let owner = community.owner.clone();
-    let intake = intake_direct_invite_keys(&[&relays, &floor], &primary, &community, |pk| {
-        folded.roster.is_authorized(pk, &owner, perm::MANAGE_CHANNELS)
-    })
-    .await;
+    let intake = intake_direct_invite_keys(&[&relays, &floor], &primary, &community, &folded).await;
     let mut learned = intake.learned;
     let intake = intake_access_keys(&relays, &primary, &intake.community, &folded).await;
     learned.extend(intake.learned.iter().cloned());

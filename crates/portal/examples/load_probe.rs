@@ -18,7 +18,6 @@ use bridge::key_intake::intake_direct_invite_keys;
 use bridge::relays::{Hub, RelayLike, Relays};
 use concord::community::Membership;
 use concord::invite::{invite_delivery_relays, parse_invite_link, stock_relays};
-use concord::roles::perm;
 use nostr::prelude::*;
 use portal::manager::{BRIDGE_COLUMNS, BridgeRow};
 use portal::relay_guard::filter_public_relays;
@@ -84,12 +83,8 @@ impl Probe {
         let folded = community.runtime.folded().context("no fold")?;
         let floor = community.relays.with_urls(invite_delivery_relays(&[]));
         floor.register_auth_keys(vec![primary.clone()]);
-        let owner = membership.owner.clone();
         let intake = stage("scanning for direct invites", 90, async {
-            Ok(intake_direct_invite_keys(&[&community.relays, &floor], &primary, &membership, |pk| {
-                folded.roster.is_authorized(pk, &owner, perm::MANAGE_CHANNELS)
-            })
-            .await)
+            Ok(intake_direct_invite_keys(&[&community.relays, &floor], &primary, &membership, &folded).await)
         })
         .await?;
         let client = community.runtime.client_for(intake.community, primary);

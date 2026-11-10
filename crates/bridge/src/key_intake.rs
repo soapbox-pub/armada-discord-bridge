@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use concord::community::Membership;
 use concord::control::FoldedControl;
 use concord::delivery::{access_delivery_admits, access_key_refuted, open_access_key, parse_delivery};
+use concord::direct_invite::{VendVerdict, judge_vend};
 use concord::kinds::{self, Plane};
 use concord::rekey::{group_rotations, parse_rekey};
 use concord::stream::{StreamKey, open_plane_wrap};
@@ -49,15 +50,15 @@ pub struct KeyIntake {
 /// Scan the identity's giftwrap inbox for Direct Invites to THIS community and
 /// merge the private-channel keys they carry.
 ///
-/// `is_authorized_sender` decides whether a sender may vend channel keys here:
-/// the owner, or a roster member holding MANAGE_CHANNELS. It is REQUIRED. Our
-/// npub is public (kind 0, guestbook join, kind 10050), and the community's id,
-/// owner and salt ride in every invite, so anyone at all can seal a well-formed
-/// bundle to us naming this community. Without the gate, a stranger's bundle
-/// claiming a higher epoch for a real channel id would replace that channel's
-/// key — silently redirecting everything the bridge mirrors into a stream only
-/// the attacker can read, persisting across restarts because the forged wrap
-/// stays on the relays.
+/// Each vended key is judged against `folded` exactly as Armada judges a
+/// catch-up ([`judge_vend`]). Our npub is public (kind 0, guestbook join, kind
+/// 10050), and the community's id, owner and salt ride in every invite, so
+/// anyone at all can seal a well-formed bundle to us naming this community; a
+/// stranger's, or a banned or merely-entitled member's, claiming a higher
+/// epoch for a real channel would otherwise replace that channel's key —
+/// silently redirecting everything the bridge mirrors into a stream only the
+/// sender can read, persisting across restarts because the wrap stays on the
+/// relays.
 ///
 /// The scan is indexed by the wrap's outer `k` tag, which is why a recipient can
 /// ask for exactly their invites. The tag is unsigned relay-visible bytes and
@@ -66,7 +67,7 @@ pub async fn intake_direct_invite_keys(
     relay_sets: &[&dyn RelayLike],
     identity: &Keys,
     community: &Membership,
-    is_authorized_sender: impl Fn(&str) -> bool,
+    folded: &FoldedControl,
 ) -> KeyIntake {
     let filter = Filter::new()
         .kind(Kind::Custom(kinds::WRAP))
@@ -86,27 +87,36 @@ pub async fn intake_direct_invite_keys(
     let mut wraps: Vec<Event> = wraps.into_values().collect();
     wraps.sort_by_key(|w| w.created_at);
 
+    let me = identity.public_key().to_hex();
     let mut next = community.clone();
     let mut learned: Vec<String> = Vec::new();
     for wrap in &wraps {
         let Some(invite) = concord::direct_invite::unwrap(wrap, identity) else { continue };
-        // WHO sealed this, before WHAT it says. Unwrapping proves the sender
-        // (the seal opens only under the pairwise key, and the rumor's claimed
-        // author must equal the seal's), but proven-who is not authorized-to.
-        if !is_authorized_sender(&invite.inviter) {
-            tracing::warn!(sender = %&invite.inviter[..8], "ignoring direct invite from unauthorized sender");
-            continue;
-        }
         // A bundle for another community is not ours to merge: channel ids are
         // random values that say nothing about which community minted them.
         if !invite.bundle.community_id.eq_ignore_ascii_case(&community.community_id) {
             continue;
         }
+        // WHO sealed this, and whether the fold stands behind each key, before
+        // WHAT it says. Unwrapping proves the sender (the seal opens only under
+        // the pairwise key, and the rumor's claimed author must equal the
+        // seal's), but proven-who is not authorized-to.
+        let mut bundle = invite.bundle.clone();
+        bundle.channels.retain(|c| {
+            let held = next.private_channels.iter().find(|h| h.id.eq_ignore_ascii_case(&c.id)).map(|h| h.epoch);
+            match judge_vend(folded, &me, &invite.inviter, c, held) {
+                VendVerdict::Adopt => true,
+                verdict => {
+                    tracing::warn!(sender = %&invite.inviter[..8], channel = %c.id.get(..8).unwrap_or(&c.id), ?verdict, "ignoring a vended channel key");
+                    false
+                }
+            }
+        });
         // Union, never replace: a partial vend (one channel, which is what a
         // single role grant produces) must not displace keys already held, and
         // an id we hold can still ADVANCE — a re-vend at a higher epoch is a
         // rotation we were kept through.
-        for id in next.adopt_catch_up(&invite.bundle) {
+        for id in next.adopt_catch_up(&bundle) {
             if !learned.contains(&id) {
                 learned.push(id);
             }

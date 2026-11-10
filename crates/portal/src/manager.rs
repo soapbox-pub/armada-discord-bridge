@@ -740,12 +740,8 @@ impl BridgeManager {
         let folded = community.runtime.folded().context("community has no fold")?;
         let floor = relays.with_urls(invite_delivery_relays(&[]));
         floor.register_auth_keys(vec![primary.clone()]);
-        let owner = membership.owner.clone();
         let intake = stage("scanning for direct invites", STAGE_RELAY, async {
-            Ok(intake_direct_invite_keys(&[relays, &floor], &primary, &membership, |pk| {
-                folded.roster.is_authorized(pk, &owner, perm::MANAGE_CHANNELS)
-            })
-            .await)
+            Ok(intake_direct_invite_keys(&[relays, &floor], &primary, &membership, &folded).await)
         })
         .await?;
         // The ranked Roster's deliveries and rotations, on top of what Direct
