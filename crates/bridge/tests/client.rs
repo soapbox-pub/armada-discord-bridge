@@ -418,7 +418,27 @@ async fn the_first_fold_reads_running_timeouts_so_catch_up_judges_by_them() {
     let client = w.client(Keys::generate());
     client.sync_control().await.unwrap();
     let channel = client.channel(&hex::encode(chan)).unwrap();
-    let (rumor, _) = client.send_chat(&channel, SendChat::message(&alice, "while timed out")).await.unwrap();
+    // Posted by Alice's own client, as Armada's catch-up would serve it.
+    let tags = concord::stream::channel_binding_tags(&channel.id_hex, 0);
+    let rumor = concord::rumor::Rumor::new(kinds::MESSAGE, "while timed out", tags, &alice.public_key().to_hex(), Some(now_ms()), None);
     let chat = OpenedChat { ms: rumor.created_at * 1000, rumor, channel_id_hex: channel.id_hex.clone(), epoch: 0, writer_epoch: None };
     assert_eq!(client.judge(&chat), Verdict::Collapsed);
+}
+
+#[tokio::test]
+async fn a_timed_out_member_is_not_posted_for() {
+    let w = world();
+    let chan = [3u8; 32];
+    w.channel(chan, "general", false);
+    let alice = Keys::generate();
+    let now = now_ms();
+    let tags = vec![vec!["p".to_string(), alice.public_key().to_hex()], vec!["until".into(), (now / 1000 + 3600).to_string()]];
+    let timeout = concord::rumor::Rumor::new(kinds::TIMEOUT, String::new(), tags, &w.owner.public_key().to_hex(), Some(now - 60_000), None);
+    let gb: StreamKey = w.community.current_guestbook_stream();
+    w.relay.inject(seal_and_wrap(&timeout, Plane::Guestbook, &gb, &w.owner, Default::default()).unwrap());
+    let client = w.client(Keys::generate());
+    client.sync_control().await.unwrap();
+    let channel = client.channel(&hex::encode(chan)).unwrap();
+    assert!(client.send_chat(&channel, SendChat::message(&alice, "let me speak")).await.is_err());
+    assert!(client.send_chat(&channel, SendChat::message(&Keys::generate(), "fine")).await.is_ok());
 }

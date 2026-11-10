@@ -69,8 +69,18 @@ pub struct OpenedChat {
 /// collapse the post, so publishing it would only put a message on the relays
 /// that nobody sees, while Discord shows it as delivered.
 #[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-pub struct PostRefused(pub &'static str);
+#[error("{reason}")]
+pub struct PostRefused {
+    pub reason: &'static str,
+    /// Every Discord member's post would be refused here, not one member's.
+    pub channel_wide: bool,
+}
+
+impl PostRefused {
+    fn channel(reason: &'static str) -> PostRefused {
+        PostRefused { reason, channel_wide: true }
+    }
+}
 
 /// Every address a Channel's posts arrive at: its read streams and, in a
 /// restricted Channel, its writer addresses.
@@ -392,17 +402,22 @@ impl ConcordClient {
             return None;
         }
         if f.restricting_ledger(&channel.id_hex).is_some() && !f.manages_channels(author_pk) {
-            return Some(PostRefused("the Armada channel is read-only: only its writers can post there"));
+            return Some(PostRefused::channel("the Armada channel is read-only: only its writers can post there"));
+        }
+        // A Timeout is a moderator's word on Armada: posts inside it collapse
+        // there (CORD-04 §8), so a timed-out puppet isn't posted for.
+        if self.timeouts().get(author_pk).is_some_and(|t| t.running(now_ms())) {
+            return Some(PostRefused { reason: "this member is timed out in the Armada community", channel_wide: false });
         }
         if f.ranked {
             let p = f.channel_permissions(author_pk, &channel.id_hex);
             // A private channel lets in only those its overwrites name, and a
             // puppet is named by none: every post would be collapsed.
             if p & perm::VIEW_CHANNEL == 0 {
-                return Some(PostRefused("the Armada channel is private, and Discord members aren't let into it"));
+                return Some(PostRefused::channel("the Armada channel is private, and Discord members aren't let into it"));
             }
             if p & perm::SEND_MESSAGES == 0 {
-                return Some(PostRefused("Send Messages is denied to this member in the Armada channel"));
+                return Some(PostRefused::channel("Send Messages is denied to this member in the Armada channel"));
             }
         }
         None

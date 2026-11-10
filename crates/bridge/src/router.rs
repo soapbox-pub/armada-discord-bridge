@@ -255,7 +255,7 @@ impl BridgeRouter {
     /// message looked delivered. Once per channel per process: a restart may
     /// say it again, which beats never.
     async fn notice_refusal(&self, link: &ChannelLink, refused: &crate::client::PostRefused) {
-        if !self.refusals_noticed.lock().unwrap_or_else(|e| e.into_inner()).insert(link.discord_channel_id.clone()) {
+        if !refused.channel_wide || !self.refusals_noticed.lock().unwrap_or_else(|e| e.into_inner()).insert(link.discord_channel_id.clone()) {
             return;
         }
         let message = WebhookMessage {
