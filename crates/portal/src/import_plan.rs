@@ -26,25 +26,84 @@ mod d {
     pub const ADMINISTRATOR: u64 = 1 << 3;
     pub const MANAGE_CHANNELS: u64 = 1 << 4;
     pub const MANAGE_GUILD: u64 = 1 << 5;
+    pub const ADD_REACTIONS: u64 = 1 << 6;
     pub const VIEW_AUDIT_LOG: u64 = 1 << 7;
+    pub const PRIORITY_SPEAKER: u64 = 1 << 8;
+    pub const STREAM: u64 = 1 << 9;
     pub const VIEW_CHANNEL: u64 = 1 << 10;
+    pub const SEND_MESSAGES: u64 = 1 << 11;
     pub const MANAGE_MESSAGES: u64 = 1 << 13;
+    pub const ATTACH_FILES: u64 = 1 << 15;
+    pub const READ_MESSAGE_HISTORY: u64 = 1 << 16;
     pub const MENTION_EVERYONE: u64 = 1 << 17;
+    pub const CONNECT: u64 = 1 << 20;
+    pub const SPEAK: u64 = 1 << 21;
+    pub const MUTE_MEMBERS: u64 = 1 << 22;
+    pub const DEAFEN_MEMBERS: u64 = 1 << 23;
+    pub const MOVE_MEMBERS: u64 = 1 << 24;
+    pub const CHANGE_NICKNAME: u64 = 1 << 26;
+    pub const MANAGE_NICKNAMES: u64 = 1 << 27;
     pub const MANAGE_ROLES: u64 = 1 << 28;
+    pub const SEND_MESSAGES_IN_THREADS: u64 = 1 << 38;
+    pub const MODERATE_MEMBERS: u64 = 1 << 40;
+    pub const PIN_MESSAGES: u64 = 1 << 51;
 }
 
-/// Discord bit → Concord bit, per the plan's permission map.
-const BIT_MAP: [(u64, u64); 9] = [
+/// Discord bit → Concord bit. Roles v2 (CORD-04 §3) brought Concord the
+/// channel permissions Discord has (view, send, react, voice, timeouts,
+/// nicknames), so a Discord role now carries across nearly whole.
+const BIT_MAP: [(u64, u64); 27] = [
     (d::MANAGE_ROLES, perm::MANAGE_ROLES),
     (d::MANAGE_CHANNELS, perm::MANAGE_CHANNELS),
     (d::MANAGE_GUILD, perm::MANAGE_METADATA),
     (d::KICK_MEMBERS, perm::KICK),
     (d::BAN_MEMBERS, perm::BAN),
     (d::MANAGE_MESSAGES, perm::MANAGE_MESSAGES),
+    // Pinning was part of Manage Messages on Discord until it got its own bit.
+    (d::MANAGE_MESSAGES, perm::PIN_MESSAGES),
+    (d::PIN_MESSAGES, perm::PIN_MESSAGES),
     (d::CREATE_INSTANT_INVITE, perm::CREATE_INVITE),
     (d::VIEW_AUDIT_LOG, perm::VIEW_AUDIT_LOG),
     (d::MENTION_EVERYONE, perm::MENTION_EVERYONE),
+    (d::VIEW_CHANNEL, perm::VIEW_CHANNEL),
+    (d::SEND_MESSAGES, perm::SEND_MESSAGES),
+    (d::SEND_MESSAGES_IN_THREADS, perm::SEND_IN_THREADS),
+    (d::ATTACH_FILES, perm::ATTACH_FILES),
+    (d::ADD_REACTIONS, perm::ADD_REACTIONS),
+    (d::READ_MESSAGE_HISTORY, perm::READ_MESSAGE_HISTORY),
+    (d::CONNECT, perm::CONNECT),
+    (d::SPEAK, perm::SPEAK),
+    (d::STREAM, perm::VIDEO),
+    (d::PRIORITY_SPEAKER, perm::PRIORITY_SPEAKER),
+    (d::MUTE_MEMBERS, perm::MUTE_MEMBERS),
+    (d::DEAFEN_MEMBERS, perm::DEAFEN_MEMBERS),
+    (d::MOVE_MEMBERS, perm::MOVE_MEMBERS),
+    (d::MODERATE_MEMBERS, perm::MODERATE_MEMBERS),
+    (d::MANAGE_NICKNAMES, perm::MANAGE_NICKNAMES),
+    (d::CHANGE_NICKNAME, perm::CHANGE_NICKNAME),
 ];
+
+/// Every Concord bit an import can map to: what Discord's Administrator
+/// carries, and what the importer's own Admin Role must hold, since on the
+/// ranked Roster an edition may carry only bits its signer holds through
+/// Roles above it (CORD-04 §3).
+pub const ALL_MAPPED: u64 = {
+    let mut bits = 0;
+    let mut i = 0;
+    while i < BIT_MAP.len() {
+        bits |= BIT_MAP[i].1;
+        i += 1;
+    }
+    bits | perm::ADMIN_ALL
+};
+
+/// Map Discord permission bits to Concord's, with no reporting.
+pub fn map_bits(discord_bits: u64) -> u64 {
+    if discord_bits & d::ADMINISTRATOR != 0 {
+        return ALL_MAPPED;
+    }
+    BIT_MAP.iter().filter(|(d_bit, _)| discord_bits & d_bit != 0).fold(0, |acc, (_, c_bit)| acc | c_bit)
+}
 
 // Discord channel types (resources/channel).
 const TEXT: u32 = 0;
@@ -59,6 +118,48 @@ const MEDIA: u32 = 16;
 #[serde(rename_all = "lowercase")]
 pub enum ChannelKind {
     Voice,
+    Forum,
+}
+
+/// Who a planned overwrite targets: `@everyone`, or a Discord role the plan
+/// carries (members aren't imported, so their overwrites can't be).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum PlannedTarget {
+    Everyone,
+    Role { discord_id: String },
+}
+
+/// One Discord permission overwrite, mapped to Concord bits and masked to what
+/// an overwrite may touch (CORD-04 §8).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedOverwrite {
+    pub target: PlannedTarget,
+    #[serde(with = "decimal_u64")]
+    pub allow: u64,
+    #[serde(with = "decimal_u64")]
+    pub deny: u64,
+}
+
+/// A Discord category, imported as a Category (CORD-03 §4).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedCategory {
+    pub discord_id: String,
+    pub name: String,
+    /// Rank key ordering it among Categories.
+    pub rank: String,
+    #[serde(default)]
+    pub overwrites: Vec<PlannedOverwrite>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_id_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrites_published_at: Option<u64>,
+    #[serde(flatten, default)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +200,36 @@ pub struct PlannedChannel {
     /// Unix ms when the access Role edition was accepted by a relay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_role_published_at: Option<u64>,
+    /// The Discord category it sits in, imported as its Category.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category_discord_id: Option<String>,
+    /// Rank key ordering it in the sidebar (CORD-03 §2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<String>,
+    /// Its own Discord overwrites, mapped. Unused while `synced`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overwrites: Vec<PlannedOverwrite>,
+    /// Its overwrites are its category's, so it imports synced to the Category (CORD-04 §8).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub synced: bool,
+    /// `@everyone` can't post here: a read-only channel, imported restricted
+    /// with a Writers ledger (CORD-03 §1).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restricted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overwrites_published_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_published_at: Option<u64>,
+    /// A Private Channel's birth rotation (CORD-03 §2), accepted by a relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_published_at: Option<u64>,
+    /// A read-only channel's writer epoch 1: its secret and certifier, sealed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_sealed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certifier_sealed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_published_at: Option<u64>,
     /// Only GuildText channels can be live-bridged (webhook mirroring).
     #[serde(default)]
     pub bridgeable: bool,
@@ -166,6 +297,13 @@ pub struct PlannedRole {
     /// Discord-only permissions this role loses, for the preview's honesty.
     #[serde(default)]
     pub dropped: Vec<String>,
+    /// Rank key (CORD-04 §3): Discord's order, below the importer's Admin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hoist: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mentionable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_id_hex: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,6 +338,8 @@ impl SkippedItem {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OwnerSignPurpose {
+    /// The switch to the ranked Roster (CORD-04 §2): only the owner can make it.
+    Everyone,
     AdminRole,
     OpGrant,
     InviteRegistry,
@@ -266,6 +406,12 @@ pub struct ImportCheckpoints {
     pub owner_registry_published_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_join_published_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_everyone_published_at: Option<u64>,
+    /// Minted on the ranked Roster (CORD-04 §2). Absent on imports prepared
+    /// before it, which finish the legacy way they were signed for.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ranked: bool,
     /// The Grant edition that hands the owner the staff write key (CORD-04 §3).
     /// The portal mints the `control_root` server-side, so without this delivery
     /// the owner holds `control_pk` (read) but could never publish a Control
@@ -358,6 +504,14 @@ pub struct ImportPlan {
     pub channels: Vec<PlannedChannel>,
     #[serde(default)]
     pub roles: Vec<PlannedRole>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<PlannedCategory>,
+    /// What every member holds before any Role: Discord's `@everyone`, mapped.
+    #[serde(default, with = "decimal_u64", skip_serializing_if = "is_zero")]
+    pub everyone_permissions: u64,
+    /// The importer's Admin Role's rank key: above every imported Role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_rank: Option<String>,
     #[serde(default)]
     pub skipped: Vec<SkippedItem>,
     /// Filled at confirm time.
@@ -372,6 +526,10 @@ pub struct ImportPlan {
     /// newer writer's checkpoints are never silently dropped.
     #[serde(flatten, default)]
     pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// u64 as a decimal string. Reads a bare number too, which nothing writes
@@ -446,15 +604,6 @@ fn is_private(channel: &SnapshotChannel, guild_id: &str, categories: &HashMap<&s
     parent.is_some_and(|p| bits(&p.deny) & d::VIEW_CHANNEL != 0)
 }
 
-fn voice_name(name: &str) -> String {
-    let n = name.len();
-    if n >= 5 && name.is_char_boundary(n - 5) && name[n - 5..].eq_ignore_ascii_case("voice") {
-        name.to_owned()
-    } else {
-        format!("{name}-voice")
-    }
-}
-
 /// The first `units` UTF-16 code units, as JavaScript's `slice` counts them
 /// (rows written by the TS portal were cut that way), never splitting a char.
 fn truncate_utf16(s: &str, units: usize) -> &str {
@@ -468,10 +617,54 @@ fn truncate_utf16(s: &str, units: usize) -> &str {
     s
 }
 
-fn plan_channels(snapshot: &GuildSnapshot, skipped: &mut Vec<SkippedItem>) -> Vec<PlannedChannel> {
+/// A channel's or category's Discord overwrites, mapped and masked to what a
+/// Concord overwrite may touch. Member overwrites name Discord accounts no
+/// import has an npub for; role overwrites naming a role the plan skipped would
+/// be refused by every reader (CORD-04 §8), so both are left out.
+fn plan_overwrites(c: &SnapshotChannel, guild_id: &str, roles: &[PlannedRole]) -> Vec<PlannedOverwrite> {
+    let mut out: Vec<PlannedOverwrite> = c
+        .permission_overwrites
+        .iter()
+        .filter(|o| o.kind == 0)
+        .filter_map(|o| {
+            let target = if o.id == guild_id {
+                PlannedTarget::Everyone
+            } else if roles.iter().any(|r| r.discord_id == o.id) {
+                PlannedTarget::Role { discord_id: o.id.clone() }
+            } else {
+                return None;
+            };
+            let (allow, deny) = (map_bits(bits(&o.allow)) & perm::OVERWRITABLE, map_bits(bits(&o.deny)) & perm::OVERWRITABLE);
+            (allow != 0 || deny != 0).then_some(PlannedOverwrite { target, allow, deny })
+        })
+        .collect();
+    out.sort_by_key(|o| match &o.target {
+        PlannedTarget::Everyone => String::new(),
+        PlannedTarget::Role { discord_id } => discord_id.clone(),
+    });
+    out
+}
+
+fn plan_channels(snapshot: &GuildSnapshot, roles: &[PlannedRole], everyone: u64, skipped: &mut Vec<SkippedItem>) -> (Vec<PlannedChannel>, Vec<PlannedCategory>) {
+    let guild_id = snapshot.guild.id.as_str();
     let categories: HashMap<&str, &SnapshotChannel> =
         snapshot.channels.iter().filter(|c| c.kind == CATEGORY).map(|c| (c.id.as_str(), c)).collect();
     let category_of = |c: &SnapshotChannel| c.parent_id.as_deref().and_then(|p| categories.get(p)).copied();
+
+    let mut ordered_categories: Vec<&SnapshotChannel> = categories.values().copied().collect();
+    ordered_categories.sort_by_key(|c| (c.position, c.id.clone()));
+    let category_ranks = concord::rank::spread(ordered_categories.len());
+    let planned_categories: Vec<PlannedCategory> = ordered_categories
+        .iter()
+        .zip(category_ranks)
+        .map(|(c, rank)| PlannedCategory {
+            discord_id: c.id.clone(),
+            name: cap_name(&c.name),
+            rank,
+            overwrites: plan_overwrites(c, guild_id, roles),
+            ..PlannedCategory::default()
+        })
+        .collect();
 
     let mut ordered: Vec<&SnapshotChannel> = snapshot.channels.iter().collect();
     ordered.sort_by_key(|c| (category_of(c).map_or(-1, |cat| cat.position), c.position));
@@ -479,38 +672,47 @@ fn plan_channels(snapshot: &GuildSnapshot, skipped: &mut Vec<SkippedItem>) -> Ve
     let mut out = Vec::new();
     for channel in ordered {
         if channel.kind == CATEGORY {
-            continue; // carried as custom.category on children
+            continue; // imported as a Category of its own
         }
-        if channel.kind == FORUM || channel.kind == MEDIA {
-            skipped.push(SkippedItem::new(SkippedKind::Channel, label(channel), "forum/media channels are not supported yet"));
+        if channel.kind == MEDIA {
+            skipped.push(SkippedItem::new(SkippedKind::Channel, label(channel), "media channels are not supported yet"));
             continue;
         }
         let voice = channel.kind == VOICE || channel.kind == STAGE;
-        if !voice && channel.kind != TEXT && channel.kind != ANNOUNCEMENT {
+        let forum = channel.kind == FORUM;
+        if !voice && !forum && channel.kind != TEXT && channel.kind != ANNOUNCEMENT {
             let reason = format!("unsupported channel type {}", channel.kind);
             skipped.push(SkippedItem::new(SkippedKind::Channel, label(channel), reason));
             continue;
         }
-        let private = is_private(channel, &snapshot.guild.id, &categories);
-        // A private channel CAN be mirrored, but never by default: doing so vends
+        let private = is_private(channel, guild_id, &categories);
+        // A private channel CAN be mirrored, but never by default: doing so hands
         // its key to the bridge's custodial npub and copies a deliberately gated
         // room into Discord in plaintext. That is a choice the owner makes per
         // channel, on the review screen, not one an import makes for them.
-        //
-        // (The bridge takes delivery of the key at boot as a Direct Invite — see
-        // keyIntake — which the wiring step sends before starting it. What is
-        // still unhandled is CORD-06 rotation: after a revoke-driven rekey the
-        // bridge holds a superseded key and goes quiet until it is re-granted.)
         let bridgeable = channel.kind == TEXT;
         let topic = channel.topic.as_deref().map(str::trim).filter(|t| !t.is_empty());
+        let parent = category_of(channel);
+        let own = plan_overwrites(channel, guild_id, roles);
+        // Discord calls a channel synced when its overwrites are its category's;
+        // that is exactly a Concord sync (CORD-04 §8), and keeps an edit to the
+        // Category reaching every channel that followed it on Discord.
+        let synced = parent.is_some_and(|p| plan_overwrites(p, guild_id, roles) == own);
+        let effective = if synced { parent.map(|p| plan_overwrites(p, guild_id, roles)).unwrap_or_default() } else { own.clone() };
+        let everyone_row = effective.iter().find(|o| o.target == PlannedTarget::Everyone);
+        let everyone_here = everyone_row.map_or(everyone, |o| (everyone & !o.deny) | o.allow);
         out.push(PlannedChannel {
             discord_id: channel.id.clone(),
             discord_type: channel.kind,
-            name: cap_name(&if voice { voice_name(&channel.name) } else { channel.name.clone() }),
+            name: cap_name(&channel.name),
             topic: topic.map(|t| truncate_utf16(t, 1024).to_owned()),
-            category: category_of(channel).map(|c| c.name.clone()),
-            kind: voice.then_some(ChannelKind::Voice),
+            category: parent.map(|c| c.name.clone()),
+            category_discord_id: parent.map(|c| c.id.clone()),
+            kind: if voice { Some(ChannelKind::Voice) } else if forum { Some(ChannelKind::Forum) } else { None },
             private: private.then_some(true),
+            overwrites: if synced { Vec::new() } else { own },
+            synced,
+            restricted: everyone_here & perm::SEND_MESSAGES == 0,
             bridgeable,
             bridge: bridgeable && !private,
             selected: true,
@@ -518,31 +720,23 @@ fn plan_channels(snapshot: &GuildSnapshot, skipped: &mut Vec<SkippedItem>) -> Ve
             ..PlannedChannel::default()
         });
     }
-    out
+    let ranks = concord::rank::spread(out.len());
+    for (c, rank) in out.iter_mut().zip(ranks) {
+        c.rank = Some(rank);
+    }
+    (out, planned_categories)
 }
 
 /// Human labels for the Discord bits we deliberately drop, preview copy.
-const DISCORD_ONLY: [(u64, &str); 20] = [
-    (1 << 6, "Add Reactions"),
-    (1 << 8, "Priority Speaker"),
-    (1 << 11, "Send Messages"),
+const DISCORD_ONLY: [(u64, &str); 8] = [
     (1 << 12, "Send TTS Messages"),
     (1 << 14, "Embed Links"),
-    (1 << 15, "Attach Files"),
-    (1 << 16, "Read Message History"),
     (1 << 18, "Use External Emojis"),
-    (1 << 20, "Connect"),
-    (1 << 21, "Speak"),
-    (1 << 22, "Mute Members"),
-    (1 << 23, "Deafen Members"),
-    (1 << 24, "Move Members"),
     (1 << 25, "Use Voice Activity"),
-    (1 << 26, "Change Nickname"),
-    (1 << 27, "Manage Nicknames"),
     (1 << 29, "Manage Webhooks"),
     (1 << 30, "Manage Expressions"),
-    (1 << 34, "Manage Events"),
-    (1 << 38, "Manage Threads"),
+    (1 << 33, "Manage Events"),
+    (1 << 34, "Manage Threads"),
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -552,23 +746,23 @@ pub struct MappedPermissions {
 }
 
 pub fn map_role_permissions(discord_bits: u64) -> MappedPermissions {
+    let permissions = map_bits(discord_bits);
     if discord_bits & d::ADMINISTRATOR != 0 {
-        return MappedPermissions { permissions: perm::ADMIN_ALL, dropped: Vec::new() };
+        return MappedPermissions { permissions, dropped: Vec::new() };
     }
-    let permissions = BIT_MAP.iter().filter(|(d_bit, _)| discord_bits & d_bit != 0).fold(0, |acc, (_, c_bit)| acc | c_bit);
     let dropped =
         DISCORD_ONLY.iter().filter(|(bit, _)| discord_bits & bit != 0).map(|(_, name)| (*name).to_owned()).collect();
     MappedPermissions { permissions, dropped }
 }
 
-/// Concord holds 100 roles per community; position 1 is reserved for the stock
-/// Admin role the importer mints, so 99 slots remain for imported roles.
+/// Concord holds 100 roles per community; the importer's own Admin takes one,
+/// so 99 remain for imported roles.
 pub const MAX_IMPORTED_ROLES: usize = 99;
 
 fn plan_roles(snapshot: &GuildSnapshot, skipped: &mut Vec<SkippedItem>) -> Vec<PlannedRole> {
     let mut candidates = Vec::new();
-    // Highest Discord position = highest authority; walk top-down so Concord
-    // positions (lower = higher) preserve the hierarchy below the stock Admin.
+    // Highest Discord position = highest authority; walk top-down so rank
+    // keys preserve the hierarchy below the importer's Admin.
     let mut roles: Vec<_> = snapshot.guild.roles.iter().collect();
     roles.sort_by_key(|r| std::cmp::Reverse(r.position));
     for role in roles {
@@ -580,14 +774,6 @@ fn plan_roles(snapshot: &GuildSnapshot, skipped: &mut Vec<SkippedItem>) -> Vec<P
             continue;
         }
         let MappedPermissions { permissions, dropped } = map_role_permissions(bits(&role.permissions));
-        if permissions == 0 && !role.hoist {
-            skipped.push(SkippedItem::new(
-                SkippedKind::Role,
-                &role.name,
-                "no mappable permissions and not displayed separately",
-            ));
-            continue;
-        }
         candidates.push(PlannedRole {
             discord_id: role.id.clone(),
             name: cap_name(&role.name),
@@ -595,6 +781,8 @@ fn plan_roles(snapshot: &GuildSnapshot, skipped: &mut Vec<SkippedItem>) -> Vec<P
             position: 0, // assigned below
             permissions,
             dropped,
+            hoist: role.hoist,
+            mentionable: role.mentionable,
             ..PlannedRole::default()
         });
     }
@@ -603,8 +791,11 @@ fn plan_roles(snapshot: &GuildSnapshot, skipped: &mut Vec<SkippedItem>) -> Vec<P
             skipped.push(SkippedItem::new(SkippedKind::Role, dropped.name, "community role cap (100) reached"));
         }
     }
+    // The Admin takes the first key, every imported Role one below it.
+    let ranks = concord::rank::spread(candidates.len() + 1);
     for (i, role) in candidates.iter_mut().enumerate() {
-        role.position = i as u32 + 2; // 2..n, below the stock Admin at 1
+        role.position = i as u32 + 2;
+        role.rank = Some(ranks[i + 1].clone());
     }
     candidates
 }
@@ -615,8 +806,10 @@ fn is_word(name: &str) -> bool {
 
 pub fn build_import_plan(snapshot: &GuildSnapshot) -> ImportPlan {
     let mut skipped = Vec::new();
-    let mut channels = plan_channels(snapshot, &mut skipped);
     let roles = plan_roles(snapshot, &mut skipped);
+    let everyone_discord = snapshot.guild.roles.iter().find(|r| r.id == snapshot.guild.id).map_or(0, |r| bits(&r.permissions));
+    let everyone_permissions = map_bits(everyone_discord);
+    let (mut channels, categories) = plan_channels(snapshot, &roles, everyone_permissions, &mut skipped);
 
     let member_count = snapshot.guild.approximate_member_count;
     // Follows the bridge default, so a private channel doesn't arrive with
@@ -672,6 +865,9 @@ pub fn build_import_plan(snapshot: &GuildSnapshot) -> ImportPlan {
         emojis,
         channels,
         roles,
+        categories,
+        everyone_permissions,
+        admin_rank: Some(concord::rank::spread(1).remove(0)),
         skipped,
         relays: Vec::new(),
         admin_pk_hex: None,
@@ -726,17 +922,12 @@ mod tests {
     }
 
     #[test]
-    fn imports_voice_and_stage_channels_as_voice_rooms_with_custom_kind() {
+    fn imports_voice_and_stage_channels_as_voice_rooms() {
+        // Concord has a voice view now (CORD-03 §2), so the name stays the name.
         let plan =
             build_import_plan(&snapshot(vec![channel("1", "hangout", 2), channel("2", "The Voice", 13)], vec![]));
-        let got: Vec<_> = plan.channels.iter().map(|c| (c.name.as_str(), c.kind)).collect();
-        assert_eq!(
-            got,
-            [
-                ("hangout-voice", Some(ChannelKind::Voice)),
-                ("The Voice", Some(ChannelKind::Voice)), // already ends in "voice": no suffix
-            ]
-        );
+        let got: Vec<_> = plan.channels.iter().map(|c| (c.name.as_str(), c.kind, c.bridgeable)).collect();
+        assert_eq!(got, [("hangout", Some(ChannelKind::Voice), false), ("The Voice", Some(ChannelKind::Voice), false)]);
     }
 
     #[test]
@@ -787,41 +978,81 @@ mod tests {
     }
 
     #[test]
-    fn skips_forum_channels_with_a_reason() {
-        let plan = build_import_plan(&snapshot(vec![channel("1", "help", 15)], vec![]));
-        assert!(plan.channels.is_empty());
-        assert!(plan.skipped.iter().find(|s| s.name == "#help").unwrap().reason.contains("forum"));
+    fn imports_forum_channels_as_forums_and_skips_media_with_a_reason() {
+        let plan = build_import_plan(&snapshot(vec![channel("1", "help", 15), channel("2", "gallery", 16)], vec![]));
+        let got: Vec<_> = plan.channels.iter().map(|c| (c.name.as_str(), c.kind, c.bridgeable)).collect();
+        assert_eq!(got, [("help", Some(ChannelKind::Forum), false)]);
+        assert!(plan.skipped.iter().find(|s| s.name == "#gallery").unwrap().reason.contains("media"));
+    }
+
+    #[test]
+    fn plans_overwrites_syncs_and_read_only_channels() {
+        let mut snap = snapshot(
+            vec![
+                SnapshotChannel { permission_overwrites: everyone(0, 1 << 6), ..channel("9", "Info", 4) },
+                SnapshotChannel { parent_id: Some("9".into()), permission_overwrites: everyone(0, 1 << 6), ..channel("1", "rules", 0) },
+                SnapshotChannel {
+                    parent_id: Some("9".into()),
+                    permission_overwrites: vec![
+                        ChannelOverwrite { id: "100".into(), kind: 0, allow: "0".into(), deny: (1u64 << 11).to_string() },
+                        ChannelOverwrite { id: "2".into(), kind: 0, allow: (1u64 << 11).to_string(), deny: "0".into() },
+                        ChannelOverwrite { id: "555".into(), kind: 1, allow: (1u64 << 11).to_string(), deny: "0".into() },
+                    ],
+                    ..channel("3", "news", 5)
+                },
+            ],
+            vec![role("2", "Staff", 1)],
+        );
+        snap.guild.roles[0].permissions = ((1u64 << 10) | (1u64 << 11)).to_string();
+        let plan = build_import_plan(&snap);
+        assert_eq!(plan.everyone_permissions, perm::VIEW_CHANNEL | perm::SEND_MESSAGES);
+        assert_eq!(plan.categories.len(), 1);
+        assert_eq!(plan.categories[0].overwrites, [PlannedOverwrite { target: PlannedTarget::Everyone, allow: 0, deny: perm::ADD_REACTIONS }]);
+        let rules = &plan.channels[0];
+        assert!(rules.synced && rules.overwrites.is_empty() && !rules.restricted);
+        let news = &plan.channels[1];
+        // A member overwrite names an account no import has an npub for: left out.
+        assert_eq!(news.overwrites.len(), 2);
+        assert!(!news.synced && news.restricted);
+        assert!(plan.channels.windows(2).all(|w| w[0].rank < w[1].rank));
     }
 
     // ── role planning ──
 
     #[test]
-    fn maps_administrator_to_admin_all_with_nothing_dropped() {
-        assert_eq!(map_role_permissions(1 << 3), MappedPermissions { permissions: perm::ADMIN_ALL, dropped: vec![] });
+    fn maps_administrator_to_every_mapped_bit_with_nothing_dropped() {
+        assert_eq!(map_role_permissions(1 << 3), MappedPermissions { permissions: ALL_MAPPED, dropped: vec![] });
+        assert_eq!(ALL_MAPPED & perm::ADMIN_ALL, perm::ADMIN_ALL);
     }
 
     #[test]
     fn maps_individual_bits_and_reports_dropped_discord_only_ones() {
-        let bits = (1 << 1) | (1 << 2) | (1 << 13) | (1 << 22); // kick, ban, manage messages, mute
+        let bits = (1 << 1) | (1 << 2) | (1 << 13) | (1 << 22) | (1 << 29); // kick, ban, manage messages, mute, webhooks
         let MappedPermissions { permissions, dropped } = map_role_permissions(bits);
-        assert_eq!(permissions, perm::KICK | perm::BAN | perm::MANAGE_MESSAGES);
-        assert_eq!(dropped, ["Mute Members"]);
+        // Pinning rode Manage Messages on Discord before it had its own bit.
+        assert_eq!(permissions, perm::KICK | perm::BAN | perm::MANAGE_MESSAGES | perm::PIN_MESSAGES | perm::MUTE_MEMBERS);
+        assert_eq!(dropped, ["Manage Webhooks"]);
     }
 
     #[test]
-    fn skips_everyone_managed_roles_and_permissionless_unhoisted_roles() {
+    fn skips_managed_roles_and_keeps_permissionless_ones_for_their_overwrites() {
+        // A role with no permissions of its own is how Discord gates channels:
+        // on the ranked Roster its overwrites carry across, so it does too.
         let plan = build_import_plan(&snapshot(
             vec![],
             vec![
                 SnapshotRole { managed: true, permissions: (1u64 << 3).to_string(), ..role("2", "Some Bot", 3) },
                 role("3", "Cosmetic", 2),
-                SnapshotRole { hoist: true, ..role("4", "Hoisted Badge", 1) },
+                SnapshotRole { hoist: true, mentionable: true, ..role("4", "Hoisted Badge", 1) },
             ],
         ));
-        assert_eq!(plan.roles.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["Hoisted Badge"]);
-        let reason = |name: &str| plan.skipped.iter().find(|s| s.name == name).unwrap().reason.clone();
-        assert!(reason("Some Bot").contains("managed"));
-        assert!(reason("Cosmetic").contains("no mappable"));
+        assert_eq!(plan.roles.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["Cosmetic", "Hoisted Badge"]);
+        assert!(plan.roles[1].hoist && plan.roles[1].mentionable);
+        assert!(plan.skipped.iter().find(|s| s.name == "Some Bot").unwrap().reason.contains("managed"));
+        // Discord's order, every key below the importer's Admin.
+        let admin = plan.admin_rank.clone().unwrap();
+        assert!(plan.roles.iter().all(|r| r.rank.clone().unwrap() > admin));
+        assert!(plan.roles[0].rank < plan.roles[1].rank);
     }
 
     #[test]
@@ -910,7 +1141,7 @@ mod tests {
         assert_eq!(ch["kind"], "voice");
         assert!(ch.get("private").is_none());
         assert!(ch.get("topic").is_none());
-        assert_eq!(v["roles"][0]["permissions"], perm::ADMIN_ALL.to_string());
+        assert_eq!(v["roles"][0]["permissions"], ALL_MAPPED.to_string());
         assert_eq!(v["skipped"][0]["kind"], "feature");
     }
 
