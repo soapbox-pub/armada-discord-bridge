@@ -121,6 +121,9 @@ const GATEWAY_RETRY_MAX: Duration = Duration::from_secs(10 * 60);
 /// How many bridges may be starting at once during boot; see `start_all`.
 const START_CONCURRENCY: usize = 12;
 
+/// How many deferred catch-ups run at once after a boot; see `run_deferred_catch_ups`.
+const CATCH_UP_CONCURRENCY: usize = 4;
+
 /// Most Discord messages one start-time catch-up reads per channel. Bounds an
 /// old anchor — a bridge down for weeks — to a burst the channel can absorb.
 const DISCORD_CATCHUP_MAX: usize = 500;
@@ -174,8 +177,25 @@ impl DiscordCalls {
 /// whole relay deadline, one bridge after another.
 const COMMUNITY_REOPEN_AFTER: Duration = Duration::from_secs(60);
 
-async fn stage<T>(name: &str, limit: Duration, fut: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
-    match tokio::time::timeout(limit, fut).await {
+/// Wall time spent in each start stage since the last boot summary: what a
+/// slow boot is spending its time on, without rehearsing one beside it.
+static STAGE_TIMES: Mutex<Vec<(&'static str, u32, Duration)>> = Mutex::new(Vec::new());
+
+async fn stage<T>(name: &'static str, limit: Duration, fut: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    let began = Instant::now();
+    let result = tokio::time::timeout(limit, fut).await;
+    let took = began.elapsed();
+    {
+        let mut times = lock(&STAGE_TIMES);
+        match times.iter_mut().find(|(n, _, _)| *n == name) {
+            Some(row) => {
+                row.1 += 1;
+                row.2 += took;
+            }
+            None => times.push((name, 1, took)),
+        }
+    }
+    match result {
         Ok(result) => result,
         Err(_) => bail!("{name} timed out after {}s", limit.as_secs()),
     }
@@ -333,7 +353,12 @@ pub struct BridgeManager {
     discord_calls: DiscordCalls,
     /// Bridges with a history copy running in this process.
     history_running: Mutex<std::collections::HashSet<String>>,
+    /// Boots in progress, and the catch-ups their starts deferred.
+    catch_ups: Mutex<(usize, Vec<DeferredCatchUp>)>,
 }
+
+/// A started bridge's catch-up, and when its live routing attached.
+type DeferredCatchUp = (Arc<Running>, u64);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -357,6 +382,7 @@ impl BridgeManager {
             booted: AtomicBool::new(false),
             discord_calls: DiscordCalls::default(),
             history_running: Mutex::default(),
+            catch_ups: Mutex::default(),
         })
     }
 
@@ -492,6 +518,47 @@ impl BridgeManager {
         }
     }
 
+    /// Replay what a bridge missed while down, on both sides.
+    async fn catch_up(&self, rb: &Arc<Running>, live_from_ms: u64) {
+        if let Err(error) = self.backfill_missed(rb).await {
+            tracing::warn!(bridge = %rb.id, error = %format!("{error:#}"), "catch-up backfill failed");
+        }
+        if let Err(error) = self.catch_up_discord(rb, live_from_ms).await {
+            tracing::warn!(bridge = %rb.id, error = %format!("{error:#}"), "Discord catch-up failed");
+        }
+    }
+
+    /// Run the catch-ups a boot deferred, a few at a time: unbounded, they
+    /// would fill the shared hub's query slots just as they did mid-boot, and
+    /// starve the live folds and retries that share them.
+    fn run_deferred_catch_ups(&self, deferred: Vec<DeferredCatchUp>) {
+        if deferred.is_empty() {
+            return;
+        }
+        let me = self.arc();
+        tokio::spawn(async move {
+            let began = Instant::now();
+            let total = deferred.len();
+            let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(deferred)));
+            let workers = (0..CATCH_UP_CONCURRENCY.min(total)).map(|_| {
+                let (me, queue) = (me.clone(), queue.clone());
+                async move {
+                    loop {
+                        let next = lock(&queue).pop_front();
+                        let Some((rb, live_from_ms)) = next else { break };
+                        // Stopped or restarted since: its own start owns it now.
+                        if !me.is_live(&rb.id) {
+                            continue;
+                        }
+                        me.catch_up(&rb, live_from_ms).await;
+                    }
+                }
+            });
+            futures_util::future::join_all(workers).await;
+            tracing::info!("{total} deferred catch-ups ran in {}s", began.elapsed().as_secs());
+        });
+    }
+
     /// Bring every stored bridge up, several at a time.
     ///
     /// One at a time took half an hour for a few hundred bridges, and a single
@@ -500,6 +567,7 @@ impl BridgeManager {
     /// starting all at once would aim hundreds of simultaneous REQs at the same
     /// few hosts and spend the token's REST budget on name lookups.
     async fn start_all(&self, rows: Vec<BridgeRow>) {
+        lock(&self.catch_ups).0 += 1;
         let began = Instant::now();
         let total = rows.len();
         let ids: Vec<String> = rows.iter().map(|r| r.bridge_id.clone()).collect();
@@ -516,7 +584,20 @@ impl BridgeManager {
         });
         futures_util::future::join_all(workers).await;
         let live = ids.iter().filter(|id| self.is_live(id)).count();
-        tracing::info!("{live}/{total} bridges live in {}s; {}", began.elapsed().as_secs(), self.discord_calls.take());
+        tracing::info!("{live}/{total} bridges live in {}s; {}; stages: {}", began.elapsed().as_secs(), self.discord_calls.take(), self.take_stage_times());
+        let deferred = {
+            let mut c = lock(&self.catch_ups);
+            c.0 -= 1;
+            if c.0 == 0 { std::mem::take(&mut c.1) } else { Vec::new() }
+        };
+        self.run_deferred_catch_ups(deferred);
+    }
+
+    /// Where the starts' time went since the last summary, slowest stage first.
+    fn take_stage_times(&self) -> String {
+        let mut t = std::mem::take(&mut *lock(&STAGE_TIMES));
+        t.sort_by_key(|(_, _, d)| std::cmp::Reverse(*d));
+        t.iter().map(|(n, c, d)| format!("{n} {c}x {:.0}s", d.as_secs_f64())).collect::<Vec<_>>().join(", ")
     }
 
     fn active_router_for(&self, discord_channel_id: &str) -> Option<(Arc<Running>, Arc<BridgeRouter>)> {
@@ -740,7 +821,7 @@ impl BridgeManager {
         // The Control Plane is folded once per community, before any key is
         // accepted: it reads from the root the invite carried, so the roster —
         // and with it, who may vend a channel key — is knowable first.
-        let community = self.community(&membership).await?;
+        let community = stage("community: open, or wait for it", START_DEADLINE, self.community(&membership)).await?;
         let relays = &community.relays;
         // NIP-42 as the bridge's own npub too: relays that gate kind 1059 serve
         // a giftwrap only to the pubkey it is addressed to, and the Direct
@@ -890,16 +971,27 @@ impl BridgeManager {
         if status == LiveStatus::Active {
             let live_from_ms = now_ms();
             self.attach_routing(&rb, &unseal(&self.env.seal_key_hex, master_sealed)?, &row.options)?;
-            let me = self.arc();
-            let rb2 = rb.clone();
-            tokio::spawn(async move {
-                if let Err(error) = me.backfill_missed(&rb2).await {
-                    tracing::warn!(bridge = %rb2.id, error = %format!("{error:#}"), "catch-up backfill failed");
+            // During a boot the catch-up waits for every start to finish.
+            // Each one's relay query waits on every relay and holds one of the
+            // shared hub's few query slots, and spawned as each bridge came up,
+            // two thousand of them queued the starts still to come behind
+            // them: a boot took 1090s where the starts alone took 250s
+            // (2026-11-11). Live chat is attached already; a catch-up only
+            // replays what was missed, and the mapping table dedupes.
+            let deferred = {
+                let mut c = lock(&self.catch_ups);
+                if c.0 > 0 {
+                    c.1.push((rb.clone(), live_from_ms));
+                    true
+                } else {
+                    false
                 }
-                if let Err(error) = me.catch_up_discord(&rb2, live_from_ms).await {
-                    tracing::warn!(bridge = %rb2.id, error = %format!("{error:#}"), "Discord catch-up failed");
-                }
-            });
+            };
+            if !deferred {
+                let me = self.arc();
+                let rb2 = rb.clone();
+                tokio::spawn(async move { me.catch_up(&rb2, live_from_ms).await });
+            }
         } else {
             let content = self.confirm_request(row, &client, &rb.confirm_code).await?;
             // In a read-only Armada channel (or one denying the bridge Send
