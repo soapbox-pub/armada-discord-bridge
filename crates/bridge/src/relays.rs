@@ -34,7 +34,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use nostr::prelude::*;
@@ -140,6 +140,26 @@ pub struct Hub {
     pool: Pool,
     routes: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Event>>>>,
     queries: tokio::sync::Semaphore,
+    /// Per kind of query: how many ran, the time they waited for a slot, and
+    /// the time they held one. See [`Hub::take_query_report`].
+    query_times: Mutex<HashMap<String, (u32, Duration, Duration)>>,
+}
+
+/// What a query asks for, coarsely: its mode, its first filter's kinds, and
+/// whether it is addressed by `#p` (an inbox) or by `authors` (a plane).
+fn query_label(mode: &str, filters: &[Filter]) -> String {
+    let Some(f) = filters.first() else { return mode.to_owned() };
+    let kinds = f.kinds.as_ref().map(|k| k.iter().map(|k| k.as_u16().to_string()).collect::<Vec<_>>().join("+")).unwrap_or_default();
+    let by = if f.generic_tags.keys().any(|t| t.as_char() == 'p') {
+        "#p"
+    } else if f.authors.is_some() {
+        "authors"
+    } else if f.ids.is_some() {
+        "ids"
+    } else {
+        "any"
+    };
+    format!("{mode} k{kinds} {by}{}", if filters.len() > 1 { format!(" +{}", filters.len() - 1) } else { String::new() })
 }
 
 impl Hub {
@@ -154,7 +174,7 @@ impl Hub {
         let (pool, rx) = Pool::new(auth);
         let routes: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<Event>>>> = Arc::default();
         tokio::spawn(dispatch(rx, Arc::downgrade(&routes)));
-        Arc::new(Hub { pool, routes, queries: tokio::sync::Semaphore::new(queries) })
+        Arc::new(Hub { pool, routes, queries: tokio::sync::Semaphore::new(queries), query_times: Mutex::default() })
     }
 
     /// A handle reading and writing `urls` over this hub's connections.
@@ -168,6 +188,34 @@ impl Hub {
 
     pub fn stats(&self) -> std::collections::BTreeMap<String, relay_pool::RelayStats> {
         self.pool.stats()
+    }
+
+    /// Run one query under the hub's limit, recording its wait and hold.
+    async fn timed<T>(&self, label: String, run: impl std::future::Future<Output = T>) -> anyhow::Result<T> {
+        let asked = Instant::now();
+        let _slot = self.queries.acquire().await?;
+        let got = Instant::now();
+        let out = run.await;
+        let (waited, held) = (got - asked, got.elapsed());
+        let mut times = self.query_times.lock().unwrap_or_else(|e| e.into_inner());
+        let row = times.entry(label).or_default();
+        row.0 += 1;
+        row.1 += waited;
+        row.2 += held;
+        Ok(out)
+    }
+
+    /// The queries since the last report, the ones holding slots longest
+    /// first: what a slow boot was waiting on. Resets the tally.
+    pub fn take_query_report(&self) -> String {
+        let times = std::mem::take(&mut *self.query_times.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut rows: Vec<_> = times.into_iter().collect();
+        rows.sort_by_key(|(_, (_, _, held))| std::cmp::Reverse(*held));
+        rows.iter()
+            .take(10)
+            .map(|(label, (n, waited, held))| format!("{label}: {n}x waited {:.0}s held {:.0}s", waited.as_secs_f64(), held.as_secs_f64()))
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 }
 
@@ -246,20 +294,20 @@ fn newest_first(mut events: Vec<Event>) -> Vec<Event> {
 #[async_trait]
 impl RelayLike for Relays {
     async fn query(&self, filters: Vec<Filter>) -> anyhow::Result<Vec<Event>> {
-        let _slot = self.hub.queries.acquire().await?;
-        let events = self.hub.pool.query(&self.urls, filters, QUERY_TIMEOUT).await;
+        let label = query_label("all", &filters);
+        let events = self.hub.timed(label, self.hub.pool.query(&self.urls, filters, QUERY_TIMEOUT)).await?;
         Ok(newest_first(events.into_iter().filter(verify_once).collect()))
     }
 
     async fn query_settled(&self, filters: Vec<Filter>) -> anyhow::Result<Vec<Event>> {
-        let _slot = self.hub.queries.acquire().await?;
-        let events = self.hub.pool.query_settled(&self.urls, filters, QUERY_TIMEOUT, SETTLE_GRACE).await;
+        let label = query_label("settled", &filters);
+        let events = self.hub.timed(label, self.hub.pool.query_settled(&self.urls, filters, QUERY_TIMEOUT, SETTLE_GRACE)).await?;
         Ok(newest_first(events.into_iter().filter(verify_once).collect()))
     }
 
     async fn query_race(&self, filters: Vec<Filter>) -> Vec<Event> {
-        let Ok(_slot) = self.hub.queries.acquire().await else { return vec![] };
-        let events = self.hub.pool.query_race(&self.urls, filters, QUERY_TIMEOUT).await;
+        let label = query_label("race", &filters);
+        let Ok(events) = self.hub.timed(label, self.hub.pool.query_race(&self.urls, filters, QUERY_TIMEOUT)).await else { return vec![] };
         newest_first(events.into_iter().filter(verify_once).collect())
     }
 

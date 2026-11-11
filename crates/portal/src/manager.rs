@@ -585,6 +585,9 @@ impl BridgeManager {
         futures_util::future::join_all(workers).await;
         let live = ids.iter().filter(|id| self.is_live(id)).count();
         tracing::info!("{live}/{total} bridges live in {}s; {}; stages: {}", began.elapsed().as_secs(), self.discord_calls.take(), self.take_stage_times());
+        // Which queries held the hubs' slots, and how long others waited for one.
+        tracing::info!("boot queries, communities hub: {}", self.communities_hub.take_query_report());
+        tracing::info!("boot queries, bootstrap hub: {}", self.bootstrap.take_query_report());
         let deferred = {
             let mut c = lock(&self.catch_ups);
             c.0 -= 1;

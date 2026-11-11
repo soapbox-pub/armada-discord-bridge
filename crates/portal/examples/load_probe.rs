@@ -207,6 +207,8 @@ async fn main() -> anyhow::Result<()> {
     let live = probe.live.lock().unwrap().len();
     eprintln!("PROBE boot: {live}/{total} live in {}s, {}", began.elapsed().as_secs(), process_line());
     eprintln!("PROBE stages: {}", timings_line());
+    eprintln!("PROBE queries, communities hub: {}", probe.communities.take_query_report());
+    eprintln!("PROBE queries, bootstrap hub: {}", probe.bootstrap.take_query_report());
     for (why, n) in probe.failures.lock().unwrap().iter() {
         eprintln!("PROBE failed x{n}: {why}");
     }
