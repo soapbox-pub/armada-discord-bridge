@@ -53,9 +53,11 @@ never bridged without its community's consent.
 
 Not yet: severance detection is partial (a Refounding that leaves the bridge
 out pauses it; a ban without one, or a dissolution, doesn't yet); Discord-side commands are parsed from message text rather than
-registered as slash commands. And the owner of an imported community does not
-receive its staff write key: Roles v2 left no protocol path for a custodial
-importer to hand it over, so that needs an upstream change.
+registered as slash commands. The owner of an imported community gets its
+staff write key by signing a Grant to themselves in the browser, since on Roles
+v2 nobody else may sign one naming them; CORD-04 §3 assumes an owner already
+holds the key, so the `control_wrap` that Grant carries is read by Armada but
+not yet blessed by the spec.
 
 ## Layout
 
