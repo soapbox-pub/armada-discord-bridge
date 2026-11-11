@@ -428,6 +428,10 @@ impl BridgeManager {
             t.closed += s.closed;
             t.auth_rejected += s.auth_rejected;
             t.reqs += s.reqs;
+            t.answered += s.answered;
+            t.answer_ms += s.answer_ms;
+            t.unanswered += s.unanswered;
+            t.never_sent += s.never_sent;
         }
         out
     }
