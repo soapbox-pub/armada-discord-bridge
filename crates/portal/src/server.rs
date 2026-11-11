@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use crate::auth::{SessionData, SessionGuild, SessionUser, Sessions, require_session};
 use crate::discord_rest::{CannotCreateChannels, DiscordRest, OAuthGuild, bot_install_url, bot_install_url_create, can_manage, discord_channel_name, oauth_url};
 use crate::env::PortalEnv;
-use crate::importer::{ConfirmBody, Importer, PrepareBody, Preview};
+use crate::importer::{ConfirmBody, Importer, PrepareBody, Preview, StaffKeyBody};
 use crate::manager::{BRIDGE_COLUMNS, BridgeManager, BridgeRow};
 use crate::security::{OriginPolicy, api_cors, origin_guard, security_headers};
 use crate::seal::{seal, unseal};
@@ -514,8 +514,33 @@ async fn import_get(State(st): State<AppState>, headers: HeaderMap, Path(id): Pa
     Ok(Json(json!({
         "importId": row.import_id, "status": row.status, "statusDetail": row.status_detail,
         "plan": row.plan, "communityId": row.community_id, "inviteUrl": invite_url,
+        "staffKeyOwed": row.staff_key_owed(),
     }))
     .into_response())
+}
+
+/// The owner's staff write key, wrapped op→owner for the browser to re-wrap
+/// (`Importer::staff_key_offer`).
+async fn import_staff_key_offer(State(st): State<AppState>, headers: HeaderMap, Path(id): Path<String>) -> Res {
+    let importer = st.importer.clone();
+    import_action(&st, &headers, &id, async |owner| {
+        let (owner_pk, op_pk, wrap) = importer.staff_key_offer(&id, owner).await?;
+        Ok(json!({ "ownerPk": owner_pk, "opPk": op_pk, "wrap": wrap }))
+    })
+    .await
+}
+
+/// Without `signed`, the Grant template to sign; with it, publish the Grant.
+async fn import_staff_key(State(st): State<AppState>, headers: HeaderMap, Path(id): Path<String>, Json(body): Json<StaffKeyBody>) -> Res {
+    let importer = st.importer.clone();
+    import_action(&st, &headers, &id, async |owner| match &body.signed {
+        None => Ok(json!({ "template": importer.staff_key_template(&id, owner, &body.control_wrap).await? })),
+        Some(signed) => {
+            importer.deliver_staff_key(&id, owner, &body.control_wrap, signed).await?;
+            Ok(json!({ "ok": true }))
+        }
+    })
+    .await
 }
 
 /// Every import mutation: authenticate, re-check authority, then act. A
@@ -1193,6 +1218,7 @@ pub fn app(st: AppState, web_dir: &str) -> anyhow::Result<Router> {
         .route("/imports/{id}/prepare", post(import_prepare))
         .route("/imports/{id}/confirm", post(import_confirm))
         .route("/imports/{id}/retry", post(import_retry))
+        .route("/imports/{id}/staff-key", get(import_staff_key_offer).post(import_staff_key))
         .route("/imports/{id}/rerun-history", post(import_rerun_history))
         .route("/communities/{community_id}/rerun-history", post(community_rerun_history))
         .route("/bridges", post(bridge_create).get(bridges_list))

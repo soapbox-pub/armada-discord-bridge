@@ -58,6 +58,19 @@ for (const ch of channels.filter((c) => c.isPrivate)) {
   check(taken, `the owner takes the key to private channel ${ch.channelIdHex.slice(0, 8)}`);
 }
 
+// The owner's own Grant hands them the staff write key, read the way Armada's
+// useStaffKeyWatch reads it: off the folded Roster, opened under the pairwise
+// key with the head's author (the owner themselves), checked against control_pk.
+const mine = folded.roster.grants.find((g: any) => g.member === me);
+const head = folded.headEditions.get(derive.bytesToHex(derive.grantLocator(cid, h(me))));
+let staff = false;
+if (mine?.controlWrap && head) {
+  const plain = rekey.base64ToBytes(nip44Decrypt(mine.controlWrap, getConversationKey(ownerSk, head.author)));
+  const { epoch, controlRoot } = rekey.decodeControlWrap(plain);
+  staff = epoch === BigInt(m.root_epoch) && derive.controlSignerGroupKey(controlRoot, cid, epoch).pk === m.control_pk;
+}
+check(staff, "the owner adopts the staff write key from their own Grant");
+
 if (failures.length) {
   console.error(`Armada disagrees with the import:\n- ${failures.join("\n- ")}`);
   process.exit(1);

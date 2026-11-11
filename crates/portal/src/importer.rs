@@ -71,7 +71,7 @@ const RESUME_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_ASSET_BYTES: usize = 8 * 1024 * 1024;
 
 pub const IMPORT_COLUMNS: &str = "import_id::text AS import_id, owner_discord_id, discord_guild_id, discord_guild_name, status, \
-     status_detail, plan, history_progress, owner_sk_sealed, community_sealed, community_id, invite_url_sealed, link_signer_sk_sealed, updated_at";
+     status_detail, plan, history_progress, owner_sk_sealed, community_sealed, community_id, invite_url_sealed, link_signer_sk_sealed, updated_at, owner_staff_key_at";
 
 #[derive(Clone, Debug)]
 pub struct ImportRow {
@@ -88,6 +88,20 @@ pub struct ImportRow {
     pub invite_url_sealed: Option<Vec<u8>>,
     pub link_signer_sk_sealed: Option<Vec<u8>>,
     pub updated_at: SystemTime,
+    /// When the owner's staff-key Grant landed (see `deliver_staff_key`).
+    pub owner_staff_key_at: Option<SystemTime>,
+}
+
+impl ImportRow {
+    /// Whether the owner still lacks the staff write key, and can be handed it.
+    ///
+    /// Only a Roles v2 import owes it: a legacy one's pipeline delivers it in a
+    /// Grant the op key signs (`publish_editions` step 1b). Only after confirm:
+    /// before that no community exists for the key to open.
+    pub fn staff_key_owed(&self) -> bool {
+        let cp = &self.plan.checkpoints;
+        cp.ranked && cp.owner_signed_seals.is_some() && self.owner_staff_key_at.is_none()
+    }
 }
 
 impl ImportRow {
@@ -108,6 +122,7 @@ impl ImportRow {
             invite_url_sealed: r.get("invite_url_sealed"),
             link_signer_sk_sealed: r.get("link_signer_sk_sealed"),
             updated_at: r.get("updated_at"),
+            owner_staff_key_at: r.get("owner_staff_key_at"),
         })
     }
 }
@@ -136,6 +151,15 @@ pub struct PrepareBody {
 pub struct ConfirmBody {
     /// The owner-signed seals, in the same order as the prepared templates.
     pub signed_events: Option<Vec<SignedSeal>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaffKeyBody {
+    /// The staff write key, NIP-44'd by the owner's signer to the owner.
+    pub control_wrap: String,
+    /// The owner-signed Grant seal; absent when asking for its template.
+    pub signed: Option<SignedSeal>,
 }
 
 pub enum Preview {
@@ -616,6 +640,111 @@ impl Importer {
         self.launch(import_id);
         Ok(())
     }
+
+    /// Step 1 of handing the owner the staff write key: the key, wrapped for
+    /// the owner under the op↔owner pairwise key, for the browser to re-wrap.
+    ///
+    /// The owner of an imported community needs `control_root` to change any
+    /// setting, and joins through the public invite, which carries only
+    /// `control_pk`. On the ranked Roster the op key can't deliver it the way
+    /// it does on the legacy one (step 1b): a Grant naming the owner stands
+    /// only when the owner signs it (CORD-04 §3). So the owner signs it, and
+    /// Armada's staff-key watch opens a Grant's wrap with the pairwise key
+    /// between member and sealer, which for the owner's own Grant is the
+    /// owner↔owner key: only the owner's signer can compute it, so the wrap has
+    /// to be made in the browser.
+    ///
+    /// The secret travels here wrapped op→owner rather than in the clear, so a
+    /// stolen Discord session (all this endpoint checks) yields ciphertext only
+    /// the owner's key opens. Returns `(owner, op, wrap)`.
+    pub async fn staff_key_offer(&self, import_id: &str, owner_discord_id: &str) -> anyhow::Result<(String, String, String)> {
+        let row = self.row(import_id, Some(owner_discord_id)).await?.context("no such import")?;
+        if !row.staff_key_owed() {
+            bail!("this import owes no staff key");
+        }
+        let (community, op, _) = self.load(import_id).await?;
+        let control_root = community.control_root.as_deref().and_then(hex32).context("the portal does not hold this community's control key")?;
+        let owner = PublicKey::from_hex(&community.owner)?;
+        let wrap = concord::rekey::seal_control_wrap(community.root_epoch, &control_root, op.secret_key(), &owner)?;
+        Ok((community.owner, op.public_key().to_hex(), wrap))
+    }
+
+    /// Step 2: the owner's staff-key Grant around the browser's re-wrap, as a
+    /// seal template to sign. Stateless: step 3 rebuilds it from the same inputs.
+    pub async fn staff_key_template(&self, import_id: &str, owner_discord_id: &str, control_wrap: &str) -> anyhow::Result<EventTemplate> {
+        let row = self.row(import_id, Some(owner_discord_id)).await?.context("no such import")?;
+        if !row.staff_key_owed() {
+            bail!("this import owes no staff key");
+        }
+        Self::owner_staff_grant(&row.plan, control_wrap, now_ms() / 1000)
+    }
+
+    /// Step 3: check the signed Grant against the template it must be, publish
+    /// it to the Control Plane, and record that it landed.
+    pub async fn deliver_staff_key(&self, import_id: &str, owner_discord_id: &str, control_wrap: &str, signed: &SignedSeal) -> anyhow::Result<()> {
+        let row = self.row(import_id, Some(owner_discord_id)).await?.context("no such import")?;
+        if !row.staff_key_owed() {
+            bail!("this import owes no staff key");
+        }
+        // Step 2 stamped the template with the time it was asked for; a stamp
+        // far from now is not one it issued.
+        if signed.created_at.abs_diff(now_ms() / 1000) > 3600 {
+            bail!("the staff-key grant is dated too far from now; sign it again");
+        }
+        let owner = row.plan.checkpoints.owner_pk_hex.clone().unwrap_or_default();
+        let t = Self::owner_staff_grant(&row.plan, control_wrap, signed.created_at)?;
+        if signed.kind != t.kind || signed.content != t.content || signed.tags != t.tags {
+            bail!("the signed staff-key grant does not match its template");
+        }
+        if signed.pubkey != owner {
+            bail!("the staff-key grant is signed by the wrong key");
+        }
+        let seal = seal_event(signed).context("the staff-key grant has an invalid signature")?;
+        let (community, _, _) = self.load(import_id).await?;
+        let control = community.control_write_stream().context("the portal does not hold this community's control key")?;
+        let relays = (self.io.relays)(community.relays.clone());
+        relays.register_auth_keys(stream_keys(&community.control_streams()));
+        let wrap = wrap_seal(&seal, &control, WrapOptions::default())?;
+        self.publish_verified(relays.as_ref(), &wrap, "the owner's staff-key grant").await?;
+        self.pool
+            .get()
+            .await?
+            .execute("UPDATE imports SET owner_staff_key_at = now() WHERE import_id = ($1::text)::uuid", &[&import_id])
+            .await?;
+        tracing::info!(import = %import_id, community = %community.community_id, "owner staff key delivered");
+        Ok(())
+    }
+
+    /// The owner's own Grant, carrying the staff write key, as a seal template.
+    ///
+    /// CORD-04 §3 says a Grant naming the owner "carries no `control_wrap`,
+    /// since the owner holds the `control_root` by right". That holds when the
+    /// owner's client minted the community; here the portal minted it, so the
+    /// owner holds it by right and in fact nowhere. The field is delivery, never
+    /// authority (§2): a reader that skips it on an owner's Grant loses
+    /// nothing, and Armada adopts it only after checking the secret derives to
+    /// the community's `control_pk`. Nothing here changes what the fold admits.
+    ///
+    /// The Grant names the Admin Role because a Grant naming no standing Role
+    /// is a strip, which never folds into the Roster, and Armada reads the wrap
+    /// off the folded Roster. For the owner the Role is display only (§3).
+    fn owner_staff_grant(plan: &ImportPlan, control_wrap: &str, created_at: u64) -> anyhow::Result<EventTemplate> {
+        // The fold drops a wrap outside these bounds without a word (roles.rs
+        // MAX_CONTROL_WRAP_CHARS), which would record a delivery that delivered
+        // nothing. A NIP-44 wrap of 40 bytes is ~130 base64 characters.
+        if control_wrap.is_empty() || control_wrap.len() > 1024 || base64::Engine::decode(&base64::engine::general_purpose::STANDARD, control_wrap).is_err() {
+            bail!("the staff-key wrap is not a NIP-44 payload");
+        }
+        let cp = &plan.checkpoints;
+        let owner = cp.owner_pk_hex.as_deref().context("import has no owner")?;
+        let cid = cp.community_id_hex.as_deref().and_then(hex32).context("import has no community")?;
+        let admin = cp.admin_role_id_hex.clone().context("import has no Admin Role")?;
+        let binding = edition_binding(&cid);
+        let meta = EditionMeta { created_at: Some(created_at), ..EditionMeta::first(owner, None) }.marked(&binding);
+        let grant = MemberGrant { member: owner.to_owned(), role_ids: vec![admin], control_wrap: Some(control_wrap.to_owned()) };
+        let rumor = build_grant_edition(&cid, &grant, &meta)?;
+        Ok(EventTemplate { kind: kinds::SEAL_PLAINTEXT, content: rumor.to_json(), tags: vec![], created_at: rumor.created_at })
+    }
 }
 
 /// A browser-signed seal as an event, if its id and signature verify.
@@ -865,12 +994,10 @@ impl Importer {
         // and never came from a grant. This edition delivers a key, claims nothing.
         //
         // On the ranked Roster no such Grant can stand: a Grant naming the owner
-        // stands only when the owner signs it, and carries no `control_wrap`
-        // (CORD-04 §3), so publishing one would only put an edition every
-        // reader refuses on the plane. That leaves no protocol path by which a
-        // custodial importer hands the owner the staff key; it needs one
-        // upstream (an owner-signed delivery, or Armada minting the community
-        // itself and granting the op key), not a workaround here.
+        // stands only when the owner signs it (CORD-04 §3), so one the op key
+        // signed would only put an edition every reader refuses on the plane.
+        // There the owner signs their own, from the browser, whenever they get
+        // to it: see `staff_key_offer`.
         if !plan.checkpoints.ranked
             && plan.checkpoints.owner_control_key_published_at.is_none()
             && let Some(control_root) = community.control_root.as_deref().and_then(hex32)
@@ -1991,13 +2118,6 @@ mod tests {
         let joined = bridge::client::resolve_invite(&invite.unwrap(), &relay).await.unwrap();
         let member = ConcordClient::new(joined.membership.clone(), Arc::new(relay.clone()), Keys::generate());
         let folded = member.sync_control().await.unwrap();
-        // `DUMP_IMPORT=path` writes what the import published, for
-        // tools/vectors/check-import.ts to fold with Armada's own code.
-        if let Ok(path) = std::env::var("DUMP_IMPORT") {
-            let events: Vec<Value> = relay.published().iter().map(|e| serde_json::from_str(&e.as_json()).unwrap()).collect();
-            let dump = json!({ "membership": joined.membership, "events": events, "owner_sk": owner.secret_key().to_secret_hex(), "op": cp.op_pk_hex });
-            std::fs::write(path, dump.to_string()).unwrap();
-        }
         assert!(folded.ranked, "the owner's @everyone switched the community at genesis");
         assert_eq!(folded.metadata.as_ref().unwrap().name, "Lynch Park");
         // Vector authenticates the invite's root by the OWNER's metadata edition
@@ -2112,9 +2232,46 @@ mod tests {
             .get(0);
         assert_ne!(folded.channel_permissions(&bridge_pk, &mods.channel_id_hex) & perm::VIEW_CHANNEL, 0, "the bridge is let in by a member overwrite");
 
-        // No Grant can hand the owner the staff key on the ranked Roster
-        // (CORD-04 §3), so none is published; see publish_editions.
+        // The op key can't hand the owner the staff key on the ranked Roster
+        // (CORD-04 §3), so the pipeline publishes no Grant naming them...
         assert!(folded.roster.grants.iter().all(|g| g.member != owner_hex));
+        assert!(row.staff_key_owed());
+
+        // ...and the owner signs their own, as the browser does: open the
+        // op→owner wrap, re-wrap it owner→owner, sign the Grant around it.
+        let (offer_owner, offer_op, offer_wrap) = importer.staff_key_offer(&import_id, &owner_discord).await.unwrap();
+        assert_eq!((offer_owner.as_str(), offer_op.as_str()), (owner_hex.as_str(), op_pk.as_str()));
+        let from_op = concord::derive::conversation_key(owner.secret_key(), &PublicKey::from_hex(&op_pk).unwrap());
+        let plain_b64 = concord::nip44::decrypt_str(&from_op, &offer_wrap).unwrap();
+        let to_self = concord::derive::conversation_key(owner.secret_key(), &owner.public_key());
+        let self_wrap = concord::nip44::encrypt_str(&to_self, &plain_b64).unwrap();
+        assert!(importer.staff_key_template(&import_id, &owner_discord, "not base64!").await.is_err());
+        let template = importer.staff_key_template(&import_id, &owner_discord, &self_wrap).await.unwrap();
+        // Signed by anyone but the owner, or around another wrap, it is refused.
+        assert!(importer.deliver_staff_key(&import_id, &owner_discord, &self_wrap, &sign(&template, &Keys::generate())).await.is_err());
+        assert!(importer.deliver_staff_key(&import_id, &owner_discord, &offer_wrap, &sign(&template, &owner)).await.is_err());
+        importer.deliver_staff_key(&import_id, &owner_discord, &self_wrap, &sign(&template, &owner)).await.unwrap();
+        let (row, _) = importer.get(&import_id, &owner_discord).await.unwrap().unwrap();
+        assert!(!row.staff_key_owed());
+        assert!(importer.staff_key_offer(&import_id, &owner_discord).await.is_err(), "delivered once");
+
+        // It folds, and the owner opens it with their own key alone, as
+        // Armada's staff-key watch does, to the plane's own control key.
+        let refolded = member.sync_control().await.unwrap();
+        let mine = refolded.roster.grants.iter().find(|g| g.member == owner_hex).expect("the owner's Grant folds");
+        let plain = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, concord::nip44::decrypt_str(&to_self, mine.control_wrap.as_ref().unwrap()).unwrap()).unwrap();
+        let (epoch, root) = concord::rekey::decode_control_wrap(&plain).unwrap();
+        let derived = concord::derive::control_signer_group_key(&root, &joined.membership.id(), epoch).keys.public_key().to_hex();
+        assert_eq!(Some(derived), joined.membership.control_pk.clone(), "the owner now holds the staff write key");
+        assert!(refolded.roster.has(&op, ALL_MAPPED), "nothing the op holds moved");
+        // `DUMP_IMPORT=path` writes what the import published, the owner's
+        // staff-key Grant included, for tools/vectors/check-import.ts to fold
+        // with Armada's own code.
+        if let Ok(path) = std::env::var("DUMP_IMPORT") {
+            let events: Vec<Value> = relay.published().iter().map(|e| serde_json::from_str(&e.as_json()).unwrap()).collect();
+            let dump = json!({ "membership": joined.membership, "events": events, "owner_sk": owner.secret_key().to_secret_hex(), "op": op_pk });
+            std::fs::write(path, dump.to_string()).unwrap();
+        }
 
         // Both text channels were wired; the private one only because it was ticked.
         let bridges = pool
