@@ -100,6 +100,18 @@ impl Probe {
             .with_context(|| format!("bootstrap {:?}", bootstrap.urls()))?
             .membership;
         let community = stage("community: open, or wait for it", 180, self.community(&membership)).await?;
+        if std::env::var("PROBE_COMMUNITIES").is_ok() {
+            let f = community.runtime.folded();
+            eprintln!(
+                "PROBE community {} epoch={} relays={:?} channels={} wanted={} found={}",
+                &membership.community_id[..8],
+                membership.root_epoch,
+                community.relays.urls(),
+                f.as_ref().map_or(0, |f| f.channels.len()),
+                row.concord_channel_id.as_deref().unwrap_or("-").get(..8).unwrap_or("-"),
+                f.as_ref().and_then(|f| f.channels.get(row.concord_channel_id.as_deref().unwrap_or(""))).map_or("absent".to_owned(), |c| format!("private={} deleted={}", c.private, c.deleted)),
+            );
+        }
         community.relays.register_auth_keys(vec![primary.clone()]);
         let folded = community.runtime.folded().context("no fold")?;
         // As the portal's start does it (manager.rs `start_inner`).
@@ -183,6 +195,12 @@ async fn main() -> anyhow::Result<()> {
     // rehearsing a whole boot.
     if let Some(n) = std::env::var("PROBE_LIMIT").ok().and_then(|n| n.parse().ok()) {
         rows.truncate(n);
+    }
+    // PROBE_COMMUNITIES=<id prefix>,... tries only those communities' bridges,
+    // and says what their relays held.
+    let only: Vec<String> = std::env::var("PROBE_COMMUNITIES").map(|v| v.split(',').map(str::to_owned).collect()).unwrap_or_default();
+    if !only.is_empty() {
+        rows.retain(|r| r.community_id.as_deref().is_some_and(|c| only.iter().any(|p| c.starts_with(p.as_str()))));
     }
     let probe = Arc::new(Probe {
         seal_key: std::env::var("PORTAL_SEAL_KEY")?,
