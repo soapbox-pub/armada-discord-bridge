@@ -589,7 +589,13 @@ impl ConcordClient {
     /// Returns the chats and the newest wrap timestamp seen, the next cursor.
     pub async fn backfill_channel(&self, channel: &ChannelView, since_secs: u64, limit: usize) -> anyhow::Result<(Vec<OpenedChat>, Option<u64>)> {
         let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).authors(channel_addresses(channel)).since(Timestamp::from_secs(since_secs)).limit(limit);
-        let wraps = self.relays.query(vec![filter]).await?;
+        // Settled, not every relay: a relay that takes REQs and never answers
+        // (relay.dreamith.to, 2026-11-11) made each catch-up wait out the whole
+        // timeout, and a boot's two thousand of them took over an hour. What
+        // this gives up is a post held only by a relay answering more than the
+        // grace after the rest, which the ten-second timeout gave up past ten;
+        // clients publish to every relay of a community.
+        let wraps = self.relays.query_settled(vec![filter]).await?;
         let mut chats: Vec<OpenedChat> = wraps.iter().filter_map(|w| open_chat(w, channel)).collect();
         chats.sort_by_key(|c| c.ms);
         let newest = wraps.iter().map(|w| w.created_at.as_secs()).max();

@@ -121,8 +121,10 @@ const GATEWAY_RETRY_MAX: Duration = Duration::from_secs(10 * 60);
 /// How many bridges may be starting at once during boot; see `start_all`.
 const START_CONCURRENCY: usize = 12;
 
-/// How many deferred catch-ups run at once after a boot; see `run_deferred_catch_ups`.
-const CATCH_UP_CONCURRENCY: usize = 4;
+/// How many deferred catch-ups run at once after a boot; see
+/// `run_deferred_catch_ups`. Two thirds of the shared hub's query slots: the
+/// starts are done, and live folds and retries still need the rest.
+const CATCH_UP_CONCURRENCY: usize = 8;
 
 /// Most Discord messages one start-time catch-up reads per channel. Bounds an
 /// old anchor — a bridge down for weeks — to a burst the channel can absorb.
