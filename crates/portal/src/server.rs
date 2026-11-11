@@ -519,6 +519,14 @@ async fn import_get(State(st): State<AppState>, headers: HeaderMap, Path(id): Pa
     .into_response())
 }
 
+/// The session's imports still owed the owner's staff key.
+async fn import_staff_keys_owed(State(st): State<AppState>, headers: HeaderMap) -> Res {
+    let session = session_or_401!(st, headers);
+    let owed = st.importer.staff_keys_owed(&session.user.id).await?;
+    let owed: Vec<Value> = owed.into_iter().map(|(id, name)| json!({ "importId": id, "communityName": name })).collect();
+    Ok(Json(json!({ "imports": owed })).into_response())
+}
+
 /// The owner's staff write key, wrapped op→owner for the browser to re-wrap
 /// (`Importer::staff_key_offer`).
 async fn import_staff_key_offer(State(st): State<AppState>, headers: HeaderMap, Path(id): Path<String>) -> Res {
@@ -1214,6 +1222,7 @@ pub fn app(st: AppState, web_dir: &str) -> anyhow::Result<Router> {
         .route("/me", get(me))
         .route("/guilds/{id}/channels", get(guild_channels))
         .route("/imports", post(import_create))
+        .route("/imports/staff-keys-owed", get(import_staff_keys_owed))
         .route("/imports/{id}", get(import_get))
         .route("/imports/{id}/prepare", post(import_prepare))
         .route("/imports/{id}/confirm", post(import_confirm))

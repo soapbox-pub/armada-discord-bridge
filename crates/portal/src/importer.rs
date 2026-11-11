@@ -641,6 +641,27 @@ impl Importer {
         Ok(())
     }
 
+    /// This Discord user's imports whose owner still lacks the staff write
+    /// key, as `(import_id, community name)`, so the dashboard can say so: an
+    /// owner who imported before the browser delivered it has no other way to
+    /// learn why Armada won't let them change a setting.
+    pub async fn staff_keys_owed(&self, owner_discord_id: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let rows = self
+            .pool
+            .get()
+            .await?
+            .query(
+                &format!(
+                    "SELECT {IMPORT_COLUMNS} FROM imports WHERE owner_discord_id = $1 AND owner_staff_key_at IS NULL
+                       AND status NOT IN ('previewed', 'awaiting_sigs') ORDER BY updated_at DESC"
+                ),
+                &[&owner_discord_id],
+            )
+            .await?;
+        let rows = rows.iter().filter_map(|r| ImportRow::from_row(r).ok());
+        Ok(rows.filter(ImportRow::staff_key_owed).map(|r| (r.import_id, r.plan.community_name)).collect())
+    }
+
     /// Step 1 of handing the owner the staff write key: the key, wrapped for
     /// the owner under the op↔owner pairwise key, for the browser to re-wrap.
     ///
@@ -2236,6 +2257,8 @@ mod tests {
         // (CORD-04 §3), so the pipeline publishes no Grant naming them...
         assert!(folded.roster.grants.iter().all(|g| g.member != owner_hex));
         assert!(row.staff_key_owed());
+        let owed = importer.staff_keys_owed(&owner_discord).await.unwrap();
+        assert_eq!(owed, [(import_id.clone(), "Lynch Park".to_owned())], "the dashboard is told");
 
         // ...and the owner signs their own, as the browser does: open the
         // op→owner wrap, re-wrap it owner→owner, sign the Grant around it.
@@ -2254,6 +2277,7 @@ mod tests {
         let (row, _) = importer.get(&import_id, &owner_discord).await.unwrap().unwrap();
         assert!(!row.staff_key_owed());
         assert!(importer.staff_key_offer(&import_id, &owner_discord).await.is_err(), "delivered once");
+        assert!(importer.staff_keys_owed(&owner_discord).await.unwrap().is_empty());
 
         // It folds, and the owner opens it with their own key alone, as
         // Armada's staff-key watch does, to the plane's own control key.
