@@ -321,3 +321,25 @@ async fn a_start_walks_every_refounding_since_the_invite_and_hands_the_fold_the_
     let other = bridge::key_intake::intake_base_rotations(rt.relays().as_ref(), &stranger, &w.community, &folded).await;
     assert_eq!(other.adopted, None);
 }
+
+#[tokio::test]
+async fn starts_in_one_community_share_a_fetch_of_its_refoundings_and_each_opens_only_its_own_blob() {
+    let w = world();
+    let general = concord::random32();
+    w.channel(general, "general", false);
+    let rt = w.open(Arc::default()).await;
+    let (a, b, stranger) = (Keys::generate(), Keys::generate(), Keys::generate());
+    let r = refound(&w, &w.community, &[&a, &b]);
+    let folded = rt.folded().unwrap();
+
+    let before = w.relay.queries();
+    let ia = rt.intake_base_rotations(&a, &w.community, &folded).await;
+    let after_first = w.relay.queries();
+    let ib = rt.intake_base_rotations(&b, &w.community, &folded).await;
+    let is = rt.intake_base_rotations(&stranger, &w.community, &folded).await;
+    assert_eq!((ia.adopted, ib.adopted), (Some(1), Some(1)));
+    assert_eq!((ia.community.root.as_str(), ib.community.root.as_str()), (r.after.root.as_str(), r.after.root.as_str()));
+    assert_eq!(is.adopted, None, "a shared fetch hands nobody a key: each opens its own blob");
+    assert_eq!(w.relay.queries(), after_first, "the later starts asked the relays nothing");
+    assert!(after_first > before);
+}

@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use bridge::client::{BotCommand, BotCommandArg, ConcordClient, OpenedChat, SendChat, TaskGuard, now_ms, resolve_invite};
 use bridge::community::{Attachment, CommunityRuntime};
 use bridge::discord::{CommandMessage, DiscordAdapter, DiscordEvents, TypingEvent};
-use bridge::key_intake::{intake_access_keys, intake_base_rotations, intake_direct_invite_keys};
+use bridge::key_intake::{intake_access_keys, intake_direct_invite_keys};
 use bridge::profiles::Kind0ProfileResolver;
 use bridge::puppets::PuppetCache;
 use bridge::relays::{Hub, RelayLike, Relays};
@@ -835,7 +835,7 @@ impl BridgeManager {
         // bridge's own key, before any channel key: the access plane derives
         // from the root. The invite moves only when its creator re-posts it,
         // and nobody re-posts the one an import minted.
-        let base = stage("following refoundings", STAGE_RELAY, async { Ok(intake_base_rotations(relays, &primary, &membership, &folded).await) }).await?;
+        let base = stage("following refoundings", STAGE_RELAY, async { Ok(community.runtime.intake_base_rotations(&primary, &membership, &folded).await) }).await?;
         if base.excluded.is_some() {
             return Err(RefoundedOut.into());
         }

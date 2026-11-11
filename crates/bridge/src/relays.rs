@@ -316,6 +316,7 @@ struct MemoryState {
     /// Serve giftwraps only to their address or recipient, once AUTHed as it.
     gated: bool,
     authed: std::collections::HashSet<PublicKey>,
+    queries: usize,
 }
 
 impl MemoryState {
@@ -378,6 +379,11 @@ impl MemoryRelay {
         st.subs.len()
     }
 
+    /// One-shot queries answered so far.
+    pub fn queries(&self) -> usize {
+        self.inner.lock().unwrap().queries
+    }
+
     /// Gate kind 1059 by NIP-42, as ditto-relay does by default: a wrap is
     /// served only to a connection authenticated as its author or recipient.
     pub fn gate_giftwraps(&self) {
@@ -401,7 +407,8 @@ impl MemoryRelay {
 #[async_trait]
 impl RelayLike for MemoryRelay {
     async fn query(&self, filters: Vec<Filter>) -> anyhow::Result<Vec<Event>> {
-        let st = self.inner.lock().unwrap();
+        let mut st = self.inner.lock().unwrap();
+        st.queries += 1;
         let mut out: Vec<Event> = Vec::new();
         for f in &filters {
             let mut matched: Vec<Event> =

@@ -229,13 +229,29 @@ const MAX_BASE_STEPS: usize = 16;
 /// takes a rotation only from an unbanned BAN holder citing a satisfied
 /// Grant, continuing from the root held.
 pub async fn intake_base_rotations(relays: &dyn RelayLike, identity: &Keys, community: &Membership, folded: &FoldedControl) -> BaseIntake {
+    walk_base_rotations(|address| fetch_base_rotations(relays, address), identity, community, folded).await
+}
+
+/// The wraps at one base rotation address.
+pub async fn fetch_base_rotations(relays: &dyn RelayLike, address: StreamKey) -> Vec<Event> {
+    relays.register_auth_keys(auth_keys([&address]));
+    let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).author(address.pk).limit(SCAN_LIMIT);
+    relays.query_settled(vec![filter]).await.unwrap_or_default()
+}
+
+/// [`intake_base_rotations`] over any source of the wraps at an address: what
+/// a rotation address holds is the same for every member, and only opening a
+/// blob takes a member's own key, so one fetch can serve a community.
+pub async fn walk_base_rotations<F, Fut>(mut fetch: F, identity: &Keys, community: &Membership, folded: &FoldedControl) -> BaseIntake
+where
+    F: FnMut(StreamKey) -> Fut,
+    Fut: std::future::Future<Output = Vec<Event>>,
+{
     let mut next = community.clone();
     let (mut adopted, mut excluded) = (None, None);
     for _ in 0..MAX_BASE_STEPS {
         let address: StreamKey = (&next.next_base_rekey_address()).into();
-        relays.register_auth_keys(auth_keys([&address]));
-        let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).author(address.pk).limit(SCAN_LIMIT);
-        let wraps = relays.query_settled(vec![filter]).await.unwrap_or_default();
+        let wraps = fetch(address.clone()).await;
         let parsed = wraps.iter().filter_map(|w| parse_rekey(&open_plane_wrap(w, &address, Plane::Rekey).ok()?).ok()).collect();
         match next.apply_base_rotations(&group_rotations(parsed), folded, identity) {
             concord::community::RekeyOutcome::AdoptedRoot(epoch) => adopted = Some(epoch),

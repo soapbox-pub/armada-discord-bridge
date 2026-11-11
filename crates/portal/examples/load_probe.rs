@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use bridge::client::{ConcordClient, resolve_invite};
 use bridge::community::{Attachment, CommunityRuntime};
-use bridge::key_intake::{intake_access_keys, intake_base_rotations, intake_direct_invite_keys};
+use bridge::key_intake::{intake_access_keys, intake_direct_invite_keys};
 use bridge::relays::{Hub, RelayLike, Relays};
 use concord::community::Membership;
 use concord::invite::{invite_delivery_relays, parse_invite_link, stock_relays};
@@ -103,7 +103,7 @@ impl Probe {
         community.relays.register_auth_keys(vec![primary.clone()]);
         let folded = community.runtime.folded().context("no fold")?;
         // As the portal's start does it (manager.rs `start_inner`).
-        let base = stage("following refoundings", 90, async { Ok(intake_base_rotations(&community.relays, &primary, &membership, &folded).await) }).await?;
+        let base = stage("following refoundings", 90, async { Ok(community.runtime.intake_base_rotations(&primary, &membership, &folded).await) }).await?;
         let (membership, folded) = if base.adopted.is_some() {
             stage("refolding at the new root", 90, community.runtime.adopt_base(&base.community)).await?;
             (base.community, community.runtime.folded().context("no fold")?)

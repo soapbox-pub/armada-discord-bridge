@@ -64,11 +64,18 @@ pub struct CommunityRuntime {
     refound: Arc<Notify>,
     /// Told the id of each attached bridge a Refounding removed.
     on_excluded: Mutex<Option<ExcludedHandler>>,
+    /// What each base rotation address held when last fetched for a start.
+    base_wraps: tokio::sync::Mutex<HashMap<PublicKey, (std::time::Instant, Vec<Event>)>>,
     tasks: Mutex<Vec<TaskGuard>>,
 }
 
 /// Called with a bridge id when a Refounding left that bridge out.
 pub type ExcludedHandler = Arc<dyn Fn(String) + Send + Sync>;
+
+/// How long a start may reuse what a base rotation address held when another
+/// start of the same community fetched it. A Refounding landing meanwhile is
+/// heard by the control REQ, whose follow-up fetches afresh.
+const BASE_WRAPS_FRESH: Duration = Duration::from_secs(120);
 
 /// How long a Refounding's chunks are given to land before it is read.
 const REFOUND_SETTLE: Duration = Duration::from_millis(1500);
@@ -101,6 +108,7 @@ impl CommunityRuntime {
             control_sub: Mutex::new(None),
             refound: Arc::default(),
             on_excluded: Mutex::new(None),
+            base_wraps: tokio::sync::Mutex::default(),
             tasks: Mutex::default(),
         });
         rt.restart_control();
@@ -173,6 +181,40 @@ impl CommunityRuntime {
             }
         }
         self.refresh_views();
+    }
+
+    /// Follow the community's Refoundings for a starting bridge, with its own
+    /// key, from wraps this community fetched for its other starts.
+    ///
+    /// Every bridge into a community asks the same rotation address, and a
+    /// boot starts them back to back: per bridge, it was the slowest stage of
+    /// a start (0.59s, 2208 times, 2026-11-11). One fetch per address now
+    /// serves them all. Live following (`follow_refounding`) never reads
+    /// from here.
+    pub async fn intake_base_rotations(&self, identity: &Keys, community: &Membership, folded: &FoldedControl) -> crate::key_intake::BaseIntake {
+        let relays = self.relays().clone();
+        crate::key_intake::walk_base_rotations(
+            |address| {
+                let relays = relays.clone();
+                async move {
+                    // Held across the fetch, so the community's other starts wait
+                    // for this one rather than all asking at once.
+                    let mut cache = self.base_wraps.lock().await;
+                    if let Some((at, wraps)) = cache.get(&address.pk)
+                        && at.elapsed() < BASE_WRAPS_FRESH
+                    {
+                        return wraps.clone();
+                    }
+                    let wraps = crate::key_intake::fetch_base_rotations(relays.as_ref(), address.clone()).await;
+                    cache.insert(address.pk, (std::time::Instant::now(), wraps.clone()));
+                    wraps
+                }
+            },
+            identity,
+            community,
+            folded,
+        )
+        .await
     }
 
     /// Move the shared fold to a root a bridge verified (its own rotation
