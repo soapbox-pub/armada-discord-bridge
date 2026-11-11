@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use bridge::client::{ConcordClient, resolve_invite};
 use bridge::community::{Attachment, CommunityRuntime};
-use bridge::key_intake::intake_direct_invite_keys;
+use bridge::key_intake::{intake_access_keys, intake_base_rotations, intake_direct_invite_keys};
 use bridge::relays::{Hub, RelayLike, Relays};
 use concord::community::Membership;
 use concord::invite::{invite_delivery_relays, parse_invite_link, stock_relays};
@@ -25,8 +25,29 @@ use portal::seal::unseal;
 
 const WORKERS: usize = 12;
 
-async fn stage<T>(name: &str, secs: u64, fut: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
-    tokio::time::timeout(Duration::from_secs(secs), fut).await.map_err(|_| anyhow::anyhow!("{name} timed out"))?
+/// Wall time spent in each stage across every start: (count, total).
+static TIMINGS: Mutex<Vec<(&'static str, u32, Duration)>> = Mutex::new(Vec::new());
+
+async fn stage<T>(name: &'static str, secs: u64, fut: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    let began = Instant::now();
+    let out = tokio::time::timeout(Duration::from_secs(secs), fut).await.map_err(|_| anyhow::anyhow!("{name} timed out"));
+    let took = began.elapsed();
+    let mut t = TIMINGS.lock().unwrap();
+    match t.iter_mut().find(|(n, _, _)| *n == name) {
+        Some(row) => {
+            row.1 += 1;
+            row.2 += took;
+        }
+        None => t.push((name, 1, took)),
+    }
+    out?
+}
+
+/// Where the starts' time went, slowest stage first.
+fn timings_line() -> String {
+    let mut t = TIMINGS.lock().unwrap().clone();
+    t.sort_by_key(|(_, _, d)| std::cmp::Reverse(*d));
+    t.iter().map(|(n, c, d)| format!("{n}: {c}x avg {:.2}s total {:.0}s", d.as_secs_f64() / f64::from(*c), d.as_secs_f64())).collect::<Vec<_>>().join("; ")
 }
 
 struct Community {
@@ -78,15 +99,25 @@ impl Probe {
             .await
             .with_context(|| format!("bootstrap {:?}", bootstrap.urls()))?
             .membership;
-        let community = self.community(&membership).await?;
+        let community = stage("community: open, or wait for it", 180, self.community(&membership)).await?;
         community.relays.register_auth_keys(vec![primary.clone()]);
         let folded = community.runtime.folded().context("no fold")?;
+        // As the portal's start does it (manager.rs `start_inner`).
+        let base = stage("following refoundings", 90, async { Ok(intake_base_rotations(&community.relays, &primary, &membership, &folded).await) }).await?;
+        let (membership, folded) = if base.adopted.is_some() {
+            stage("refolding at the new root", 90, community.runtime.adopt_base(&base.community)).await?;
+            (base.community, community.runtime.folded().context("no fold")?)
+        } else {
+            (membership, folded)
+        };
         let floor = community.relays.with_urls(invite_delivery_relays(&[]));
         floor.register_auth_keys(vec![primary.clone()]);
         let intake = stage("scanning for direct invites", 90, async {
             Ok(intake_direct_invite_keys(&[&community.relays, &floor], &primary, &membership, &folded).await)
         })
         .await?;
+        let intake =
+            stage("reading channel key deliveries", 90, async { Ok(intake_access_keys(&community.relays, &primary, &intake.community, &folded).await) }).await?;
         let client = community.runtime.client_for(intake.community, primary);
         let id = row.concord_channel_id.as_deref().context("no channel")?;
         let channel = match client.channel(id) {
@@ -133,7 +164,12 @@ async fn main() -> anyhow::Result<()> {
     let minutes: u64 = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(10);
     let db = bridge::db::connect(&std::env::var("DATABASE_URL")?, 2)?;
     let sql = format!("SELECT {BRIDGE_COLUMNS} FROM bridges WHERE status IN ('pending_confirm', 'active')");
-    let rows: Vec<BridgeRow> = db.get().await?.query(&sql, &[]).await?.iter().map(BridgeRow::from_row).collect();
+    let mut rows: Vec<BridgeRow> = db.get().await?.query(&sql, &[]).await?.iter().map(BridgeRow::from_row).collect();
+    // PROBE_LIMIT=n tries only n bridges: enough to time the stages without
+    // rehearsing a whole boot.
+    if let Some(n) = std::env::var("PROBE_LIMIT").ok().and_then(|n| n.parse().ok()) {
+        rows.truncate(n);
+    }
     let probe = Arc::new(Probe {
         seal_key: std::env::var("PORTAL_SEAL_KEY")?,
         bootstrap: Hub::new(Keys::generate()),
@@ -161,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                     if n % 100 == 0 {
                         eprintln!("PROBE {n}/{total} tried, {} live, {}s, {}", probe.live.lock().unwrap().len(), began.elapsed().as_secs(), process_line());
+                        eprintln!("PROBE stages: {}", timings_line());
                     }
                 }
             })
@@ -169,6 +206,7 @@ async fn main() -> anyhow::Result<()> {
     futures_util::future::join_all(workers).await;
     let live = probe.live.lock().unwrap().len();
     eprintln!("PROBE boot: {live}/{total} live in {}s, {}", began.elapsed().as_secs(), process_line());
+    eprintln!("PROBE stages: {}", timings_line());
     for (why, n) in probe.failures.lock().unwrap().iter() {
         eprintln!("PROBE failed x{n}: {why}");
     }
