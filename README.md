@@ -56,8 +56,8 @@ out pauses it; a ban without one, or a dissolution, doesn't yet); Discord-side c
 registered as slash commands. The owner of an imported community gets its
 staff write key by signing a Grant to themselves in the browser, since on Roles
 v2 nobody else may sign one naming them; CORD-04 §3 assumes an owner already
-holds the key, so the `control_wrap` that Grant carries is read by Armada but
-not yet blessed by the spec.
+holds the key, so the `control_wrap` that Grant carries is adopted by Armada and
+Vector alike but not yet blessed by the spec.
 
 ## Layout
 
