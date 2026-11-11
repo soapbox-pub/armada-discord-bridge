@@ -39,8 +39,17 @@ fn relays_line(manager: &BridgeManager) -> String {
         .iter()
         .map(|(url, (sockets, s))| {
             format!(
-                "{url} sockets={sockets} reqs={} refused={} closed={} auth_rejected={} connects={} connect_failures={}",
-                s.reqs, s.refused, s.closed, s.auth_rejected, s.connects, s.connect_failures
+                "{url} sockets={sockets} reqs={} refused={} closed={} auth_rejected={} connects={} connect_failures={} answered={} avg_answer_ms={} unanswered={} never_sent={}",
+                s.reqs,
+                s.refused,
+                s.closed,
+                s.auth_rejected,
+                s.connects,
+                s.connect_failures,
+                s.answered,
+                s.answer_ms.checked_div(s.answered).unwrap_or(0),
+                s.unanswered,
+                s.never_sent
             )
         })
         .collect();

@@ -139,7 +139,21 @@ impl Probe {
 fn relays_line(hub: &Hub) -> String {
     hub.stats()
         .iter()
-        .map(|(url, s)| format!("{url} up={} reqs={} refused={} closed={} auth_rejected={} connect_failures={}", s.connected, s.reqs, s.refused, s.closed, s.auth_rejected, s.connect_failures))
+        .map(|(url, s)| {
+            format!(
+                "{url} up={} reqs={} refused={} closed={} auth_rejected={} connect_failures={} answered={} avg_answer_ms={} unanswered={} never_sent={}",
+                s.connected,
+                s.reqs,
+                s.refused,
+                s.closed,
+                s.auth_rejected,
+                s.connect_failures,
+                s.answered,
+                s.answer_ms.checked_div(s.answered).unwrap_or(0),
+                s.unanswered,
+                s.never_sent
+            )
+        })
         .collect::<Vec<_>>()
         .join("; ")
 }

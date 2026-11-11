@@ -164,6 +164,8 @@ impl Bin {
 
 struct PendingQuery {
     filters: Vec<Filter>,
+    /// When it was asked for, to time the relay's answer.
+    created: Instant,
     tx: mpsc::UnboundedSender<QueryMsg>,
     /// On the wire, rather than waiting for a slot under [`MAX_REQS`].
     sent: bool,
@@ -732,6 +734,7 @@ impl RelayTask {
                     id.clone(),
                     PendingQuery {
                         filters,
+                        created: Instant::now(),
                         tx,
                         sent: false,
                         sent_epoch: 0,
@@ -742,8 +745,19 @@ impl RelayTask {
                 self.send_query(&id);
             }
             Cmd::CancelQuery { id } => {
-                if self.queries.remove(&id).is_some_and(|q| q.sent) {
-                    self.push(ClientMessage::close(id));
+                // Still pending when the caller gave up: unanswered, or never
+                // sent at all for want of a REQ slot under MAX_REQS.
+                if let Some(q) = self.queries.remove(&id) {
+                    let sent = q.sent;
+                    self.shared.stat(&self.url, |s| if sent { s.unanswered += 1 } else { s.never_sent += 1 });
+                    // Given up on early, it says nothing about the relay: a
+                    // settled query ends as soon as the others answered.
+                    if sent && q.created.elapsed() >= crate::STRIKE_AFTER {
+                        self.shared.strike(&self.url);
+                    }
+                    if sent {
+                        self.push(ClientMessage::close(id));
+                    }
                 }
             }
             Cmd::Publish { event, tx } => {
@@ -855,6 +869,12 @@ impl RelayTask {
                 }
             }
         } else if let Some(q) = self.queries.remove(id) {
+            let took = q.created.elapsed().as_millis() as u64;
+            self.shared.stat(&self.url, |s| {
+                s.answered += 1;
+                s.answer_ms += took;
+            });
+            self.shared.answered(&self.url);
             let _ = q.tx.send(QueryMsg::Eose);
             self.push(ClientMessage::close(id.clone()));
         }

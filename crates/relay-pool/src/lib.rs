@@ -82,6 +82,14 @@ pub struct RelayStats {
     pub auth_rejected: u64,
     /// REQs open on the connection now, standing and one-shot.
     pub reqs: usize,
+    /// One-shot queries answered (EOSE), and the time they took in total,
+    /// from asked to answered, queueing for a REQ slot included.
+    pub answered: u64,
+    pub answer_ms: u64,
+    /// One-shot queries the caller gave up on before an answer: sent and
+    /// unanswered, or never sent for want of a REQ slot.
+    pub unanswered: u64,
+    pub never_sent: u64,
 }
 
 /// A pool of relay connections. Cheap to clone; all clones share the same
@@ -115,7 +123,19 @@ pub(crate) struct State {
     auth_keys: HashMap<PublicKey, AuthKey>,
     connected: BTreeSet<String>,
     stats: BTreeMap<String, RelayStats>,
+    /// Per relay: queries left unanswered since its last answer, and when the
+    /// latest was given up on. See [`Shared::unresponsive`].
+    strikes: HashMap<String, (u32, Instant)>,
 }
+
+/// A query still unanswered this long when its caller gives up is a strike
+/// against the relay. Healthy relays answer well inside it.
+pub(crate) const STRIKE_AFTER: Duration = Duration::from_secs(2);
+/// Strikes in a row after which settled queries stop waiting for a relay.
+const STRIKES_TO_DEMOTE: u32 = 3;
+/// How long a demotion lasts past the latest strike. After it the relay is
+/// waited for again, and a few more silences demote it again.
+const DEMOTION: Duration = Duration::from_secs(60);
 
 struct PoolSub {
     relays: BTreeSet<String>,
@@ -195,6 +215,31 @@ impl Shared {
         pubkeys
             .iter()
             .all(|pk| *pk == self.main_keys.public_key() || st.auth_keys.get(pk).is_some_and(|k| k.relays.contains(relay)))
+    }
+
+    /// A query sent to `relay` went unanswered past [`STRIKE_AFTER`].
+    pub(crate) fn strike(&self, relay: &str) {
+        let mut st = self.lock();
+        let entry = st.strikes.entry(relay.to_string()).or_insert((0, Instant::now()));
+        *entry = (entry.0 + 1, Instant::now());
+    }
+
+    /// `relay` answered a query: it is waited for again.
+    pub(crate) fn answered(&self, relay: &str) {
+        self.lock().strikes.remove(relay);
+    }
+
+    /// Whether settled queries should not wait for `relay`: it has left its
+    /// last few queries unanswered, the latest within [`DEMOTION`].
+    ///
+    /// A relay can take REQs and never answer them (relay.dreamith.to, under
+    /// a boot's load: 25 answered, 1618 not, 2026-11-11). Every settled query
+    /// naming it then waited out the whole grace, and a boot ran at a quarter
+    /// speed. A settled query is by definition one whose caller can do
+    /// without a late relay; the REQ still goes out, and whatever the relay
+    /// does send is still taken.
+    fn unresponsive(st: &State, relay: &str) -> bool {
+        st.strikes.get(relay).is_some_and(|(n, at)| *n >= STRIKES_TO_DEMOTE && at.elapsed() < DEMOTION)
     }
 
     pub(crate) fn stat(&self, relay: &str, f: impl FnOnce(&mut RelayStats)) {
@@ -421,47 +466,70 @@ impl Pool {
         if relays.is_empty() {
             return Vec::new();
         }
+        // Relays a settled query waits for answer on `tx`; the ones it won't
+        // wait for (see `Shared::unresponsive`) on `tx_extra`, which is read
+        // for events but never holds the query open. Unless every relay is
+        // unresponsive: then they are all waited for, as before.
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx_extra, mut rx_extra) = mpsc::unbounded_channel();
         let mut ids = Vec::with_capacity(relays.len());
+        let mut remaining = 0;
         {
             let shared = self.shared();
             let mut st = shared.lock();
+            let skipped: HashSet<&String> = match grace {
+                Some(_) => relays.iter().filter(|r| Shared::unresponsive(&st, r)).collect(),
+                None => HashSet::new(),
+            };
+            let skipped = if skipped.len() == relays.len() { HashSet::new() } else { skipped };
             for r in &relays {
                 let id = SubscriptionId::generate();
                 ids.push((r.clone(), id.clone()));
+                let waited = !skipped.contains(r);
+                remaining += usize::from(waited);
                 shared.send(
                     &mut st,
                     r,
                     Cmd::Query {
                         id,
                         filters: filters.clone(),
-                        tx: tx.clone(),
+                        tx: if waited { tx.clone() } else { tx_extra.clone() },
                     },
                 );
             }
         }
         drop(tx);
+        drop(tx_extra);
 
-        let mut remaining = relays.len();
         let mut seen = HashSet::new();
         let mut events = Vec::new();
         let mut settling = false;
+        let mut extra_open = true;
         while remaining > 0 {
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(QueryMsg::Event(event))) => {
+            let next = tokio::time::timeout_at(deadline, async {
+                tokio::select! {
+                    m = rx.recv() => (true, m),
+                    m = rx_extra.recv(), if extra_open => (false, m),
+                }
+            })
+            .await;
+            match next {
+                Ok((false, Some(QueryMsg::Event(event)))) | Ok((true, Some(QueryMsg::Event(event)))) => {
                     if seen.insert(event.id) {
                         events.push(*event);
                     }
                 }
-                Ok(Some(QueryMsg::Eose)) => {
+                Ok((false, None)) => extra_open = false,
+                Ok((false, Some(_))) => {}
+                Ok((true, Some(QueryMsg::Eose))) => {
                     remaining -= 1;
                     if let Some(grace) = grace.filter(|_| !settling) {
                         settling = true;
                         deadline = deadline.min(Instant::now() + grace);
                     }
                 }
-                Ok(Some(QueryMsg::Done)) => remaining -= 1,
-                Ok(None) | Err(_) => break,
+                Ok((true, Some(QueryMsg::Done))) => remaining -= 1,
+                Ok((true, None)) | Err(_) => break,
             }
         }
 

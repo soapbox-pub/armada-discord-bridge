@@ -694,3 +694,33 @@ async fn queries_past_the_cap_wait_their_turn() {
     let results = futures_util::future::join_all(queries).await;
     assert!(results.iter().all(|r| r.len() == 1));
 }
+
+/// A relay that takes REQs and never answers them (relay.dreamith.to under
+/// load, 2026-11-11) costs settled queries the whole grace a few times, then
+/// is no longer waited for; what the healthy relay holds still comes back.
+#[tokio::test]
+async fn settled_queries_stop_waiting_for_a_relay_that_never_answers() {
+    let good = MockRelay::start(false).await;
+    good.store(note(&Keys::generate(), 1, "here", 1_700_000_000));
+    let mute = MockRelay::start(false).await;
+    mute.answer_after(Duration::from_secs(60));
+    let (pool, _rx) = Pool::new(Keys::generate());
+    let relays = [good.url.clone(), mute.url.clone()];
+    let grace = Duration::from_millis(2500);
+    for i in 0..3 {
+        let start = Instant::now();
+        let events = pool.query_settled(&relays, vec![Filter::new()], Duration::from_secs(10), grace).await;
+        assert_eq!(events.len(), 1);
+        assert!(start.elapsed() >= Duration::from_secs(2), "query {i} waited out the grace ({:?})", start.elapsed());
+    }
+    // The give-ups reach the relay's task asynchronously.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let start = Instant::now();
+    let events = pool.query_settled(&relays, vec![Filter::new()], Duration::from_secs(10), grace).await;
+    assert_eq!(events.len(), 1);
+    assert!(start.elapsed() < Duration::from_secs(1), "the silent relay no longer holds a settled query ({:?})", start.elapsed());
+    // A plain query still waits for every relay: its caller asked for all of them.
+    let start = Instant::now();
+    pool.query(&relays, vec![Filter::new()], Duration::from_millis(1500)).await;
+    assert!(start.elapsed() >= Duration::from_millis(1400));
+}
