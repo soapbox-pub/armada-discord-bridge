@@ -85,6 +85,8 @@ export interface ImportStatus {
   plan: ImportPlanView;
   communityId?: string | null;
   inviteUrl?: string;
+  /** The owner still needs to sign themselves the staff write key (lib/staffKey.ts). */
+  staffKeyOwed?: boolean;
 }
 
 export type BridgeStatus = "draft" | "pending_confirm" | "active" | "paused" | "severed" | (string & {});

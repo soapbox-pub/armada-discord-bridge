@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import * as nip19 from "nostr-tools/nip19";
+import * as nip44 from "nostr-tools/nip44";
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 import type { EventTemplate, NostrEvent } from "nostr-tools/pure";
 
@@ -10,6 +11,10 @@ import type { NostrProfile } from "./nostrProfile";
 interface Nip07 {
   getPublicKey(): Promise<string>;
   signEvent(template: EventTemplate): Promise<NostrEvent>;
+  nip44?: {
+    encrypt(pubkey: string, plaintext: string): Promise<string>;
+    decrypt(pubkey: string, ciphertext: string): Promise<string>;
+  };
 }
 declare global {
   interface Window { nostr?: Nip07 }
@@ -134,6 +139,25 @@ export function useNostrLogin(defaultRelays: string[]) {
     return finalizeEvent(template, sk);
   }
 
+  /**
+   * NIP-44 with the owner's key, for re-wrapping the staff write key to
+   * themselves (lib/staffKey.ts). Only the signer can: the owner↔owner
+   * conversation key needs the owner's secret.
+   */
+  function nip44Signer() {
+    if (method === "extension") {
+      const ext = window.nostr?.nip44;
+      if (!ext) throw new Error("your Nostr extension can't encrypt (NIP-44); log in with a signer that can");
+      return ext;
+    }
+    const sk = nsecKey();
+    if (!sk) throw new Error("your key is no longer available; unlock again");
+    return {
+      encrypt: async (pubkey: string, text: string) => nip44.encrypt(text, nip44.getConversationKey(sk, pubkey)),
+      decrypt: async (pubkey: string, text: string) => nip44.decrypt(text, nip44.getConversationKey(sk, pubkey)),
+    };
+  }
+
   return {
     pk,
     npub: pk ? nip19.npubEncode(pk) : "",
@@ -148,5 +172,6 @@ export function useNostrLogin(defaultRelays: string[]) {
     unlockNsec,
     disconnect,
     signTemplate,
+    nip44Signer,
   };
 }

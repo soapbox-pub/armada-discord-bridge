@@ -12,6 +12,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { deliverStaffKey } from "@/lib/staffKey";
 import { cn, errText, plural } from "@/lib/utils";
 import { NostrLogin } from "@/NostrLogin";
 import { useMe } from "@/session";
@@ -271,6 +272,11 @@ function ReviewStep() {
       setSigningStep("Starting the import…");
       await api(`/api/imports/${draft.importId}/confirm`, { method: "POST", body: JSON.stringify({ signedEvents: signed }) });
       const id = draft.importId!;
+      // While the owner is still here with their key: without it, Armada lets
+      // them change nothing. A failure (an extension without NIP-44, say)
+      // doesn't hold up the import; the progress page offers it again.
+      setSigningStep("Handing you the community's staff key…");
+      await deliverStaffKey(id, login).catch(() => undefined);
       sessionStorage.removeItem(DRAFT_KEY);
       navigate(`/imports/${id}`, { replace: true, state: { fresh: true } });
     } catch (e) {

@@ -1,4 +1,5 @@
-import { ArrowLeftRight, ChevronRight, History, MoreHorizontal, Plus, Settings2 } from "lucide-react";
+import { ArrowLeftRight, ChevronRight, History, KeyRound, MoreHorizontal, Plus, Settings2 } from "lucide-react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
 import { api, type BridgeSummary } from "@/api";
@@ -78,12 +79,45 @@ export function Dashboard() {
         </Alert>
       )}
 
+      <StaffKeysOwed />
+
       {communities === null && !error && <DashboardSkeleton />}
 
       {communities !== null && total === 0 && <EmptyState />}
 
       {communities?.map((c) => <CommunityCard key={c.key} community={c} />)}
     </div>
+  );
+}
+
+/**
+ * Imported communities whose owner never signed for the staff key, each
+ * linking to the page that asks for it. Armada can't tell them why it won't
+ * let them change a setting: only the portal ever held the key.
+ */
+function StaffKeysOwed() {
+  const [owed, setOwed] = useState<Array<{ importId: string; communityName: string }>>([]);
+  useEffect(() => {
+    api<{ imports: Array<{ importId: string; communityName: string }> }>("/api/imports/staff-keys-owed")
+      .then((r) => setOwed(r.imports))
+      .catch(() => undefined);
+  }, []);
+  return (
+    <>
+      {owed.map((o) => (
+        <Alert key={o.importId}>
+          <KeyRound />
+          <AlertDescription className="flex flex-wrap items-center gap-x-3 gap-y-2">
+            <span className="flex-1">
+              To change <span className="font-medium text-foreground">{o.communityName}</span>'s settings in Armada, sign for its staff key.
+            </span>
+            <Button asChild size="sm" className="clip-corner">
+              <Link to={`/imports/${o.importId}`}>Sign for it</Link>
+            </Button>
+          </AlertDescription>
+        </Alert>
+      ))}
+    </>
   );
 }
 

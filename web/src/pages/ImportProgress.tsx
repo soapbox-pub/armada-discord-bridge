@@ -1,4 +1,4 @@
-import { AlertTriangle, ArrowRight, Check, ExternalLink, History, Loader2, RotateCw } from "lucide-react";
+import { AlertTriangle, ArrowRight, Check, ExternalLink, History, KeyRound, Loader2, RotateCw } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 
@@ -9,7 +9,10 @@ import { WizardShell, WizardStepBody } from "@/components/WizardShell";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { toast } from "@/components/ui/toaster";
+import { deliverStaffKey } from "@/lib/staffKey";
 import { cn, errText, plural } from "@/lib/utils";
+import { NostrLogin } from "@/NostrLogin";
+import { useNostrLogin } from "@/useNostrLogin";
 
 const RUNNING: ImportStatus["status"][] = ["minting", "publishing", "wiring", "history"];
 
@@ -151,6 +154,7 @@ export function ImportProgress() {
           description={`${bits.join(", ")}, owned by your key.`}
         >
           <div className="space-y-4 text-left">
+            {status.staffKeyOwed && <StaffKeyCard importId={status.importId} onDone={() => setPoll((n) => n + 1)} />}
             {actionError && (
               <Alert variant="destructive">
                 <AlertDescription>{actionError}</AlertDescription>
@@ -251,6 +255,7 @@ export function ImportProgress() {
             ))}
           </ol>
           <p className="text-center font-mono text-xs text-muted-foreground">status: {status.status}</p>
+          {status.staffKeyOwed && <StaffKeyCard importId={status.importId} onDone={() => setPoll((n) => n + 1)} />}
           {failed && (
             <>
               {(status.statusDetail || actionError) && (
@@ -304,6 +309,55 @@ function Box({ title, children }: { title: string; children: ReactNode }) {
     <div className="space-y-1 rounded-lg bg-secondary/40 p-3">
       <SectionLabel>{title}</SectionLabel>
       {children}
+    </div>
+  );
+}
+
+/**
+ * The one signature an imported community's owner still owes: the Grant that
+ * hands them its staff write key, without which Armada lets them change no
+ * setting. Imports from before the wizard asked for it all owe it.
+ */
+function StaffKeyCard({ importId, onDone }: { importId: string; onDone: () => void }) {
+  const login = useNostrLogin([]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function deliver() {
+    setBusy(true);
+    setError("");
+    try {
+      await deliverStaffKey(importId, login);
+      toast({ title: "Staff key delivered", description: "Reopen the community in Armada to change its settings." });
+      onDone();
+    } catch (e) {
+      setError(errText(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-3 rounded-lg border border-primary/40 bg-primary/5 p-4">
+      <div className="flex items-start gap-3">
+        <KeyRound className="mt-0.5 size-4 shrink-0 text-primary" />
+        <div className="space-y-1">
+          <p className="text-sm font-medium">One more signature</p>
+          <p className="text-xs text-muted-foreground">
+            Until you sign for the community's staff key, Armada won't let you change its settings. Log in with the key that owns
+            it; it signs here in your browser and never reaches the portal.
+          </p>
+        </div>
+      </div>
+      <NostrLogin login={login} />
+      {error && (
+        <Alert variant="destructive">
+          <AlertDescription className="text-xs">{error}</AlertDescription>
+        </Alert>
+      )}
+      <Button className="w-full clip-corner-lg" disabled={!login.pk || busy} onClick={() => void deliver()}>
+        {busy ? <Loader2 className="animate-spin" /> : <KeyRound />} Sign for the staff key
+      </Button>
     </div>
   );
 }
