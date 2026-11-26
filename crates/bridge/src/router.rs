@@ -615,6 +615,10 @@ impl BridgeRouter {
         // it would make Discord the way around the community's moderation.
         // A reaction or deletion answers to the ledger alone, and only in a
         // Locked window (CORD-03 §1).
+        // A reaction whose author lacks Add Reactions there isn't counted (CORD-04 §8).
+        if chat.kind() == kinds::REACTION && self.client.folded().is_some_and(|f| concord::judge::reaction_ignored(&f, &chat.channel_id_hex, chat.author())) {
+            return Ok(vec![]);
+        }
         let judged = match chat.kind() {
             kinds::MESSAGE | kinds::COMMENT | kinds::EDIT | kinds::TYPING => Some(self.client.judge(chat)).filter(|v| *v != Verdict::Stands),
             kinds::REACTION | kinds::DELETE => Some(self.client.judge(chat)).filter(|v| *v == Verdict::Held),

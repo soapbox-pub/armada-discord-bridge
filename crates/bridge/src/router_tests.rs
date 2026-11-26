@@ -310,7 +310,7 @@ async fn publishes_one_guestbook_join_per_puppet() {
 async fn refuses_to_publish_for_a_banned_puppet() {
     let h = harness();
     h.ban(&h.puppets.get(USER).unwrap().pk);
-    assert!(h.router.on_discord_message(discord_msg(), &h.link).await.is_err());
+    assert_eq!(h.router.on_discord_message(discord_msg(), &h.link).await.unwrap(), None, "refused before anything is sent");
     assert!(h.chats().is_empty());
 }
 
@@ -461,7 +461,8 @@ async fn a_private_armada_channel_on_ranked_roles_takes_nothing_from_puppets() {
     let puppet = h.puppets.get(USER).unwrap();
     let refused = h.client.post_refusal(&h.channel, &puppet.keys, kinds::MESSAGE).expect("refused");
     assert!(refused.to_string().contains("private"), "{refused}");
-    assert!(h.client.post_refusal(&h.channel, &puppet.keys, kinds::REACTION).is_none(), "reactions stay at the read address");
+    // Nor its reactions: one by a member without Add Reactions there isn't counted (CORD-04 §8).
+    assert!(h.client.post_refusal(&h.channel, &puppet.keys, kinds::REACTION).is_some());
 }
 
 #[tokio::test]
@@ -636,6 +637,7 @@ async fn a_locked_channel_mirrors_only_the_reactions_its_ledger_stands_behind() 
 
     // An approved member's, at the writer address with their certificate, stands.
     let alice = Keys::generate();
+    h.approve(&gate, &alice);
     let cert = concord::writers::sign_writer_cert(
         gate.certifier.secret_key(),
         &concord::writers::cert_digest(&h.client.community().id(), &concord::hex32(&h.channel.id_hex).unwrap(), 1, &alice.public_key().to_bytes()),

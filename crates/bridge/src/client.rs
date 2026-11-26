@@ -16,8 +16,8 @@ use concord::community::{ChannelView, Membership};
 use concord::control::{FoldedControl, fold_control, seal_edition};
 use concord::grant::GrantBlocked;
 use concord::edition::{Edition, parse_edition};
-use concord::guestbook::{FoldedTimeout, fold_timeouts};
-use concord::invite::{InviteBundle, parse_bundle_event, parse_invite_link};
+use concord::guestbook::{FoldedTimeout, TimeoutBook, fold_timeouts};
+use concord::invite::{InviteBundle, parse_invite_link, resolve_bundle};
 use concord::judge::{Post, Verdict, judge_post};
 use concord::kinds::{self, Plane};
 use concord::roles::{Role, perm};
@@ -198,8 +198,8 @@ pub async fn resolve_invite(invite_url: &str, relays: &dyn RelayLike) -> anyhow:
     let signer = PublicKey::from_hex(&link.link_signer)?;
     let filter = Filter::new().kind(Kind::Custom(kinds::INVITE_BUNDLE)).author(signer).limit(8);
     let events = relays.query_race(vec![filter]).await;
-    let newest = events.iter().max_by_key(|e| e.created_at).context("invite bundle not found on bootstrap relays")?;
-    let bundle = parse_bundle_event(newest, &link, now_ms())?;
+    // A revocation tombstone among what the relay returned revokes the link (CORD-05 §2).
+    let bundle = resolve_bundle(&events, &link, now_ms())?;
     let membership = Membership::from_bundle(&bundle, now_ms());
     Ok(JoinResult { membership, bundle })
 }
@@ -228,7 +228,7 @@ type FoldCell = Arc<RwLock<Option<Arc<FoldedControl>>>>;
 
 /// The Guestbook's Timeout rumors seen so far, shared like the fold. Kept raw:
 /// whether one counts is judged against the Roster as it stands (CORD-04 §8).
-type TimeoutCell = Arc<RwLock<HashMap<String, Opened>>>;
+type TimeoutCell = Arc<RwLock<TimeoutBook>>;
 
 /// How long a key watcher lets a rotation's chunks land before reading it.
 const KEY_SETTLE: Duration = Duration::from_millis(750);
@@ -238,8 +238,6 @@ type KeyedCache = std::sync::Mutex<Option<(Arc<FoldedControl>, Arc<FoldedControl
 
 /// Timeouts run at most 28 days, so older Guestbook entries can't hold one.
 const TIMEOUT_LOOKBACK_SECS: u64 = 28 * 24 * 60 * 60;
-/// Bound on Timeout rumors held per community: a flood can't grow it without end.
-const MAX_TIMEOUTS_HELD: usize = 10_000;
 
 /// One entry of the kind-10304 command manifest (Armada's draft bot NIP).
 pub struct BotCommand {
@@ -510,6 +508,15 @@ impl ConcordClient {
         Ok(folded)
     }
 
+    /// Whether the root this client reads from is the Community's own, by
+    /// what the last whole read found (CORD-05 §1): see
+    /// [`concord::community::authenticate_root`].
+    pub fn root_verdict(&self) -> concord::community::RootVerdict {
+        let synced = self.synced.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let editions: Vec<Edition> = synced.values().cloned().collect();
+        concord::community::authenticate_root(&self.community(), &editions)
+    }
+
     /// Channels readable with held keys, per the current fold.
     pub fn channels(&self) -> Vec<ChannelView> {
         let channels = self.community().channels(self.folded().as_deref());
@@ -549,7 +556,11 @@ impl ConcordClient {
     /// The Timeouts running now, judged against the current Roster.
     pub fn timeouts(&self) -> HashMap<String, FoldedTimeout> {
         let Some(f) = self.folded() else { return HashMap::new() };
-        let opened: Vec<Opened> = self.timeouts.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+        let opened: Vec<Opened> = {
+            let mut book = self.timeouts.write().unwrap_or_else(|e| e.into_inner());
+            book.prune(|a| f.moderates_members(a));
+            book.rumors()
+        };
         let cid = self.community().id();
         fold_timeouts(&opened, now_ms(), &f.owner, &f.banned, |actor, target, citation| {
             f.roster.can_act_on_member(actor, &f.owner, target, perm::MODERATE_MEMBERS) && f.citation_satisfied(&cid, actor, citation)
@@ -574,18 +585,26 @@ impl ConcordClient {
     pub fn post_refusal(&self, channel: &ChannelView, author: &Keys, kind: u16) -> Option<PostRefused> {
         let f = self.folded()?;
         let pk = author.public_key().to_hex();
-        let ledger = f.restricting_ledger(&channel.id_hex);
-        if !rides_writer_address(kind, ledger.is_some_and(ledger_locked)) {
-            return None;
+        if f.banned.contains(&pk) {
+            return Some(PostRefused { reason: "this member is banned from the Armada community", channel_wide: false, awaiting: false });
         }
+        let ledger = f.restricting_ledger(&channel.id_hex);
         // A writer posts at the writer address; the owner and a manager's posts
-        // stand at the read address too (CORD-03 §1).
-        if ledger.is_some() && !f.manages_channels(&pk) && self.writer_for(&channel.id_hex, author, kind).is_none() {
+        // stand at the read address too (CORD-03 §1). Reactions and deletions
+        // ride it only in a Locked Channel.
+        if rides_writer_address(kind, ledger.is_some_and(ledger_locked))
+            && ledger.is_some()
+            && !f.manages_channels(&pk)
+            && self.writer_for(&channel.id_hex, author, kind).is_none()
+        {
             return Some(self.unwritable(&f, &channel.id_hex, &pk, kind, true, "the Armada channel is read-only: only its writers can post there"));
         }
-        // A Timeout is a moderator's word on Armada: posts inside it collapse
-        // there (CORD-04 §8), so a timed-out puppet isn't posted for.
-        if self.timeouts().get(&pk).is_some_and(|t| t.running(now_ms())) {
+        // A Timeout is a moderator's word on Armada: posts, edits and reactions
+        // inside it collapse there (CORD-04 §8), so a timed-out puppet's aren't
+        // sent. Deleting their own messages is still theirs to do. This and the
+        // checks below ran only for kinds riding the writer address, so outside
+        // a Locked Channel every reaction skipped them.
+        if kind != kinds::DELETE && self.timeouts().get(&pk).is_some_and(|t| t.running(now_ms())) {
             return Some(PostRefused { reason: "this member is timed out in the Armada community", channel_wide: false, awaiting: false });
         }
         if f.ranked {
@@ -838,10 +857,10 @@ impl ConcordClient {
         if opened.rumor.kind != kinds::TIMEOUT {
             return;
         }
-        let mut held = self.timeouts.write().unwrap_or_else(|e| e.into_inner());
-        if held.len() < MAX_TIMEOUTS_HELD || held.contains_key(&opened.rumor.id) {
-            held.insert(opened.rumor.id.clone(), opened);
-        }
+        // Any member can publish Timeouts: only a moderator's are kept once
+        // there is a fold to say who that is; `timeouts` prunes the rest.
+        let f = self.folded();
+        self.timeouts.write().unwrap_or_else(|e| e.into_inner()).hold(opened, |a| f.as_ref().is_none_or(|f| f.moderates_members(a)));
     }
 
     /// Live-fold the Control Plane, so bans and channel changes apply to (nearly)
@@ -912,7 +931,7 @@ impl ConcordClient {
             'resubscribe: loop {
                 let Some(client) = me.upgrade() else { return };
                 let Some(id) = concord::hex32(&channel) else { return };
-                let streams = key_watch_streams(&client.community(), &channel, &id);
+                let streams = key_watch_streams(&client.community(), client.folded().as_deref(), &client.primary_pk(), &channel, &id);
                 client.relays.register_auth_keys(crate::key_intake::auth_keys(&streams));
                 let since = Timestamp::from_secs((now_ms() / 1000).saturating_sub(60));
                 let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).authors(streams.iter().map(|s| s.pk).collect::<Vec<_>>()).since(since);
@@ -941,7 +960,7 @@ impl ConcordClient {
                         }
                     }
                     // A new epoch moves the next rotation's address.
-                    if key_watch_streams(&client.community(), &channel, &id).iter().map(|s| s.pk).ne(addresses.iter().copied()) {
+                    if key_watch_streams(&client.community(), client.folded().as_deref(), &client.primary_pk(), &channel, &id).iter().map(|s| s.pk).ne(addresses.iter().copied()) {
                         continue 'resubscribe;
                     }
                 }
@@ -1036,9 +1055,12 @@ impl<'a> SendChat<'a> {
 
 /// Where a held private channel's next keys arrive: its upcoming rotations
 /// and its access plane.
-fn key_watch_streams(community: &Membership, channel_id_hex: &str, id: &concord::Bytes32) -> Vec<StreamKey> {
-    let mut streams: Vec<StreamKey> =
-        community.channel_rekey_addresses().into_iter().filter(|(_, c, _)| c == channel_id_hex).map(|(g, _, _)| (&g).into()).collect();
+fn key_watch_streams(community: &Membership, folded: Option<&FoldedControl>, me: &str, channel_id_hex: &str, id: &concord::Bytes32) -> Vec<StreamKey> {
+    let addresses = match folded {
+        Some(f) => community.channel_rekey_addresses_with(f, me),
+        None => community.channel_rekey_addresses(),
+    };
+    let mut streams: Vec<StreamKey> = addresses.into_iter().filter(|(_, c, _)| c == channel_id_hex).map(|(g, _, _)| (&g).into()).collect();
     streams.push((&community.access_plane(id)).into());
     streams
 }

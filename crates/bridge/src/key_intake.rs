@@ -179,7 +179,9 @@ pub async fn intake_access_keys(relays: &dyn RelayLike, identity: &Keys, communi
     // Rotations carry every held key forward: a birth at epoch 1, or the
     // re-key a ban or revoke triggers, which would otherwise leave the bridge
     // on a superseded key, silent.
-    let addresses = next.channel_rekey_addresses();
+    // Channels made private before a key reached us are walked from their
+    // sealed head (CORD-03 §2), or a converted Channel is lost to the bridge.
+    let addresses = next.channel_rekey_addresses_with(folded, &me);
     if !addresses.is_empty() {
         let streams: Vec<StreamKey> = addresses.iter().map(|(g, _, _)| g.into()).collect();
         relays.register_auth_keys(auth_keys(&streams));

@@ -8,7 +8,7 @@ use bridge::client::{OpenedChat, SendChat};
 use bridge::community::{CommunityRuntime, RESUBSCRIBE_SETTLE};
 use bridge::relays::MemoryRelay;
 use concord::community::{Membership, PrivateChannelKey};
-use concord::control::{build_channel_edition, seal_edition};
+use concord::control::{build_channel_edition, build_metadata_edition, seal_edition};
 use concord::edition::EditionMeta;
 use concord::nostr::prelude::*;
 use serde_json::json;
@@ -26,6 +26,9 @@ fn world() -> World {
     let community = Membership::mint("Test", &owner.public_key().to_hex(), vec!["wss://relay.example".into()], 0);
     let relay = MemoryRelay::new();
     relay.cap_subscriptions(CAP);
+    // The owner's genesis metadata, which a start authenticates the root by (CORD-05 §1).
+    let genesis = build_metadata_edition(&community.id(), &json!({ "name": "Test" }), &EditionMeta::first(&owner.public_key().to_hex(), None)).unwrap();
+    relay.inject(seal_edition(&genesis, &community.control_write_stream().unwrap(), &owner).unwrap());
     World { relay, owner, community }
 }
 
@@ -342,4 +345,19 @@ async fn starts_in_one_community_share_a_fetch_of_its_refoundings_and_each_opens
     assert_eq!(is.adopted, None, "a shared fetch hands nobody a key: each opens its own blob");
     assert_eq!(w.relay.queries(), after_first, "the later starts asked the relays nothing");
     assert!(after_first > before);
+}
+
+#[tokio::test]
+async fn a_root_no_owner_anchor_opens_under_is_refused() {
+    let w = world();
+    // The same Community's identity paired with a root of someone else's, whose
+    // plane holds a metadata edition that someone signed.
+    let forger = Keys::generate();
+    let mut forged = w.community.clone();
+    forged.root = hex::encode(concord::random32());
+    forged.held_roots[0].key = forged.root.clone();
+    let meta = build_metadata_edition(&forged.id(), &json!({ "name": "Test" }), &EditionMeta::first(&forger.public_key().to_hex(), None)).unwrap();
+    w.relay.inject(seal_edition(&meta, &forged.control_write_stream().unwrap(), &forger).unwrap());
+    let err = CommunityRuntime::open(forged, Arc::new(w.relay.clone()), None).await.err().expect("refused");
+    assert!(err.to_string().contains("root"), "{err}");
 }
