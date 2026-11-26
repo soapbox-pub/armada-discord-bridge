@@ -136,6 +136,70 @@ async fn folds_a_control_plane_past_the_relays_cap() {
 }
 
 #[tokio::test]
+async fn an_approved_member_takes_its_writer_key_and_posts_where_it_stands() {
+    use bridge::writer_keys::intake_writer_keys;
+    use concord::delivery::{WriterDelivery, build_writer_deliveries};
+    use concord::derive::{channel_writer_group_key, writer_scope};
+    use concord::roles::{Overwrite, OverwriteTarget, perm};
+    use concord::writers::{Spell, cert_digest, empty_ledger, ledger_appended, sign_writer_cert};
+
+    // Approval to post: `@everyone` can't send, so the Channel is restricted
+    // and takes posts only at its live writer address; Bob was approved.
+    let w = world();
+    let chan = [7u8; 32];
+    let chan_hex = hex::encode(chan);
+    w.channel(chan, "general", false);
+    let bob = Keys::generate();
+    let me = bob.public_key().to_hex();
+    let client = w.client(bob.clone());
+    client.sync_control().await.unwrap();
+    let (secret, certifier) = ([42u8; 32], Keys::generate());
+    let address = channel_writer_group_key(&secret, &chan, 1).pubkey().to_hex();
+    let mut f = (*client.folded().unwrap()).clone();
+    f.ranked = true;
+    f.roster.everyone = Some(perm::EVERYONE_DEFAULT & !perm::SEND_MESSAGES);
+    f.roster.overwrites.push(Overwrite { scope: chan_hex.clone(), target: OverwriteTarget::Member(me.clone()), allow: perm::SEND_MESSAGES, deny: 0 });
+    let spell = Spell::Writer { epoch: 1, pk: address.clone(), root: 0, by: f.owner.clone(), certifier: Some(certifier.public_key().to_hex()) };
+    f.writers.insert(chan_hex.clone(), ledger_appended(&empty_ledger(&chan_hex), now_ms() - 60_000, spell).unwrap());
+    client.set_folded(f.clone());
+    let channel = client.channel(&chan_hex).unwrap();
+    let refused = client.send_chat(&channel, SendChat::message(&bob, "hi")).await.unwrap_err();
+    assert!(refused.to_string().contains("read-only"), "{refused}");
+
+    // The owner hands Bob the epoch's secret and his certificate on the
+    // Channel's access plane. Eve, who can reach the plane too, hands him a
+    // secret of her own and a certificate she signed: neither is taken.
+    let cid = w.community.id();
+    let scope = writer_scope(&chan);
+    let plane: StreamKey = (&w.community.access_plane(&chan)).into();
+    let deliver = |from: &Keys, key: [u8; 32], cert: String| {
+        let wd = WriterDelivery { writer: Some(address.clone()), certs: vec![(me.clone(), cert)], mint: false };
+        for rumor in build_writer_deliveries(from, &scope, 1, &key, std::slice::from_ref(&me), now_ms() / 1000, &wd).unwrap() {
+            w.relay.inject(seal_and_wrap(&rumor, Plane::Rekey, &plane, from, Default::default()).unwrap());
+        }
+    };
+    let digest = cert_digest(&cid, &chan, 1, &bob.public_key().to_bytes());
+    let eve = Keys::generate();
+    deliver(&eve, [9u8; 32], sign_writer_cert(eve.secret_key(), &digest));
+    let none = intake_writer_keys(&w.relay, &bob, &w.community, &f, &Default::default()).await;
+    assert!(none.is_empty(), "a key that doesn't derive to the address, and a cert the certifier didn't sign: {none:?}");
+    deliver(&w.owner, secret, sign_writer_cert(certifier.secret_key(), &digest));
+    let taken = intake_writer_keys(&w.relay, &bob, &w.community, &f, &Default::default()).await;
+    let held = taken.get(&format!("{chan_hex}:1")).expect("the live epoch's writer key");
+    assert_eq!(held.secret.as_deref(), Some(hex::encode(secret).as_str()));
+    assert!(held.cert.is_some());
+    client.adopt_writers(taken.clone());
+    assert!(intake_writer_keys(&w.relay, &bob, &w.community, &f, &taken).await.is_empty(), "nothing more is owed");
+
+    // Bob's post goes to the writer address, opens there, and stands.
+    let (_, wrap) = client.send_chat(&channel, SendChat::message(&bob, "hi")).await.unwrap();
+    assert_eq!(wrap.pubkey.to_hex(), address);
+    let opened = bridge::client::open_chat(&wrap, &channel).expect("opens at the writer address");
+    assert_eq!(opened.writer_epoch, Some(1));
+    assert!(matches!(client.judge(&opened), concord::judge::Verdict::Stands), "{:?}", client.judge(&opened));
+}
+
+#[tokio::test]
 async fn publishes_joins_typing_and_a_valid_manifest() {
     let w = world();
     let chan = [1u8; 32];

@@ -31,6 +31,7 @@ use tokio::task::JoinHandle;
 
 use crate::recent::RecentIds;
 use crate::relays::{RelayLike, query_all_settled};
+use crate::writer_keys::{HeldWriters, UsableWriter, usable_writer};
 
 /// NIP-48 tag stamped on every bridge-published rumor:
 /// `["proxy", <discord permalink>, "web"]`. The full URL keeps the origin
@@ -224,6 +225,8 @@ pub struct ConcordClient {
     folded: FoldCell,
     keyed: KeyedCache,
     timeouts: TimeoutCell,
+    /// The primary's writer keys for restricted Channels (CORD-03 §1).
+    writers: RwLock<HeldWriters>,
 }
 
 impl ConcordClient {
@@ -239,6 +242,7 @@ impl ConcordClient {
             folded: FoldCell::default(),
             keyed: KeyedCache::default(),
             timeouts: TimeoutCell::default(),
+            writers: RwLock::default(),
         })
     }
 
@@ -255,6 +259,7 @@ impl ConcordClient {
             folded: with.folded.clone(),
             keyed: KeyedCache::default(),
             timeouts: with.timeouts.clone(),
+            writers: RwLock::default(),
         })
     }
 
@@ -269,6 +274,39 @@ impl ConcordClient {
         *self.community.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(community);
         // The creators a keyed fold opened depend on the keys held.
         *self.keyed.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The writer keys the primary holds.
+    pub fn held_writers(&self) -> HeldWriters {
+        self.writers.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Hold these writer epochs too, replacing any held under the same id.
+    pub fn adopt_writers(&self, writers: HeldWriters) {
+        self.writers.write().unwrap_or_else(|e| e.into_inner()).extend(writers);
+    }
+
+    /// The live writer key `author_pk` may post with in this Channel. Only
+    /// the primary holds any: a puppet is never anyone's writer.
+    pub fn usable_writer(&self, channel_id_hex: &str, author_pk: &str) -> Option<UsableWriter> {
+        if author_pk != self.primary_pk() {
+            return None;
+        }
+        let f = self.folded()?;
+        usable_writer(&f, &self.community().id(), channel_id_hex, author_pk, &self.writers.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Where a write of `kind` by `author_pk` goes: the read address, or in a
+    /// restricted Channel the live writer address (signed by the writer key,
+    /// encrypted under the read key) and the tags committing its epoch and
+    /// certificate (Armada `sendTarget`).
+    fn send_target(&self, channel: &ChannelView, author_pk: &str, kind: u16) -> (StreamKey, Vec<Vec<String>>) {
+        let read: StreamKey = (&channel.current().key).into();
+        let restricted = self.folded().is_some_and(|f| f.restricting_ledger(&channel.id_hex).is_some());
+        match self.usable_writer(&channel.id_hex, author_pk) {
+            Some(w) if restricted && rides_writer_address(kind) => (w.stream(&read), w.tags()),
+            _ => (read, vec![]),
+        }
     }
 
     pub fn relays(&self) -> &Arc<dyn RelayLike> {
@@ -437,7 +475,9 @@ impl ConcordClient {
         if !rides_writer_address(kind) {
             return None;
         }
-        if f.restricting_ledger(&channel.id_hex).is_some() && !f.manages_channels(author_pk) {
+        // A writer posts at the writer address; the owner and a manager's posts
+        // stand at the read address too (CORD-03 §1).
+        if f.restricting_ledger(&channel.id_hex).is_some() && !f.manages_channels(author_pk) && self.usable_writer(&channel.id_hex, author_pk).is_none() {
             return Some(PostRefused::channel("the Armada channel is read-only: only its writers can post there"));
         }
         // A Timeout is a moderator's word on Armada: posts inside it collapse
@@ -525,8 +565,11 @@ impl ConcordClient {
             return Ok(());
         }
         let b = Binding { channel_id_hex: &channel.id_hex, epoch: channel.current().epoch };
-        let rumor = concord::chat::typing(&b, &author.public_key().to_hex(), ms);
-        let stream: StreamKey = (&channel.current().key).into();
+        let (stream, writer_tags) = self.send_target(channel, &author.public_key().to_hex(), kinds::TYPING);
+        let mut rumor = concord::chat::typing(&b, &author.public_key().to_hex(), ms);
+        if !writer_tags.is_empty() {
+            rumor = Rumor::new(rumor.kind, rumor.content, rumor.tags.into_iter().chain(writer_tags).collect(), &rumor.pubkey, Some(ms), None);
+        }
         let wrap = seal_and_wrap(&rumor, Plane::Chat, &stream, author, WrapOptions { ephemeral: true, ..Default::default() })?;
         self.relays.publish(&wrap).await
     }
@@ -542,10 +585,11 @@ impl ConcordClient {
         if let Some(refused) = self.post_refusal(channel, &pk, msg.kind) {
             return Err(refused.into());
         }
+        let (stream, writer_tags) = self.send_target(channel, &pk, msg.kind);
         let mut tags = concord::stream::channel_binding_tags(&channel.id_hex, channel.current().epoch);
         tags.extend(msg.tags);
+        tags.extend(writer_tags);
         let rumor = Rumor::new(msg.kind, msg.content, tags, &pk, Some(msg.ms.unwrap_or_else(now_ms)), None);
-        let stream: StreamKey = (&channel.current().key).into();
         // The wrap's `p` is the author's derived wrap-owner key, not a random
         // one, so the puppet (any instance of this bridge holding its key) can
         // find and delete its own wraps later (CORD-01 §Deletions).
