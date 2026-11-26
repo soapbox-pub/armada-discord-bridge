@@ -286,6 +286,40 @@ impl Relays {
     }
 }
 
+/// Every event matching `filter`, newest first, past the cap relays put on
+/// one REQ. A relay answers a bare filter with its newest few hundred and an
+/// EOSE that doesn't say it stopped short, so a read that must be whole (the
+/// Control Plane: lose its oldest editions and the Channels and Roles they
+/// define are gone) asks again below the oldest timestamp it got, until a
+/// page comes back empty. `until` is inclusive, so events sharing the
+/// boundary second come back and are deduped. A page of nothing new means one
+/// second holds more than a relay's whole page (real Control Planes put a few
+/// dozen in a second at most): REQ can't reach the rest of that second, so the
+/// read steps past it rather than stopping there.
+pub async fn query_all_settled(relays: &dyn RelayLike, filter: Filter) -> anyhow::Result<Vec<Event>> {
+    /// A backstop against a relay that ignores `until`.
+    const MAX_PAGES: usize = 200;
+    let mut seen: HashSet<EventId> = HashSet::new();
+    let mut out: Vec<Event> = Vec::new();
+    let mut until: Option<Timestamp> = None;
+    for _ in 0..MAX_PAGES {
+        let page_filter = match until {
+            Some(t) => filter.clone().until(t),
+            None => filter.clone(),
+        };
+        let page = relays.query_settled(vec![page_filter]).await?;
+        let Some(oldest) = page.iter().map(|e| e.created_at).min() else { break };
+        let before = out.len();
+        out.extend(page.into_iter().filter(|e| seen.insert(e.id)));
+        let next = if out.len() > before { oldest } else { Timestamp::from_secs(oldest.as_secs().saturating_sub(1)) };
+        if until == Some(next) || oldest.as_secs() == 0 {
+            break;
+        }
+        until = Some(next);
+    }
+    Ok(newest_first(out))
+}
+
 fn newest_first(mut events: Vec<Event>) -> Vec<Event> {
     events.sort_by_key(|e| std::cmp::Reverse(e.created_at));
     events
@@ -365,6 +399,8 @@ struct MemoryState {
     gated: bool,
     authed: std::collections::HashSet<PublicKey>,
     queries: usize,
+    /// Answer at most this many events per filter, as real relays do.
+    max_results: Option<usize>,
 }
 
 impl MemoryState {
@@ -413,6 +449,12 @@ impl MemoryRelay {
     /// connection; a refused one is closed straight away.
     pub fn cap_subscriptions(&self, max: usize) {
         self.inner.lock().unwrap().max_subs = Some(max);
+    }
+
+    /// Answer at most `max` events per filter, newest first, as real relays
+    /// cap a REQ (500 on ditto-relay and strfry's defaults).
+    pub fn cap_results(&self, max: usize) {
+        self.inner.lock().unwrap().max_results = Some(max);
     }
 
     /// Subscriptions refused for the cap so far.
@@ -464,6 +506,9 @@ impl RelayLike for MemoryRelay {
             matched.sort_by_key(|e| std::cmp::Reverse(e.created_at));
             if let Some(limit) = f.limit {
                 matched.truncate(limit);
+            }
+            if let Some(max) = st.max_results {
+                matched.truncate(max);
             }
             for e in matched {
                 if !out.iter().any(|o| o.id == e.id) {

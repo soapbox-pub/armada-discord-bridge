@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use crate::recent::RecentIds;
-use crate::relays::RelayLike;
+use crate::relays::{RelayLike, query_all_settled};
 
 /// NIP-48 tag stamped on every bridge-published rumor:
 /// `["proxy", <discord permalink>, "web"]`. The full URL keeps the origin
@@ -357,7 +357,14 @@ impl ConcordClient {
     /// bridge was down were mirrored.
     pub async fn sync_control(&self) -> anyhow::Result<Arc<FoldedControl>> {
         let (guestbook, guestbook_filter) = self.guestbook_filter();
-        let wraps = self.relays.query_settled(vec![self.control_filter(), guestbook_filter]).await?;
+        // Paged, and each filter on its own: a Community past a relay's REQ
+        // cap (a few hundred approval Grants will do it) otherwise folds from
+        // its newest editions alone, and every Channel and Role defined
+        // before them vanishes.
+        let relays = &*self.relays;
+        let (control, guestbook_wraps) = tokio::try_join!(query_all_settled(relays, self.control_filter()), query_all_settled(relays, guestbook_filter))?;
+        let mut seen = std::collections::HashSet::new();
+        let wraps: Vec<Event> = control.into_iter().chain(guestbook_wraps).filter(|e| seen.insert(e.id)).collect();
         let (timeouts, control): (Vec<Event>, Vec<Event>) = wraps.into_iter().partition(|w| guestbook.iter().any(|s| s.pk == w.pubkey));
         for wrap in &timeouts {
             self.take_timeout(wrap, &guestbook);

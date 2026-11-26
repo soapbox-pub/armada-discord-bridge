@@ -45,10 +45,27 @@ impl World {
 
     /// The owner publishes a channel edition.
     fn channel(&self, id: [u8; 32], name: &str, private: bool) {
+        self.channel_at(id, name, private, None);
+    }
+
+    /// The owner publishes a channel edition dated `created_at` (seconds).
+    fn channel_at(&self, id: [u8; 32], name: &str, private: bool, created_at: Option<u64>) {
         let owner = self.owner.public_key().to_hex();
-        let rumor = build_channel_edition(&id, &json!({ "name": name, "private": private }), &EditionMeta::first(&owner, None)).unwrap();
+        let meta = EditionMeta { created_at, ..EditionMeta::first(&owner, None) };
+        let rumor = build_channel_edition(&id, &json!({ "name": name, "private": private }), &meta).unwrap();
         let control = self.community.control_write_stream().unwrap();
-        self.relay.inject(seal_edition(&rumor, &control, &self.owner).unwrap());
+        let wrap = seal_edition(&rumor, &control, &self.owner).unwrap();
+        // A wrap is stamped when it's sealed; re-sign it at the edition's time,
+        // as one published then would have been.
+        let wrap = match created_at {
+            None => wrap,
+            Some(t) => EventBuilder::new(wrap.kind, wrap.content.clone())
+                .tags(wrap.tags.clone())
+                .custom_created_at(Timestamp::from_secs(t))
+                .finalize(&Keys::new(control.sk.clone().unwrap()))
+                .unwrap(),
+        };
+        self.relay.inject(wrap);
     }
 
     /// The owner vends a private channel key to `to` as a Direct Invite.
@@ -93,6 +110,29 @@ async fn sends_chat_that_opens_with_binding_tags_and_refuses_banned_authors() {
     folded.banned.insert(alice.public_key().to_hex());
     client.set_folded(folded);
     assert!(client.send_chat(&channel, SendChat::message(&alice, "again")).await.is_err());
+}
+
+#[tokio::test]
+async fn folds_a_control_plane_past_the_relays_cap() {
+    // Relays answer a REQ with their newest few hundred events and no word
+    // that they stopped short. A Community whose Control Plane outgrew that
+    // (Soapbox's, after a day of approval Grants) folded from its newest
+    // editions alone: no Channels, no Roles, read-only everywhere.
+    let w = world();
+    w.relay.cap_results(10);
+    let ids: Vec<[u8; 32]> = (1..=25u8).map(|i| [i; 32]).collect();
+    // A few to a second, as real editions land; the boundary second of each
+    // page comes back on the next and must not be taken for the end.
+    let start = now_ms() / 1000 - 600;
+    for (i, id) in ids.iter().enumerate() {
+        w.channel_at(*id, &format!("c{i}"), false, Some(start + i as u64 / 3));
+    }
+    let client = w.client(Keys::generate());
+    client.sync_control().await.unwrap();
+    let folded: Vec<String> = client.channels().iter().map(|c| c.id_hex.clone()).collect();
+    for id in &ids {
+        assert!(folded.contains(&hex::encode(id)), "channel {} folded", hex::encode(id));
+    }
 }
 
 #[tokio::test]
