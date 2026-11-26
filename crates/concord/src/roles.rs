@@ -391,6 +391,17 @@ impl Roster {
             return u64::MAX;
         }
         let held: Vec<&Role> = self.roles_of(member).collect();
+        self.resolve_in_channel(member, &held, channel_id_hex, is_private)
+    }
+
+    /// What a member holding `role` alone would have in one Channel: what
+    /// being granted it would let someone with no Role do there. No member's
+    /// own overwrite applies, and no sealed creator is let in.
+    pub fn role_channel_permissions(&self, role: &Role, channel_id_hex: &str, is_private: bool) -> u64 {
+        self.resolve_in_channel("", &[role], channel_id_hex, is_private)
+    }
+
+    fn resolve_in_channel(&self, member: &str, held: &[&Role], channel_id_hex: &str, is_private: bool) -> u64 {
         let mut p = held.iter().fold(self.everyone.unwrap_or(0), |acc, r| acc | r.permissions);
         let channel = channel_id_hex.to_lowercase();
         let created = p & perm::MANAGE_CHANNELS != 0 && self.creators.get(&channel).is_some_and(|c| c == member);

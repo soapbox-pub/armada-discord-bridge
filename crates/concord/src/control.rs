@@ -184,6 +184,17 @@ impl FoldedControl {
         self.channel_permissions(actor, channel_id_hex) & perm::MANAGE_MESSAGES != 0
     }
 
+    /// Whether `member` may make a write of `kind` in a Channel (Armada
+    /// `maySendKind`): the bit [`crate::writers::writer_bit`] names, or for a
+    /// deletion any right a Locked Channel's writer address takes from them.
+    pub fn may_send_kind(&self, member: &str, channel_id_hex: &str, kind: u16) -> bool {
+        let p = self.channel_permissions(member, channel_id_hex);
+        match crate::writers::writer_bit(kind) {
+            Some(bit) => p & bit != 0,
+            None => p & (perm::SEND_MESSAGES | perm::ADD_REACTIONS | perm::CONNECT | perm::MANAGE_MESSAGES) != 0,
+        }
+    }
+
     /// The live Writers ledger restricting a Channel, if one does now.
     pub fn restricting_ledger(&self, channel_id_hex: &str) -> Option<&Ledger> {
         self.writers.get(channel_id_hex).filter(|l| crate::writers::ledger_restricted(l))

@@ -14,7 +14,7 @@ use crate::control::FoldedControl;
 use crate::guestbook::FoldedTimeout;
 use crate::kinds;
 use crate::roles::perm;
-use crate::writers::{Ledger, ledger_restricted, post_stands, read_address_takes, rides_writer_address, writer_windows};
+use crate::writers::{Ledger, ledger_restricted, locked_at, post_stands, read_address_takes, rides_writer_address, writer_windows};
 
 /// A message dated more than this ahead of the reader's clock waits for its time (CORD-03 §3).
 pub const FUTURE_HOLD_MS: u64 = 5_000;
@@ -80,7 +80,7 @@ pub fn judge_post(
 
 /// A restricted Channel's judge (Armada `writerJudge`): a post stands by the
 /// ledger, at an address that takes it, or on the Roster, from a member who
-/// manages Channels or may post there and crossed a move of the ledger.
+/// manages Channels or may make that write there and crossed a move of the ledger.
 fn ledger_stands(folded: &FoldedControl, ledger: &Ledger, community_id: &Bytes32, channel_id_hex: &str, m: &Post) -> bool {
     let owner = folded.owner.as_str();
     if folded.banned.contains(m.author) && m.author != owner {
@@ -90,7 +90,8 @@ fn ledger_stands(folded: &FoldedControl, ledger: &Ledger, community_id: &Bytes32
     let windows = writer_windows(ledger);
     let open = read_address_takes(ledger, m.ms);
     let by_ledger = match wepoch {
-        None => open || !rides_writer_address(m.kind),
+        // In a Locked window reactions and deletions are judged like any write.
+        None => open || !rides_writer_address(m.kind, locked_at(ledger, m.ms)),
         Some(_) if open => true,
         Some(_) => post_stands(ledger, community_id, m.author, m.ms, m.tags),
     };
@@ -105,8 +106,7 @@ fn ledger_stands(folded: &FoldedControl, ledger: &Ledger, community_id: &Bytes32
         None => just_past(w.from),
         Some(e) => Some(w.epoch) == e && w.to.is_some_and(just_past),
     });
-    let may_post = folded.channel_permissions(m.author, channel_id_hex) & perm::SEND_MESSAGES != 0;
-    let writes = ledger_restricted(ledger) && crossed_a_move && may_post;
+    let writes = ledger_restricted(ledger) && crossed_a_move && folded.may_send_kind(m.author, channel_id_hex, m.kind);
     folded.manages_channels(m.author) || writes
 }
 
@@ -162,6 +162,19 @@ mod tests {
         assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 150_000), &t, 160_000, None), Verdict::Collapsed);
         assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 50_000), &t, 160_000, None), Verdict::Stands);
         assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 150_000), &t, 250_000, None), Verdict::Stands, "a lapsed Timeout un-collapses");
+    }
+
+    #[test]
+    fn a_locked_window_holds_a_reaction_at_the_read_address() {
+        use crate::writers::{Spell, empty_ledger, ledger_appended, ledger_appended_locked};
+        let mut f = folded();
+        let writer = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".to_owned();
+        let spell = || Spell::Writer { epoch: 1, pk: writer.clone(), root: 0, by: OWNER.into(), certifier: None };
+        let reaction = Post { author: ALICE, kind: kinds::REACTION, ms: 100_000_000, edited_ms: None, tags: &[] };
+        f.writers.insert(CHAN.into(), ledger_appended(&empty_ledger(CHAN), 1_000, spell()).unwrap());
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, reaction, &HashMap::new(), 100_000_000, None), Verdict::Stands, "reactions stay at the read address");
+        f.writers.insert(CHAN.into(), ledger_appended_locked(&empty_ledger(CHAN), 1_000, spell()).unwrap());
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, reaction, &HashMap::new(), 100_000_000, None), Verdict::Held, "a Locked window takes them only from writers");
     }
 
     #[test]

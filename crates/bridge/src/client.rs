@@ -309,7 +309,7 @@ impl ConcordClient {
         let read: StreamKey = (&channel.current().key).into();
         let restricted = self.folded().is_some_and(|f| f.restricting_ledger(&channel.id_hex).is_some());
         match self.usable_writer(&channel.id_hex, author_pk) {
-            Some(w) if restricted && rides_writer_address(kind) => (w.stream(&read), w.tags()),
+            Some(w) if restricted && rides_writer_address(kind, false) => (w.stream(&read), w.tags()),
             _ => (read, vec![]),
         }
     }
@@ -480,7 +480,7 @@ impl ConcordClient {
     /// deletions stay at the read address and are judged by no ledger.
     pub fn post_refusal(&self, channel: &ChannelView, author_pk: &str, kind: u16) -> Option<PostRefused> {
         let f = self.folded()?;
-        if !rides_writer_address(kind) {
+        if !rides_writer_address(kind, false) {
             return None;
         }
         // A writer posts at the writer address; the owner and a manager's posts

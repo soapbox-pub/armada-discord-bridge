@@ -16,6 +16,7 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::kinds;
+use crate::roles::perm;
 use crate::rumor::Rumor;
 use crate::strict;
 use crate::{Bytes32, hex32, is_hex64, to_hex};
@@ -227,6 +228,13 @@ pub fn ledger_appended(l: &Ledger, at: u64, spell: Spell) -> Option<Ledger> {
     ledger_with(l, &LedgerEntry { at: when, spell, extra: Map::new() })
 }
 
+/// [`ledger_appended`] for a writer entry opening a Locked window.
+pub fn ledger_appended_locked(l: &Ledger, at: u64, spell: Spell) -> Option<Ledger> {
+    let when = l.entries.last().map_or(at, |last| at.max(last.at));
+    let extra = Map::from_iter([("locked".to_owned(), Value::Bool(true))]);
+    ledger_with(l, &LedgerEntry { at: when, spell, extra })
+}
+
 /// A ledger's content as Vector writes it: every object's keys sorted, unknown
 /// fields carried (serde_json's default map is sorted, so building through it sorts).
 pub fn ledger_to_json(l: &Ledger) -> String {
@@ -291,9 +299,37 @@ fn sorted(v: Value) -> Value {
 }
 
 /// Whether a kind moves to the writer address with posting; reactions,
-/// deletions and voice signals stay at the read address.
-pub fn rides_writer_address(kind: u16) -> bool {
-    !matches!(kind, kinds::REACTION | kinds::DELETE | kinds::VOICE_PRESENCE | kinds::VOICE_DIRECTIVE)
+/// deletions and voice signals stay at the read address, except in a Locked
+/// window, where everything moves (CORD-03 §1, Armada `ridesWriterAddress`).
+pub fn rides_writer_address(kind: u16, locked: bool) -> bool {
+    locked || !matches!(kind, kinds::REACTION | kinds::DELETE | kinds::VOICE_PRESENCE | kinds::VOICE_DIRECTIVE)
+}
+
+/// The CORD-04 bit a write of `kind` needs at a writer address; `None` for a
+/// deletion, judged by its signer's authority (Armada `writerBit`).
+pub fn writer_bit(kind: u16) -> Option<u64> {
+    match kind {
+        kinds::REACTION => Some(perm::ADD_REACTIONS),
+        kinds::VOICE_PRESENCE | kinds::VOICE_DIRECTIVE => Some(perm::CONNECT),
+        kinds::DELETE => None,
+        _ => Some(perm::SEND_MESSAGES),
+    }
+}
+
+/// Whether `e` is a writer entry whose window is Locked: only `"locked": true` is.
+pub fn entry_locked(e: &LedgerEntry) -> bool {
+    matches!(e.spell, Spell::Writer { .. }) && e.extra.get("locked") == Some(&Value::Bool(true))
+}
+
+/// Whether every write lands at a writer address now (CORD-03 §1).
+pub fn ledger_locked(l: &Ledger) -> bool {
+    l.entries.iter().rev().find(|e| e.spell.moves()).is_some_and(entry_locked)
+}
+
+/// Whether `at_ms` falls in a Locked window the ledger still holds whole; a
+/// retired window keeps no flag.
+pub fn locked_at(l: &Ledger, at_ms: u64) -> bool {
+    l.entries.iter().rev().find(|e| e.at <= at_ms && e.spell.moves()).is_some_and(entry_locked)
 }
 
 /// The writer window taking posts now, when the ledger restricts the Channel.
@@ -465,5 +501,30 @@ mod tests {
         let stopped_l = ledger_appended(&l, 4_000, Spell::Stop { writer: pk(&author) }).unwrap();
         assert!(!post_stands(&stopped_l, &cid, &pk(&author), 5_000, &tags));
         assert!(post_stands(&stopped_l, &cid, &pk(&author), 3_000, &tags), "a stop isn't retroactive");
+    }
+
+    #[test]
+    fn a_locked_window_moves_every_write_and_keeps_its_flag_through_a_round_trip() {
+        let (w1, w2, by) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let chan = "22".repeat(32);
+        // As Armada writes it: the flag rides the writer entry beside the seal it may carry.
+        let json = format!(
+            r#"{{"channel":"{chan}","ledger":[{{"at":1000,"by":"{}","epoch":1,"locked":true,"root":0,"writer":"{}"}}],"seal":{{"count":0,"page":null,"read":0,"run":1000,"until":1000}}}}"#,
+            pk(&by),
+            pk(&w1)
+        );
+        let l = parse_ledger(&json).expect("a Locked ledger parses");
+        assert!(ledger_restricted(&l) && ledger_locked(&l));
+        assert!(locked_at(&l, 1_500) && !locked_at(&l, 500));
+        assert_eq!(parse_ledger(&ledger_to_json(&l)).unwrap(), l, "the flag and the seal are carried");
+        assert!(rides_writer_address(kinds::REACTION, true) && !rides_writer_address(kinds::REACTION, false));
+        assert!(rides_writer_address(kinds::MESSAGE, false));
+
+        // Unlocking mints a fresh epoch, and the flag is that window's alone.
+        let unlocked = ledger_appended(&l, 2_000, Spell::Writer { epoch: 2, pk: pk(&w2), root: 0, by: pk(&by), certifier: None }).unwrap();
+        assert!(!ledger_locked(&unlocked));
+        assert!(locked_at(&unlocked, 1_500) && !locked_at(&unlocked, 2_500));
+        let relocked = ledger_appended_locked(&unlocked, 3_000, Spell::Writer { epoch: 3, pk: pk(&w1), root: 0, by: pk(&by), certifier: None }).unwrap();
+        assert!(ledger_locked(&relocked) && ledger_extends(&relocked, &unlocked));
     }
 }
