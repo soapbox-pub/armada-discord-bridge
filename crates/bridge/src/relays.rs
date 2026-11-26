@@ -535,10 +535,23 @@ impl RelayLike for MemoryRelay {
             st.refused_subs += 1;
             return Subscription::new(rx, ());
         }
-        for e in &st.events {
-            if st.serves(e) && filters.iter().any(|f| f.match_event(e, MatchEventOptions::default())) {
-                let _ = tx.send(e.clone());
+        // Stored events first, as a relay replays them before EOSE: newest
+        // first and, under a cap, only the newest of each filter's.
+        let mut backlog: Vec<&Event> = Vec::new();
+        for f in &filters {
+            let mut matched: Vec<&Event> = st.events.iter().filter(|e| st.serves(e) && f.match_event(e, MatchEventOptions::default())).collect();
+            matched.sort_by_key(|e| std::cmp::Reverse(e.created_at));
+            if let Some(max) = st.max_results {
+                matched.truncate(max);
             }
+            for e in matched {
+                if !backlog.iter().any(|b| b.id == e.id) {
+                    backlog.push(e);
+                }
+            }
+        }
+        for e in backlog {
+            let _ = tx.send(e.clone());
         }
         let id = st.next_sub;
         st.next_sub += 1;

@@ -227,6 +227,9 @@ pub struct ConcordClient {
     timeouts: TimeoutCell,
     /// The primary's writer keys for restricted Channels (CORD-03 §1).
     writers: RwLock<HeldWriters>,
+    /// The control editions the last whole read found, by wrap id: what the
+    /// live subscription folds its news onto (see `subscribe_control`).
+    synced: RwLock<Arc<HashMap<EventId, Edition>>>,
 }
 
 impl ConcordClient {
@@ -243,6 +246,7 @@ impl ConcordClient {
             keyed: KeyedCache::default(),
             timeouts: TimeoutCell::default(),
             writers: RwLock::default(),
+            synced: RwLock::default(),
         })
     }
 
@@ -260,6 +264,7 @@ impl ConcordClient {
             keyed: KeyedCache::default(),
             timeouts: with.timeouts.clone(),
             writers: RwLock::default(),
+            synced: RwLock::default(),
         })
     }
 
@@ -407,7 +412,10 @@ impl ConcordClient {
         for wrap in &timeouts {
             self.take_timeout(wrap, &guestbook);
         }
-        Ok(self.fold(&self.open_editions(&control)))
+        let synced: HashMap<EventId, Edition> = control.iter().filter_map(|w| Some((w.id, self.open_editions(std::slice::from_ref(w)).pop()?))).collect();
+        let folded = self.fold(&synced.values().cloned().collect::<Vec<_>>());
+        *self.synced.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(synced);
+        Ok(folded)
     }
 
     /// Channels readable with held keys, per the current fold.
@@ -805,7 +813,15 @@ impl ConcordClient {
                         Err(_) => {
                             pending = false;
                             let Some(me) = me.upgrade() else { return };
-                            let all: Vec<Edition> = editions.values().cloned().collect();
+                            // The subscription's own backlog is only the
+                            // relays' newest few hundred: folded alone, a
+                            // Community past that loses every Channel and
+                            // Role defined before them a moment after a
+                            // whole read found them. Its news goes on top of
+                            // what the last whole read held.
+                            let synced = me.synced.read().unwrap_or_else(|e| e.into_inner()).clone();
+                            let all: Vec<Edition> =
+                                synced.iter().filter(|(id, _)| !editions.contains_key(id)).map(|(_, e)| e.clone()).chain(editions.values().cloned()).collect();
                             let folded = me.fold(&all);
                             if let Some(f) = &on_fold {
                                 f(folded);

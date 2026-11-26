@@ -136,6 +136,33 @@ async fn folds_a_control_plane_past_the_relays_cap() {
 }
 
 #[tokio::test]
+async fn a_live_refold_keeps_what_the_whole_read_found() {
+    // The live subscription's backlog is only the relays' newest few hundred
+    // events. Folding that alone undid the paged read a moment after start:
+    // channels found, then gone at the first live edition.
+    let w = world();
+    w.relay.cap_results(10);
+    let start = now_ms() / 1000 - 600;
+    let ids: Vec<[u8; 32]> = (1..=25u8).map(|i| [i; 32]).collect();
+    for (i, id) in ids.iter().enumerate() {
+        w.channel_at(*id, &format!("c{i}"), false, Some(start + i as u64 / 3));
+    }
+    let client = w.client(Keys::generate());
+    client.sync_control().await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let _sub = client.subscribe_control(Some(Arc::new(move |_| {
+        let _ = tx.send(());
+    })), None);
+    let late = [99u8; 32];
+    w.channel(late, "late", false);
+    tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.expect("a live refold").unwrap();
+    let folded: Vec<String> = client.channels().iter().map(|c| c.id_hex.clone()).collect();
+    for id in ids.iter().chain([&late]) {
+        assert!(folded.contains(&hex::encode(id)), "channel {} still folded", hex::encode(id));
+    }
+}
+
+#[tokio::test]
 async fn an_approved_member_takes_its_writer_key_and_posts_where_it_stands() {
     use bridge::writer_keys::intake_writer_keys;
     use concord::delivery::{WriterDelivery, build_writer_deliveries};
