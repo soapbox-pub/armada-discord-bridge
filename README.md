@@ -41,6 +41,16 @@ never bridged without its community's consent.
   takes the writer key Armada's writer duty delivers and posts, reacts and
   deletes at the writer address, Locked channels included. Until then their
   messages stay on Discord, which the channel is told once.
+- **A Role for Discord members** — as a verification bot does on Discord, the
+  bridge can give each Discord member a Role on Armada when their post needs
+  one: a Community that approves members before they post, or a Channel open
+  only to a Role, can then let in a "Discord" (or "Bridged") Role like anyone
+  else. `/bridge role <name>` in a bridged Armada channel picks it per
+  (community, Discord server); `off` gives none; unset, a plain Role named
+  "Discord", else "Bridged", is used. One of the community's bridge npubs needs
+  a Role with Manage roles ranked above it, and it only hands out plain Roles.
+  Where approval to post is on, a member's writer key still comes from a
+  moderator's Armada app, as for everyone.
 - **Refoundings** followed with the bridge's own key, at start and live.
 - **Private channel keys** from Direct Invites, access-plane deliveries and
   channel rotations, read at every start and followed while running; a
