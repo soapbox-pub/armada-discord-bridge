@@ -13,6 +13,7 @@ pub mod control;
 pub mod delivery;
 pub mod derive;
 pub mod direct_invite;
+pub mod grant;
 pub mod edition;
 pub mod guestbook;
 pub mod invite;
