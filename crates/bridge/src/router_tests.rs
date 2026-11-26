@@ -585,6 +585,40 @@ async fn a_discord_member_posts_once_an_armada_moderator_approves_them() {
     assert!(h.chats().is_empty(), "nothing at the read address, which a Locked window ignores");
 }
 
+/// Records who it was asked to admit, and says they hold the Role.
+#[derive(Default)]
+struct FakeAdmit {
+    asked: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::auto_role::Admit for FakeAdmit {
+    async fn admit(&self, _link: &ChannelLink, puppet_pk: &str) -> Option<String> {
+        self.asked.lock().unwrap().push(puppet_pk.to_owned());
+        Some("Discord".into())
+    }
+}
+
+#[tokio::test]
+async fn a_refused_member_is_admitted_with_the_bridged_role_only_for_a_recent_post() {
+    let admit = Arc::new(FakeAdmit::default());
+    let h = harness_with(|o, _| o.admit = Some(admit.clone() as Arc<dyn crate::auto_role::Admit>));
+    h.gate();
+    let puppet = h.puppets.get(USER).unwrap();
+
+    // A history copy or catch-up replays old posts, refused just the same:
+    // no Grant for every member who ever posted.
+    let old = DiscordInboundMessage { timestamp_ms: Some(now_ms() - 3_600_000), ..discord_msg() };
+    assert_eq!(h.router.on_discord_message(old, &h.link).await.unwrap(), None);
+    assert!(admit.asked.lock().unwrap().is_empty());
+
+    let live = DiscordInboundMessage { id: "2".into(), timestamp_ms: Some(now_ms()), ..discord_msg() };
+    assert_eq!(h.router.on_discord_message(live, &h.link).await.unwrap(), None, "still waiting on a writer key");
+    assert_eq!(*admit.asked.lock().unwrap(), vec![puppet.pk.clone()]);
+    let told: Vec<String> = h.sent().into_iter().map(|m| m.content).collect();
+    assert!(told.iter().any(|c| c.contains("given the Discord role")), "{told:?}");
+}
+
 #[tokio::test]
 async fn a_locked_channel_mirrors_only_the_reactions_its_ledger_stands_behind() {
     let h = harness();

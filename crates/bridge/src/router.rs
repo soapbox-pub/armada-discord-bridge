@@ -35,6 +35,7 @@ use crate::markup::{
 };
 use crate::net::{Prober, SafeProber};
 use crate::profiles::{ProfileResolver, fallback_profile};
+use crate::auto_role::Admit;
 use crate::puppets::PuppetCache;
 use crate::store::MappingStore;
 use crate::transform::{DISCORD_MAX_CHARS, concord_to_discord, discord_to_concord, split_for_discord, substituted_embed_media};
@@ -45,6 +46,9 @@ use crate::types::{
 
 /// Attachment ceiling both ways (webhook upload limit for standard guilds).
 pub const MAX_BLOB_BYTES: usize = 10 * 1024 * 1024;
+
+/// How recent a refused post must be for its author to be given the bridged Role.
+const ADMIT_WITHIN_MS: u64 = 10 * 60_000;
 
 /// Download ATTEMPTS per inbound rumor. Discord accepts 10 attachments per
 /// message, so anything past this could never be sent anyway — but the tag
@@ -143,11 +147,13 @@ pub struct RouterOptions {
     pub klipy: Option<Arc<dyn GifResolver>>,
     /// Probes GIF variants; always the guarded prober outside tests.
     pub prober: Arc<dyn Prober>,
+    /// Gives a puppet the bridged Role (`/bridge role`), when set.
+    pub admit: Option<Arc<dyn Admit>>,
 }
 
 impl Default for RouterOptions {
     fn default() -> Self {
-        RouterOptions { bridge_edits: false, blobs: None, klipy: None, prober: Arc::new(SafeProber) }
+        RouterOptions { bridge_edits: false, blobs: None, klipy: None, prober: Arc::new(SafeProber), admit: None }
     }
 }
 
@@ -163,6 +169,8 @@ pub struct BridgeRouter {
     published_profiles: Mutex<HashMap<String, String>>,
     /// discord user ids whose puppet published a Guestbook join this run.
     joined_puppets: Mutex<HashSet<String>>,
+    /// The bridged Role last given, or found held, for the awaiting notice.
+    admitted_role: Mutex<Option<String>>,
     /// Discord channels already told why their posts don't reach Armada.
     refusals_noticed: Mutex<HashSet<String>>,
     /// direction key -> last forwarded typing signal.
@@ -196,6 +204,7 @@ impl BridgeRouter {
             options,
             published_profiles: Mutex::default(),
             joined_puppets: Mutex::default(),
+            admitted_role: Mutex::default(),
             refusals_noticed: Mutex::default(),
             last_typing: Mutex::default(),
             chat_queue: tokio::sync::Mutex::new(()),
@@ -250,12 +259,34 @@ impl BridgeRouter {
         }
     }
 
+    /// Give the puppet the bridged Role, when a recent post of theirs was
+    /// refused for want of one. Only recent: a history copy or a catch-up
+    /// replays old posts that are refused just the same, and a Grant for every
+    /// member who ever posted would be a Control Plane edition each.
+    async fn admit(&self, link: &ChannelLink, puppet_pk: &str, ms: Option<u64>) -> Option<String> {
+        if ms.is_some_and(|t| now_ms().saturating_sub(t) > ADMIT_WITHIN_MS) {
+            return None;
+        }
+        let role = self.options.admit.as_ref()?.admit(link, puppet_pk).await?;
+        *self.admitted_role.lock().unwrap_or_else(|e| e.into_inner()) = Some(role.clone());
+        Some(role)
+    }
+
     /// Say once, in the Discord channel, why its posts aren't reaching Armada.
     /// Silent refusal let a Discord channel talk into nothing while every
     /// message looked delivered. Once per channel per process: a restart may
     /// say it again, which beats never.
     async fn notice_refusal(&self, link: &ChannelLink, refused: &crate::client::PostRefused) {
-        let (key, content) = if refused.channel_wide {
+        let admitted = self.admitted_role.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (key, content) = if let Some(role) = admitted.filter(|_| refused.awaiting || refused.channel_wide) {
+            (
+                format!("admitted:{}", link.discord_channel_id),
+                format!(
+                    "Discord members are given the {role} role on Armada as they post here. Where the community approves members before they post, \
+                     each one's messages go through once their Armada writer key arrives from a moderator's app; until then they stay on Discord."
+                ),
+            )
+        } else if refused.channel_wide {
             (link.discord_channel_id.clone(), format!("Messages from this channel aren't reaching Armada: {refused}. Armada messages still arrive here."))
         } else if refused.awaiting {
             (
@@ -332,9 +363,10 @@ impl BridgeRouter {
         // Checked before any upload, which would be wasted work.
         if let Some(refused) = self.client.refusal(&channel, &puppet.keys, kinds::MESSAGE).await {
             tracing::debug!(channel = %link.discord_channel_id, reason = %refused, "not bridging to Armada");
+            let admitted = if refused.awaiting || refused.channel_wide { self.admit(link, &puppet.pk, msg.timestamp_ms).await } else { None };
             // Joined, and named as on Discord, so Armada's moderators find
             // them among the members awaiting approval.
-            if refused.awaiting {
+            if refused.awaiting || admitted.is_some() {
                 if let Err(error) = self.sync_puppet_profile(&msg.author, &puppet.keys).await {
                     tracing::warn!(user = %msg.author.id, error = %format!("{error:#}"), "puppet profile publish failed");
                 }

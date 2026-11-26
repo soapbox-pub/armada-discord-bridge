@@ -1,5 +1,6 @@
 //! Discord <-> Armada bridge.
 
+pub mod auto_role;
 pub mod blossom;
 pub mod client;
 pub mod community;

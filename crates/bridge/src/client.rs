@@ -13,13 +13,14 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use concord::chat::Binding;
 use concord::community::{ChannelView, Membership};
-use concord::control::{FoldedControl, fold_control};
+use concord::control::{FoldedControl, fold_control, seal_edition};
+use concord::grant::GrantBlocked;
 use concord::edition::{Edition, parse_edition};
 use concord::guestbook::{FoldedTimeout, fold_timeouts};
 use concord::invite::{InviteBundle, parse_bundle_event, parse_invite_link};
 use concord::judge::{Post, Verdict, judge_post};
 use concord::kinds::{self, Plane};
-use concord::roles::perm;
+use concord::roles::{Role, perm};
 use concord::rumor::Rumor;
 use concord::stream::{
     MAX_EVENT_BYTES, Opened, StreamKey, WrapOptions, check_channel_binding, check_writer_binding, open_plane_wrap, seal_and_wrap, seal_rumor, wrap_seal,
@@ -629,6 +630,41 @@ impl ConcordClient {
             .iter()
             .any(|r| r.rank.is_some() && r.permissions & MANAGEMENT_BITS == 0 && f.roster.role_channel_permissions(r, channel_id_hex, private) & bit != 0);
         if approvable { PostRefused::awaiting("this member isn't approved to post in the Armada community yet") } else { PostRefused::channel(otherwise) }
+    }
+
+    /// Take the staff write key the primary's own Grant carries (CORD-04 §3),
+    /// when the epoch is split and it isn't held. Nothing is stored: the Grant
+    /// stays on the Control Plane, and each start takes it again.
+    pub fn take_staff_key(&self) -> bool {
+        let community = self.community();
+        let Some(control_pk) = community.control_pk.clone() else { return false };
+        if community.control_write_stream().is_some() {
+            return false;
+        }
+        let Some(f) = self.folded() else { return false };
+        let Some(root) = concord::grant::staff_key_from_grant(&f, &community.id(), &self.primary, community.root_epoch, &control_pk) else { return false };
+        let mut next = (*community).clone();
+        next.control_root = Some(root);
+        self.set_community(next);
+        true
+    }
+
+    /// Why the primary can't grant `role`, judged as readers will judge it.
+    pub fn grant_blocked(&self, role: &Role) -> Option<GrantBlocked> {
+        let Some(f) = self.folded() else { return Some(GrantBlocked::NoManageRoles) };
+        let community = self.community();
+        let held: Vec<String> = community.private_channels.iter().map(|c| c.id.clone()).collect();
+        concord::grant::grant_blocked(&f, &self.primary_pk(), role, community.control_write_stream().is_some(), &held)
+    }
+
+    /// Grant `member` `role` as the primary, on top of what they hold.
+    pub async fn grant_role(&self, member: &str, role: &Role) -> anyhow::Result<()> {
+        let f = self.folded().context("no fold")?;
+        let community = self.community();
+        let rumor = concord::grant::plan_grant(&f, &community.id(), &self.primary_pk(), member, role)?;
+        let stream = community.control_write_stream().context("no staff write key")?;
+        let wrap = seal_edition(&rumor, &stream, &self.primary)?;
+        self.relays.publish(&wrap).await
     }
 
     async fn publish_signed(&self, author: &Keys, kind: u16, content: String, tags: Vec<Vec<String>>) -> anyhow::Result<Event> {
