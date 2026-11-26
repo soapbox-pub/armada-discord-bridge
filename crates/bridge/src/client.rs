@@ -350,7 +350,7 @@ impl ConcordClient {
         let cid = self.community().id();
         let me = author.public_key().to_hex();
         let held = self.held_writers_of(&me);
-        if let Some(w) = usable_writer(&f, &cid, channel_id_hex, &me, kind, &held) {
+        if let Some(w) = usable_writer(&f, &cid, channel_id_hex, &me, kind, &held, None) {
             return Some(w);
         }
         let mut book = self.writers.write().unwrap_or_else(|e| e.into_inner());
@@ -360,7 +360,7 @@ impl ConcordClient {
         }
         let held = book.held.entry(me.clone()).or_default();
         held.extend(taken);
-        usable_writer(&f, &cid, channel_id_hex, &me, kind, held)
+        usable_writer(&f, &cid, channel_id_hex, &me, kind, held, None)
     }
 
     /// Read a restricted Channel's writer deliveries again if `author` is
@@ -562,7 +562,7 @@ impl ConcordClient {
         let Some(f) = self.folded() else { return Verdict::Stands };
         let post = Post { author: chat.author(), kind: chat.kind(), ms: chat.ms, edited_ms: None, tags: chat.tags() };
         let public_until = self.community().public_until(&f, &chat.channel_id_hex);
-        judge_post(&f, &self.community().id(), &chat.channel_id_hex, post, &self.timeouts(), now_ms(), public_until)
+        judge_post(&f, &self.community().id(), &chat.channel_id_hex, post, &self.timeouts(), None, now_ms(), public_until)
     }
 
     /// Why a write of `kind` by `author` would not stand in this Channel, if it

@@ -16,6 +16,25 @@ use crate::roles::perm;
 use crate::stream::StreamKey;
 use crate::{Bytes32, hex32, random32, to_hex};
 
+/// Whether a non-owner base rotation carries a blob for everyone it must
+/// (Armada `rotationCoversOwed`): the owner, and every unbanned Grant holder
+/// the Rotator can't act on with BAN. One that doesn't is neither adopted nor
+/// read as a removal by anyone (CORD-06 §2), or a Moderator could refound the
+/// Community onto a root of their own.
+fn covers_owed(set: &Rotation, folded: &FoldedControl) -> bool {
+    if set.rotator == folded.owner {
+        return true;
+    }
+    let mut owed = vec![folded.owner.clone()];
+    for g in &folded.roster.grants {
+        let member = g.member.to_lowercase();
+        if member != set.rotator && !folded.banned.contains(&member) && !folded.roster.can_act_on_member(&set.rotator, &folded.owner, &member, perm::BAN) {
+            owed.push(member);
+        }
+    }
+    owed.iter().all(|pk| rekey::my_locator(&set.rotator, pk, &set.scope_hex, set.new_epoch).is_some_and(|l| set.find_blob(&l).is_some()))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HeldRoot {
     pub epoch: u64,
@@ -294,6 +313,26 @@ impl Membership {
         guestbook_group_key(&self.root_key(), &self.id(), self.root_epoch).into()
     }
 
+    /// Each held epoch's Guestbook address and the npub whose Refounding
+    /// minted it, where known; and the addresses of epochs past 0 whose minter
+    /// this member never saw, as a joiner holds them (CORD-02 §5).
+    pub fn guestbook_authorities(&self) -> (std::collections::HashMap<String, String>, std::collections::HashSet<String>) {
+        let mut known = std::collections::HashMap::new();
+        let mut unrecorded = std::collections::HashSet::new();
+        for r in self.held_roots.iter().filter(|r| r.epoch > 0) {
+            let pk = guestbook_group_key(&b32(&r.key), &self.id(), r.epoch).pk_hex();
+            match &r.refounder {
+                Some(by) => {
+                    known.insert(pk, by.clone());
+                }
+                None => {
+                    unrecorded.insert(pk);
+                }
+            }
+        }
+        (known, unrecorded)
+    }
+
     /// The npubs whose Refoundings minted held epochs (snapshot authorities).
     pub fn snapshot_authorities(&self) -> std::collections::HashSet<String> {
         self.held_roots.iter().filter(|r| r.epoch > 0).filter_map(|r| r.refounder.clone()).collect()
@@ -338,7 +377,15 @@ impl Membership {
                 });
                 channel_streams.into_iter().chain(public_era.into_iter().flatten()).collect()
             } else {
-                root_streams.into_iter().chain(channel_streams).collect()
+                // The earlier planes its metadata publishes (CORD-03 §2), last,
+                // so a held plane of the same epoch sorts ahead of them.
+                let mut streams: Vec<ChannelStream> = root_streams.into_iter().chain(channel_streams).collect();
+                for p in published_history(&def.raw) {
+                    if !streams.iter().any(|s| s.key.pubkey() == p.key.pubkey()) {
+                        streams.push(p);
+                    }
+                }
+                streams
             };
             let field = |k: &str| opened.as_ref().and_then(|o| o.metadata.get(k)).and_then(serde_json::Value::as_str).map(str::to_owned);
             let name = match (&opened, held) {
@@ -526,10 +573,26 @@ impl Membership {
         out
     }
 
+    /// Whether a reader honors a complete base rotation off `(epoch, key)` (Armada
+    /// `honoredRootRotations`): the rotator is the owner or holds BAN, unbanned,
+    /// citing a satisfied Grant, continuing from exactly that key, and, unless
+    /// the owner, carrying a blob for everyone it can't remove (CORD-06 §2).
+    fn honors_base_rotation(&self, set: &Rotation, folded: &FoldedControl, epoch: u64, key: &Bytes32) -> bool {
+        set.scope_hex == rekey::ROOT_SCOPE_HEX
+            && set.new_epoch == epoch + 1
+            && set.prev_epoch == epoch
+            && set.is_complete()
+            && !folded.banned.contains(&set.rotator)
+            && folded.roster.is_authorized(&set.rotator, &folded.owner, perm::BAN)
+            && folded.citation_satisfied(&self.id(), &set.rotator, set.authority.as_ref())
+            && set.continues_from(epoch, key) == Continuity::Ok
+            && covers_owed(set, folded)
+    }
+
     /// Process base rotations at `root_epoch + 1` (CORD-06 §2). `rotations` must
     /// come from the next base-rekey address. Authority is the roster, never key
-    /// possession: the rotator must be the owner or hold BAN, be unbanned, and
-    /// cite a satisfied Grant.
+    /// possession. A rotation carrying no blob, or a blob at our locator that
+    /// won't open, is never a removal.
     pub fn apply_base_rotations(&mut self, rotations: &[Rotation], folded: &FoldedControl, me: &nostr::prelude::Keys) -> RekeyOutcome {
         let me_hex = me.public_key().to_hex();
         let next = self.root_epoch + 1;
@@ -537,14 +600,7 @@ impl Membership {
         let mut adopted: Option<(rekey::BaseBlob, String, u64)> = None;
         let mut excluded = false;
         for set in rotations {
-            if set.scope_hex != rekey::ROOT_SCOPE_HEX
-                || set.new_epoch != next
-                || !set.is_complete()
-                || folded.banned.contains(&set.rotator)
-                || !folded.roster.is_authorized(&set.rotator, &folded.owner, perm::BAN)
-                || !folded.citation_satisfied(&cid, &set.rotator, set.authority.as_ref())
-                || set.continues_from(self.root_epoch, &self.root_key()) != Continuity::Ok
-            {
+            if !self.honors_base_rotation(set, folded, self.root_epoch, &self.root_key()) || !set.has_blobs() {
                 continue;
             }
             let post_join = set.published_ms() >= self.joined_at_ms;
@@ -555,13 +611,10 @@ impl Membership {
                 continue;
             };
             let Ok(rotator) = nostr::prelude::PublicKey::from_hex(&set.rotator) else { continue };
-            match rekey::open_blob(blob, me.secret_key(), &rotator).and_then(|plain| rekey::decode_base_blob(&plain, &cid, next)) {
-                Ok(b) => {
-                    if adopted.as_ref().is_none_or(|(a, _, _)| b.new_root < a.new_root) {
-                        adopted = Some((b, set.rotator.clone(), set.published_ms()));
-                    }
-                }
-                Err(_) => excluded |= could_exclude,
+            if let Ok(b) = rekey::open_blob(blob, me.secret_key(), &rotator).and_then(|plain| rekey::decode_base_blob(&plain, &cid, next))
+                && adopted.as_ref().is_none_or(|(a, _, _)| b.new_root < a.new_root)
+            {
+                adopted = Some((b, set.rotator.clone(), set.published_ms()));
             }
         }
         if let Some((blob, rotator, published_ms)) = adopted {
@@ -589,19 +642,114 @@ impl Membership {
         RekeyOutcome::Nothing
     }
 
+    /// The address the held epoch's own Refoundings arrived at, derived from
+    /// the prior root: `None` when that root isn't held (joined at this epoch).
+    pub fn current_base_rekey_address(&self) -> Option<GroupKey> {
+        let prior = self.held_roots.iter().find(|r| self.root_epoch > 0 && r.epoch == self.root_epoch - 1)?;
+        Some(base_rekey_group_key(&b32(&prior.key), &self.id(), self.root_epoch))
+    }
+
+    /// Converge the held epoch onto a strictly lower sibling root (CORD-06 §3):
+    /// an honored rotation off the same prior root whose blob opens for us,
+    /// adopted with its control pair and Rotator as if taken first. Down-only,
+    /// so a fetch returning only a higher sibling never re-forks a settled
+    /// epoch. `rotations` come from [`Membership::current_base_rekey_address`].
+    pub fn heal_base_sibling(&mut self, rotations: &[Rotation], folded: &FoldedControl, me: &nostr::prelude::Keys) -> bool {
+        let Some(prior) = self.held_roots.iter().find(|r| self.root_epoch > 0 && r.epoch == self.root_epoch - 1).cloned() else { return false };
+        let me_hex = me.public_key().to_hex();
+        let cid = self.id();
+        let mut lowest: Option<(rekey::BaseBlob, String)> = None;
+        for set in rotations {
+            if !self.honors_base_rotation(set, folded, prior.epoch, &b32(&prior.key)) {
+                continue;
+            }
+            let Some(blob) = rekey::my_locator(&set.rotator, &me_hex, &set.scope_hex, set.new_epoch).and_then(|loc| set.find_blob(&loc)) else { continue };
+            let Ok(rotator) = nostr::prelude::PublicKey::from_hex(&set.rotator) else { continue };
+            if let Ok(b) = rekey::open_blob(blob, me.secret_key(), &rotator).and_then(|plain| rekey::decode_base_blob(&plain, &cid, self.root_epoch))
+                && lowest.as_ref().is_none_or(|(l, _)| b.new_root < l.new_root)
+            {
+                lowest = Some((b, set.rotator.clone()));
+            }
+        }
+        let Some((blob, rotator)) = lowest.filter(|(b, _)| b.new_root < self.root_key()) else { return false };
+        self.root = to_hex(&blob.new_root);
+        self.control_pk = blob.control_pk.clone();
+        self.control_root = blob.control_root.map(|c| to_hex(&c));
+        if let Some(r) = self.held_roots.iter_mut().find(|r| r.epoch == self.root_epoch) {
+            r.key = self.root.clone();
+            r.control_pk = blob.control_pk;
+            r.refounder = Some(rotator);
+        }
+        true
+    }
+
+    /// The Private Channels `me`'s rekey walk follows that no key reached yet
+    /// (Armada `walkTargets`): ones the fold lets them read, sealed, from the
+    /// sealed head's epoch (CORD-03 §2). A Channel converted from public is one,
+    /// and the rotation that minted it carries every reader it let in. A cut is
+    /// never walked back below. `(channel id, first epoch walked)`.
+    pub fn keyless_targets(&self, folded: &FoldedControl, me: &str) -> Vec<(String, u64)> {
+        if !folded.ranked || folded.banned.contains(me) {
+            return vec![];
+        }
+        folded
+            .channels
+            .values()
+            .filter(|c| c.private && !c.deleted && c.sealed.is_some() && !self.private_channels.iter().any(|h| h.id == c.channel_id_hex))
+            .filter(|c| me == folded.owner || folded.roster.channel_permissions(&folded.owner, me, &c.channel_id_hex, true) & perm::VIEW_CHANNEL != 0)
+            .map(|c| {
+                let sealed = c.sealed.as_ref().map_or(1, |s| s.epoch.max(1));
+                let cut = self.channel_cuts.iter().filter(|(id, _)| *id == c.channel_id_hex).map(|(_, e)| *e).max().unwrap_or(0);
+                (c.channel_id_hex.clone(), sealed.max(cut))
+            })
+            .collect()
+    }
+
+    /// [`Membership::channel_rekey_addresses`] and the addresses of the
+    /// [`Membership::keyless_targets`], from their first epoch.
+    pub fn channel_rekey_addresses_with(&self, folded: &FoldedControl, me: &str) -> Vec<(GroupKey, String, u64)> {
+        let mut out = self.channel_rekey_addresses();
+        for (ch, from) in self.keyless_targets(folded, me) {
+            let id = b32(&ch);
+            for r in &self.held_roots {
+                for epoch in from..from + rekey::CHANNEL_REKEY_LOOKAHEAD {
+                    out.push((channel_rekey_group_key(&b32(&r.key), &id, epoch), ch.clone(), epoch));
+                }
+            }
+        }
+        out
+    }
+
     /// Process private Channel rotations (CORD-06 §2), walking each channel's
-    /// epochs ascending. Returns `(channel id, adopted epoch or None if cut)`.
+    /// epochs ascending, held ones from the epoch after their key and keyless
+    /// ones from their sealed head's. Returns `(channel id, adopted epoch or
+    /// None if cut)`.
+    ///
+    /// Adoption needs an unbroken `prevcommit` chain from the key held; a
+    /// keyless walk has nothing to check, so it adopts on authority and the
+    /// blob's binding, and the seal is what authenticates a key at its epoch.
+    /// A rotation from the owner or a MANAGE_CHANNELS holder committing to
+    /// `(n − 1, root)` is a public Channel made private, and extends the chain
+    /// for a holder of an earlier private era's key too (CORD-03 §2).
     pub fn apply_channel_rotations(&mut self, rotations: &[Rotation], folded: &FoldedControl, me: &nostr::prelude::Keys) -> Vec<(String, Option<u64>)> {
         let me_hex = me.public_key().to_hex();
         let cid = self.id();
+        let roots: Vec<(u64, Bytes32)> = self.held_roots.iter().map(|r| (r.epoch, b32(&r.key))).collect();
+        // (channel id, key held and its epoch, first epoch walked)
+        type Target = (String, Option<(Bytes32, u64)>, u64);
+        let mut targets: Vec<Target> =
+            self.private_channels.iter().map(|c| (c.id.clone(), Some((b32(&c.key), c.epoch)), c.epoch + 1)).collect();
+        targets.extend(self.keyless_targets(folded, &me_hex).into_iter().map(|(id, from)| (id, None, from)));
         let mut changes = vec![];
         let mut cuts = vec![];
-        for ch in &mut self.private_channels {
+        let mut adoptions: Vec<(String, Bytes32, u64, Vec<PriorKey>)> = vec![];
+        for (ch_id, held, from) in targets {
             let mut sets: Vec<&Rotation> = rotations
                 .iter()
                 .filter(|s| {
-                    s.scope_hex == ch.id
-                        && s.new_epoch > ch.epoch
+                    s.scope_hex == ch_id
+                        && s.new_epoch >= from
+                        && s.new_epoch == s.prev_epoch + 1
                         && s.is_complete()
                         && !folded.banned.contains(&s.rotator)
                         && (folded.roster.is_authorized(&s.rotator, &folded.owner, perm::BAN)
@@ -613,8 +761,13 @@ impl Membership {
                 continue;
             }
             sets.sort_by_key(|s| s.new_epoch);
-            let id = b32(&ch.id);
-            let (mut chain_epoch, mut chain_key) = (ch.epoch, b32(&ch.key));
+            let id = b32(&ch_id);
+            let sealed = folded.channels.get(&ch_id).and_then(|c| c.sealed.as_ref());
+            let converts = |s: &Rotation| {
+                (s.rotator == folded.owner || folded.roster.is_authorized(&s.rotator, &folded.owner, perm::MANAGE_CHANNELS))
+                    && roots.iter().any(|(_, k)| s.continues_from(s.prev_epoch, k) == Continuity::Ok)
+            };
+            let mut chain: Option<(Bytes32, u64)> = held;
             let mut adopted: Option<(Bytes32, u64)> = None;
             let mut excluded_at: Option<u64> = None;
             let mut stepped: Vec<PriorKey> = vec![];
@@ -624,28 +777,34 @@ impl Membership {
                 let mut key_here: Option<(Bytes32, u64)> = None;
                 let mut addressed = false;
                 for set in sets.iter().filter(|s| s.new_epoch == epoch) {
-                    let Some(blob) = rekey::my_locator(&set.rotator, &me_hex, &ch.id, epoch).and_then(|l| set.find_blob(&l)) else { continue };
+                    let Some(blob) = rekey::my_locator(&set.rotator, &me_hex, &ch_id, epoch).and_then(|l| set.find_blob(&l)) else { continue };
                     addressed = true;
-                    if set.continues_from(chain_epoch, &chain_key) != Continuity::Ok {
+                    if let Some((k, e)) = chain
+                        && set.continues_from(e, &k) != Continuity::Ok
+                        && !converts(set)
+                    {
                         continue;
                     }
                     let Ok(rotator) = nostr::prelude::PublicKey::from_hex(&set.rotator) else { continue };
-                    if let Ok(k) = rekey::open_blob(blob, me.secret_key(), &rotator).and_then(|p| rekey::decode_channel_blob(&p, &id, epoch)) {
-                        let at = set.published_ms();
-                        key_here = Some(match key_here {
-                            Some((prev, prev_at)) => (prev.min(k), prev_at.min(at)),
-                            None => (k, at),
-                        });
+                    let Ok(k) = rekey::open_blob(blob, me.secret_key(), &rotator).and_then(|p| rekey::decode_channel_blob(&p, &id, epoch)) else { continue };
+                    if chain.is_none() && crate::delivery::access_key_refuted(sealed, &id, epoch, &k) {
+                        continue;
                     }
+                    let at = set.published_ms();
+                    key_here = Some(match key_here {
+                        Some((prev, prev_at)) => (prev.min(k), prev_at.min(at)),
+                        None => (k, at),
+                    });
                 }
                 if let Some((k, at)) = key_here {
-                    stepped.insert(0, PriorKey { key: to_hex(&chain_key), epoch: chain_epoch, retired_at: Some(at / 1000) });
+                    if let Some((ck, ce)) = chain {
+                        stepped.insert(0, PriorKey { key: to_hex(&ck), epoch: ce, retired_at: Some(at / 1000) });
+                    }
                     adopted = Some((k, epoch));
-                    chain_epoch = epoch;
-                    chain_key = k;
+                    chain = Some((k, epoch));
                     continue;
                 }
-                if addressed {
+                if addressed || held.is_none() {
                     continue;
                 }
                 if sets.iter().filter(|s| s.new_epoch == epoch).any(|s| {
@@ -656,18 +815,25 @@ impl Membership {
             }
             match (adopted, excluded_at) {
                 (Some((k, epoch)), ex) if ex.is_none_or(|x| epoch > x) => {
-                    let mut priors = stepped;
-                    priors.append(&mut ch.priors);
-                    ch.priors = priors;
-                    ch.key = to_hex(&k);
-                    ch.epoch = epoch;
-                    changes.push((ch.id.clone(), Some(epoch)));
+                    adoptions.push((ch_id.clone(), k, epoch, stepped));
+                    changes.push((ch_id, Some(epoch)));
                 }
                 (_, Some(x)) => {
-                    cuts.push((ch.id.clone(), x));
-                    changes.push((ch.id.clone(), None));
+                    cuts.push((ch_id.clone(), x));
+                    changes.push((ch_id, None));
                 }
                 _ => {}
+            }
+        }
+        for (id, k, epoch, mut stepped) in adoptions {
+            match self.private_channels.iter_mut().find(|c| c.id == id) {
+                Some(ch) => {
+                    stepped.append(&mut ch.priors);
+                    ch.priors = stepped;
+                    ch.key = to_hex(&k);
+                    ch.epoch = epoch;
+                }
+                None => self.private_channels.push(PrivateChannelKey { id, key: to_hex(&k), epoch, name: String::new(), priors: stepped }),
             }
         }
         for (id, epoch) in cuts {
@@ -678,10 +844,292 @@ impl Membership {
     }
 }
 
+/// At most this many published planes (CORD-03 §2).
+pub const MAX_HISTORY: usize = 128;
+
+/// The earlier planes a Public Channel's metadata publishes as `history`
+/// (CORD-03 §2, Armada `publishedHistory`), each by its own secret: an entry
+/// that isn't `[epoch < 2^53, "<64 hex secret>"]` names nothing.
+pub fn published_history(meta: &serde_json::Value) -> Vec<ChannelStream> {
+    let Some(entries) = meta.get("history").and_then(serde_json::Value::as_array) else { return vec![] };
+    entries
+        .iter()
+        .filter_map(|e| {
+            let [epoch, secret] = e.as_array()?.as_slice() else { return None };
+            let epoch = epoch.as_u64().filter(|e| *e < (1 << 53))?;
+            let sk = nostr::prelude::SecretKey::from_slice(&hex32(secret.as_str().filter(|s| crate::is_hex64(s))?)?).ok()?;
+            Some(ChannelStream { epoch, key: GroupKey::from_secret(sk), retired_at: None })
+        })
+        .take(MAX_HISTORY)
+        .collect()
+}
+
 fn private_streams(h: &PrivateChannelKey, id: &Bytes32) -> Vec<ChannelStream> {
     std::iter::once(ChannelStream { epoch: h.epoch, key: channel_group_key(&b32(&h.key), id, h.epoch), retired_at: None })
         .chain(h.priors.iter().filter_map(|p| {
             Some(ChannelStream { epoch: p.epoch, key: channel_group_key(&hex32(&p.key)?, id, p.epoch), retired_at: p.retired_at })
         }))
         .collect()
+}
+
+/// Whether a bundle's root is the Community's own (CORD-05 §1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootVerdict {
+    Anchored,
+    /// The plane answered and holds no anchor: a root of someone else's choosing.
+    Forged,
+    /// Nothing was read: the join waits, never waved through.
+    Unread,
+}
+
+/// Authenticate a bundle's root before persisting a join (CORD-05 §1): at
+/// epoch 0 the owner's genesis metadata edition (`vsk 0`, its `eid` the
+/// `community_id`) opens under the delivered keys; on a rotated plane,
+/// where compaction may leave no owner-signed metadata head, the
+/// Community-bound metadata head and at least one owner-signed edition do.
+/// `editions` are those opened at `m`'s current Control Plane address; an
+/// empty read defers. Bundle fields that ride in every invite and outlive
+/// removal would otherwise seat a joiner on planes an attacker controls.
+pub fn authenticate_root(m: &Membership, editions: &[crate::edition::Edition]) -> RootVerdict {
+    let here = m.current_control_stream().pk_hex();
+    let at: Vec<&crate::edition::Edition> = editions.iter().filter(|e| e.opened.stream_pk == here).collect();
+    if at.is_empty() {
+        return RootVerdict::Unread;
+    }
+    let cid = m.id();
+    let metadata = |e: &&&crate::edition::Edition| e.vsk == crate::kinds::VSK_METADATA && e.entity_id == cid;
+    let anchored = if m.root_epoch == 0 {
+        at.iter().any(|e| metadata(&e) && e.author == m.owner)
+    } else {
+        let bound = crate::derive::edition_binding(&cid);
+        at.iter().any(|e| metadata(&e) && e.binding == Some(bound)) && at.iter().any(|e| e.author == m.owner)
+    };
+    if anchored { RootVerdict::Anchored } else { RootVerdict::Forged }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use crate::control::FoldedControl;
+    use crate::derive::epoch_key_commitment;
+    use crate::kinds::Plane;
+    use crate::rekey::{group_rotations, parse_rekey};
+    use crate::roles::{MemberGrant, Role, RoleScope};
+    use crate::stream::{WrapOptions, open_plane_wrap, seal_and_wrap};
+    use base64::Engine;
+    use nostr::prelude::Keys;
+
+    /// A base rotation by `rotator` off the held epoch, carrying each blob given
+    /// as (recipient, plaintext), through a real wrap at the next base address.
+    fn rotation(m: &Membership, rotator: &Keys, blobs: &[(&Keys, Vec<u8>)], prev: Option<(u64, Bytes32)>) -> Vec<Rotation> {
+        rotation_citing(m, rotator, blobs, prev, None)
+    }
+
+    fn rotation_citing(m: &Membership, rotator: &Keys, blobs: &[(&Keys, Vec<u8>)], prev: Option<(u64, Bytes32)>, vac: Option<&crate::edition::Citation>) -> Vec<Rotation> {
+        let (prev_epoch, prev_root) = prev.unwrap_or((m.root_epoch, m.root_key()));
+        let new_epoch = prev_epoch + 1;
+        let me = rotator.public_key().to_hex();
+        let list: Vec<serde_json::Value> = blobs
+            .iter()
+            .map(|(to, plain)| {
+                let conv = crate::derive::conversation_key(rotator.secret_key(), &to.public_key());
+                let wrapped = crate::nip44::encrypt_str(&conv, &base64::engine::general_purpose::STANDARD.encode(plain)).unwrap();
+                let locator = rekey::my_locator(&me, &to.public_key().to_hex(), rekey::ROOT_SCOPE_HEX, new_epoch).unwrap();
+                serde_json::json!({ "locator": locator, "wrapped": wrapped })
+            })
+            .collect();
+        let tags = vec![
+            vec!["scope".to_string(), rekey::ROOT_SCOPE_HEX.into()],
+            vec!["newepoch".into(), new_epoch.to_string()],
+            vec!["prevepoch".into(), prev_epoch.to_string()],
+            vec!["prevcommit".into(), to_hex(&epoch_key_commitment(prev_epoch, &prev_root))],
+            vec!["chunk".into(), "1".into(), "1".into()],
+        ];
+        let tags = tags.into_iter().chain(vac.map(|c| c.to_tag())).collect();
+        let rumor = crate::rumor::Rumor::new(crate::kinds::REKEY, serde_json::Value::Array(list).to_string(), tags, &me, Some(10_000_000), None);
+        let address: StreamKey = (&base_rekey_group_key(&prev_root, &m.id(), new_epoch)).into();
+        let wrap = seal_and_wrap(&rumor, Plane::Rekey, &address, rotator, WrapOptions::default()).unwrap();
+        group_rotations(vec![parse_rekey(&open_plane_wrap(&wrap, &address, Plane::Rekey).unwrap()).unwrap()])
+    }
+
+    fn blob(m: &Membership, epoch: u64, root: &Bytes32, width: usize) -> Vec<u8> {
+        let mut p = vec![0u8; 32];
+        p.extend_from_slice(&epoch.to_be_bytes());
+        p.extend_from_slice(root);
+        let control_root = random32();
+        p.extend_from_slice(&crate::derive::control_signer_group_key(&control_root, &m.id(), epoch).keys.public_key().to_bytes());
+        p.extend_from_slice(&control_root);
+        p.resize(width, 7);
+        p
+    }
+
+    fn world() -> (Membership, Keys, Keys, FoldedControl) {
+        let owner = Keys::generate();
+        let me = Keys::generate();
+        let mut m = Membership::mint("t", &owner.public_key().to_hex(), vec![], 0);
+        m.joined_at_ms = 0;
+        let f = FoldedControl { owner: owner.public_key().to_hex(), ..Default::default() };
+        (m, owner, me, f)
+    }
+
+    #[test]
+    fn a_blob_that_wont_open_or_no_blob_at_all_is_never_a_removal() {
+        let (mut m, owner, me, f) = world();
+        let other = Keys::generate();
+        // A blob at our locator in a form we can't read.
+        let junk = rotation(&m, &owner, &[(&me, vec![1, 2, 3]), (&other, blob(&m, 1, &random32(), 136))], None);
+        assert_eq!(m.apply_base_rotations(&junk, &f, &me), RekeyOutcome::Nothing);
+        let empty = rotation(&m, &owner, &[], None);
+        assert_eq!(m.apply_base_rotations(&empty, &f, &me), RekeyOutcome::Nothing);
+        // Left out of a rotation that carries blobs: that is a removal.
+        let without = rotation(&m, &owner, &[(&other, blob(&m, 1, &random32(), 136))], None);
+        assert_eq!(m.apply_base_rotations(&without, &f, &me), RekeyOutcome::Excluded(1));
+    }
+
+    #[test]
+    fn a_wider_base_blob_is_read_by_its_prefix() {
+        let (mut m, owner, me, f) = world();
+        let root = random32();
+        let r = rotation(&m, &owner, &[(&me, blob(&m, 1, &root, 168))], None);
+        assert_eq!(m.apply_base_rotations(&r, &f, &me), RekeyOutcome::AdoptedRoot(1));
+        assert_eq!(m.root, to_hex(&root));
+        assert!(m.control_root.is_some(), "the 136-byte prefix still derives");
+        let (mut m2, owner2, me2, f2) = world();
+        let r = rotation(&m2, &owner2, &[(&me2, blob(&m2, 1, &random32(), 120))], None);
+        assert_eq!(m2.apply_base_rotations(&r, &f2, &me2), RekeyOutcome::Nothing, "a width between forms is malformed");
+    }
+
+    #[test]
+    fn a_moderators_rotation_that_skips_the_owner_is_neither_adopted_nor_a_removal() {
+        let (mut m, owner, me, mut f) = world();
+        let moderator = Keys::generate();
+        let role = Role::new(&"aa".repeat(32), "Mod", 2, perm::BAN, RoleScope::Server);
+        f.roster.roles.push(role.clone());
+        f.roster.grants.push(MemberGrant { member: moderator.public_key().to_hex(), role_ids: vec![role.role_id.clone()], control_wrap: None });
+        let eid = crate::derive::grant_locator(&m.id(), &moderator.public_key().to_bytes());
+        f.heads.insert(to_hex(&eid), crate::edition::Head { version: 1, hash: [9; 32] });
+        let vac = crate::edition::Citation { entity_id: eid, version: 1, edition_hash: [9; 32] };
+        let rotation = |m: &Membership, r: &Keys, b: &[(&Keys, Vec<u8>)], p| rotation_citing(m, r, b, p, Some(&vac));
+        let skip = rotation(&m, &moderator, &[(&me, blob(&m, 1, &random32(), 104))], None);
+        assert_eq!(m.apply_base_rotations(&skip, &f, &me), RekeyOutcome::Nothing);
+        let other = Keys::generate();
+        let cut = rotation(&m, &moderator, &[(&other, blob(&m, 1, &random32(), 104))], None);
+        assert_eq!(m.apply_base_rotations(&cut, &f, &me), RekeyOutcome::Nothing, "it can't remove anyone either");
+        let full = rotation(&m, &moderator, &[(&me, blob(&m, 1, &random32(), 104)), (&owner, blob(&m, 1, &random32(), 104))], None);
+        assert_eq!(m.apply_base_rotations(&full, &f, &me), RekeyOutcome::AdoptedRoot(1));
+    }
+
+    /// A public Channel converted to private: its first sealed head at epoch
+    /// 1, the converter's rotation at 1 committing to (0, root).
+    #[test]
+    fn a_converted_channel_is_walked_keyless_and_taken_from_its_rotation() {
+        let (m0, owner, me, mut f) = world();
+        let mut m = m0;
+        let chan_hex = "c7".repeat(32);
+        let chan = b32(&chan_hex);
+        let key = [5u8; 32];
+        let meta = serde_json::Map::from_iter([("name".to_owned(), serde_json::Value::String("ops".into()))]);
+        let content = crate::channel_seal::seal_channel_metadata(&meta, &key, &chan, 1, None, Some(&owner.public_key().to_hex())).unwrap();
+        let sealed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        f.ranked = true;
+        f.roster.everyone = Some(perm::EVERYONE_DEFAULT);
+        let sealed_meta = crate::channel_seal::SealedChannelMeta { epoch: 1, sealed: sealed["sealed"].as_str().unwrap().to_owned(), prev_hex: None };
+        f.channels.insert(chan_hex.clone(), crate::control::FoldedChannel { channel_id_hex: chan_hex.clone(), name: String::new(), private: true, sealed: Some(sealed_meta), ..Default::default() });
+        assert!(m.keyless_targets(&f, &me.public_key().to_hex()).is_empty(), "not let in");
+        f.roster.overwrites.push(crate::roles::Overwrite {
+            scope: chan_hex.clone(),
+            target: crate::roles::OverwriteTarget::Member(me.public_key().to_hex()),
+            allow: perm::VIEW_CHANNEL,
+            deny: 0,
+        });
+        assert_eq!(m.keyless_targets(&f, &me.public_key().to_hex()), vec![(chan_hex.clone(), 1)]);
+        assert!(m.channel_rekey_addresses_with(&f, &me.public_key().to_hex()).iter().any(|(_, c, e)| *c == chan_hex && *e == 1));
+
+        let root = m.root_key();
+        let rotate = |new_key: &Bytes32| {
+            let rumors = rekey::build_channel_rotation(&owner, &chan, 1, 0, &root, new_key, &[me.public_key().to_hex()], 10_000, None).unwrap();
+            let address: StreamKey = (&channel_rekey_group_key(&root, &chan, 1)).into();
+            let parsed = rumors.iter().map(|r| parse_rekey(&open_plane_wrap(&seal_and_wrap(r, Plane::Rekey, &address, &owner, WrapOptions::default()).unwrap(), &address, Plane::Rekey).unwrap()).unwrap()).collect();
+            group_rotations(parsed)
+        };
+        // A key the seal doesn't open is someone's own, not the Channel's.
+        assert!(m.apply_channel_rotations(&rotate(&[6; 32]), &f, &me).is_empty());
+        assert_eq!(m.apply_channel_rotations(&rotate(&key), &f, &me), vec![(chan_hex.clone(), Some(1))]);
+        assert_eq!(m.private_channels[0].key, to_hex(&key));
+    }
+
+    #[test]
+    fn the_held_epoch_heals_down_to_a_lower_sibling_only() {
+        let (mut m, owner, me, f) = world();
+        let (prior_epoch, prior_root) = (m.root_epoch, m.root_key());
+        let mut high = [0xffu8; 32];
+        high[31] = 0xfe;
+        let r = rotation(&m, &owner, &[(&me, blob(&m, 1, &high, 104))], None);
+        assert_eq!(m.apply_base_rotations(&r, &f, &me), RekeyOutcome::AdoptedRoot(1));
+        let address = m.current_base_rekey_address().unwrap();
+        assert_eq!(address.pubkey(), base_rekey_group_key(&prior_root, &m.id(), 1).pubkey());
+
+        let other = Keys::generate();
+        let higher = rotation(&m, &other, &[(&me, blob(&m, 1, &[0xff; 32], 104))], Some((prior_epoch, prior_root)));
+        assert!(!m.heal_base_sibling(&higher, &f, &me), "the rotator holds no BAN");
+        let higher = rotation(&m, &owner, &[(&me, blob(&m, 1, &[0xff; 32], 104))], Some((prior_epoch, prior_root)));
+        assert!(!m.heal_base_sibling(&higher, &f, &me), "never up");
+        let low = [1u8; 32];
+        let lower = rotation(&m, &owner, &[(&me, blob(&m, 1, &low, 104))], Some((prior_epoch, prior_root)));
+        assert!(m.heal_base_sibling(&lower, &f, &me));
+        assert_eq!((m.root.clone(), m.root_epoch), (to_hex(&low), 1));
+        assert_eq!(m.held_roots[0].key, to_hex(&low));
+        assert_eq!(m.held_roots[0].control_pk, m.control_pk);
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+    use crate::control::{build_metadata_edition, seal_edition};
+    use crate::edition::{EditionMeta, parse_edition};
+    use crate::kinds::Plane;
+    use crate::stream::open_plane_wrap;
+    use nostr::prelude::Keys;
+
+    fn editions(m: &Membership, rumors: &[(&crate::rumor::Rumor, &Keys)]) -> Vec<crate::edition::Edition> {
+        let w = m.control_write_stream().unwrap();
+        rumors.iter().map(|(r, k)| parse_edition(open_plane_wrap(&seal_edition(r, &w, k).unwrap(), &m.current_control_stream(), Plane::Control).unwrap()).unwrap()).collect()
+    }
+
+    #[test]
+    fn a_root_is_taken_only_with_the_owners_genesis_under_it() {
+        let owner = Keys::generate();
+        let m = Membership::mint("t", &owner.public_key().to_hex(), vec![], 0);
+        let owner_hex = owner.public_key().to_hex();
+        let genesis = build_metadata_edition(&m.id(), &serde_json::json!({ "name": "t" }), &EditionMeta::first(&owner_hex, None)).unwrap();
+        assert_eq!(authenticate_root(&m, &[]), RootVerdict::Unread);
+        assert_eq!(authenticate_root(&m, &editions(&m, &[(&genesis, &owner)])), RootVerdict::Anchored);
+        // An ex-member pairs the real identity with a root of their own, and
+        // re-signs a metadata edition there: not the owner's.
+        let forger = Keys::generate();
+        let forged = build_metadata_edition(&m.id(), &serde_json::json!({ "name": "t" }), &EditionMeta::first(&forger.public_key().to_hex(), None)).unwrap();
+        assert_eq!(authenticate_root(&m, &editions(&m, &[(&forged, &forger)])), RootVerdict::Forged);
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    #[test]
+    fn a_public_channels_published_planes_are_read_after_its_own() {
+        let m = Membership::mint("t", &"aa".repeat(32), vec![], 0);
+        let chan = "c3".repeat(32);
+        let secret = "11".repeat(32);
+        let raw = serde_json::json!({ "name": "c", "private": false, "history": [[3, secret], [4, "not hex"], "junk"] });
+        let mut f = FoldedControl { owner: m.owner.clone(), ..Default::default() };
+        f.channels.insert(chan.clone(), crate::control::FoldedChannel { channel_id_hex: chan.clone(), name: "c".into(), raw, ..Default::default() });
+        let view = m.channels(Some(&f)).into_iter().find(|c| c.id_hex == chan).unwrap();
+        assert_eq!(view.streams.len(), 2, "its root plane, then the one well-formed published plane");
+        assert_eq!(view.streams[1].epoch, 3);
+        assert_eq!(view.current().epoch, 0, "writes still go to the root plane");
+        let sk = nostr::prelude::SecretKey::from_slice(&hex32(&secret).unwrap()).unwrap();
+        assert_eq!(view.streams[1].key.pubkey(), GroupKey::from_secret(sk).pubkey());
+    }
 }

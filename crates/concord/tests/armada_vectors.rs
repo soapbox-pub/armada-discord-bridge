@@ -285,7 +285,7 @@ fn ranked_fold_matches_armada() {
     let writer = StreamKey { pk: concord::nostr::prelude::PublicKey::from_hex(r["writer_pk"].as_str().unwrap()).unwrap(), conv_key: read_key.conv_key, sk: None, restricted: false };
     let post = open_plane_wrap(&event(&r["post_wrap"]), &writer, Plane::Chat).unwrap();
     check_channel_binding(&post.rumor, ann, 0).unwrap();
-    let stands = concord::writers::post_stands(ledger, &cid, post.author(), post.ms, &post.rumor.tags);
+    let stands = concord::writers::post_stands(ledger, &cid, post.author(), post.rumor.kind, post.ms, &post.rumor.tags);
     assert_eq!(stands, want["post_stands"].as_bool().unwrap());
     assert!(stands);
     // Bob, let in by a member overwrite, takes the sealed channel's key from
@@ -305,7 +305,7 @@ fn ranked_fold_matches_armada() {
     assert!(!concord::delivery::access_delivery_admits(&folded, Some(sealed), secret, k["alice"].as_str().unwrap(), &d.deliverer, 1));
 
     let stray = open_plane_wrap(&event(&r["stray_wrap"]), &(&read_key).into(), Plane::Chat).unwrap();
-    let stray_stands = concord::writers::post_stands(ledger, &cid, stray.author(), stray.ms, &stray.rumor.tags);
+    let stray_stands = concord::writers::post_stands(ledger, &cid, stray.author(), stray.rumor.kind, stray.ms, &stray.rumor.tags);
     assert_eq!(stray_stands, want["stray_stands"].as_bool().unwrap());
     assert!(!stray_stands);
 }

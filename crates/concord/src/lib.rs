@@ -28,6 +28,7 @@ pub mod roster;
 pub mod rumor;
 pub mod strict;
 pub mod stream;
+pub mod writer_keys;
 pub mod writers;
 
 pub use nostr;

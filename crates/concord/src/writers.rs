@@ -332,6 +332,71 @@ pub fn locked_at(l: &Ledger, at_ms: u64) -> bool {
     l.entries.iter().rev().find(|e| e.at <= at_ms && e.spell.moves()).is_some_and(entry_locked)
 }
 
+/// A Channel's sealed history (CORD-03 §1): what its read address held before
+/// `until` (unix ms) is exactly what its pages list. `run` is when the run of
+/// Locked windows it was made in began. Carried in the ledger's `extra`, as
+/// it rides the top level where the cap never reaches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealRef {
+    pub page: Option<String>,
+    pub read: u64,
+    pub until: u64,
+    pub run: u64,
+    pub count: u64,
+}
+
+/// The ledger's seal, or `None` for one that lacks a field or reaches past ten
+/// minutes into its run (Armada `parseSealRef`).
+pub fn ledger_seal(l: &Ledger) -> Option<SealRef> {
+    let o = l.extra.get("seal")?.as_object()?;
+    let page = match o.get("page")? {
+        Value::Null => None,
+        Value::String(s) if is_hex64(s) => Some(s.to_lowercase()),
+        _ => return None,
+    };
+    let num = |k: &str| o.get(k).and_then(Value::as_u64);
+    let (read, until, run, count) = (num("read")?, num("until")?, num("run")?, num("count")?);
+    (until <= run + LEDGER_ENTRY_SKEW_MS).then_some(SealRef { page, read, until, run, count })
+}
+
+/// The dates the read address holds nothing a reader needs (Armada
+/// `quietSpans`): each run of Locked windows from ten minutes past its start,
+/// and the seal's run likewise. Sorted and disjoint; `to` absent while running.
+pub fn quiet_spans(l: &Ledger) -> Vec<(u64, Option<u64>)> {
+    let moving: Vec<&LedgerEntry> = l.entries.iter().filter(|e| e.spell.moves()).collect();
+    let end_after = |at: u64| moving.iter().find(|e| e.at > at && !entry_locked(e)).map(|e| e.at);
+    let mut spans: Vec<(u64, Option<u64>)> = Vec::new();
+    for (i, e) in moving.iter().enumerate() {
+        if entry_locked(e) && (i == 0 || !entry_locked(moving[i - 1])) {
+            spans.push((e.at + LEDGER_ENTRY_SKEW_MS, end_after(e.at)));
+        }
+    }
+    if let Some(seal) = ledger_seal(l) {
+        spans.push((seal.run + LEDGER_ENTRY_SKEW_MS, end_after(seal.run)));
+    }
+    spans.retain(|(from, to)| to.is_none_or(|t| t > *from));
+    spans.sort_by_key(|s| s.0);
+    let mut out: Vec<(u64, Option<u64>)> = Vec::new();
+    for (from, to) in spans {
+        match out.last_mut() {
+            Some(last) if last.1.is_none_or(|t| t >= from) => {
+                last.1 = match (last.1, to) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                };
+            }
+            _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
+/// Whether nothing a reader needs sits at the read address at `at_ms`: a
+/// reader takes nothing there then, a wrap backdated into it included.
+pub fn read_address_quiet(l: &Ledger, at_ms: u64) -> bool {
+    quiet_spans(l).iter().any(|(from, to)| *from <= at_ms && to.is_none_or(|t| at_ms < t))
+}
+
 /// The writer window taking posts now, when the ledger restricts the Channel.
 pub fn current_writer(l: &Ledger) -> Option<Window> {
     if !ledger_restricted(l) {
@@ -396,6 +461,72 @@ pub fn certifier_of(l: &Ledger, epoch: u64) -> Option<String> {
 }
 
 const CERT_LABEL: &[u8] = b"concord/writer-cert";
+const SCOPED_CERT_LABEL: &[u8] = b"concord/writer-cert-scoped";
+
+/// What a member may write at a restricted Channel's writer address (Armada
+/// `Rights`): everything, with Send Messages, or, in a Locked Channel, only the
+/// writes those CORD-04 bits name, and deletions, on a scoped certificate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rights {
+    Full,
+    Scoped(u64),
+}
+
+impl Rights {
+    /// Whether these hold every write `other` does.
+    pub fn covers(self, other: Rights) -> bool {
+        match (self, other) {
+            (Rights::Full, _) => true,
+            (Rights::Scoped(_), Rights::Full) => false,
+            (Rights::Scoped(a), Rights::Scoped(b)) => a & b == b,
+        }
+    }
+}
+
+/// What `member` may write in a Channel when it is `locked` (Armada `rightsOf`):
+/// everything with Send; in a Locked Channel reactions and calls by their own
+/// bits, and a moderator's deletions. `None` for nothing.
+pub fn rights_of(f: &crate::control::FoldedControl, member: &str, channel_id_hex: &str, locked: bool) -> Option<Rights> {
+    let p = f.channel_permissions(member, channel_id_hex);
+    if p & perm::SEND_MESSAGES != 0 {
+        return Some(Rights::Full);
+    }
+    let bits = p & SCOPED_BITS;
+    (locked && (bits != 0 || p & perm::MANAGE_MESSAGES != 0)).then_some(Rights::Scoped(bits))
+}
+
+/// The bits a scoped certificate may carry (CORD-03 §1).
+pub const SCOPED_BITS: u64 = perm::ADD_REACTIONS | perm::CONNECT;
+
+/// Whether a scoped certificate for `rights` covers a write of `kind`: never a post.
+pub fn scope_covers(rights: u64, kind: u16) -> bool {
+    match writer_bit(kind) {
+        None => true,
+        Some(bit) => bit != perm::SEND_MESSAGES && rights & bit != 0,
+    }
+}
+
+/// The scoped certificate a write carries, `["rcert", <sig hex>, <rights decimal>]`,
+/// if its first one is well-formed.
+pub fn scoped_cert_of(tags: &[Vec<String>]) -> Option<(String, u64)> {
+    let t = tags.iter().find(|t| t.first().is_some_and(|n| n == "rcert"))?;
+    let sig = t.get(1).filter(|s| s.len() == 128 && s.bytes().all(|b| b.is_ascii_hexdigit()))?;
+    let rights = t.get(2).and_then(|r| crate::parse_tag_decimal(r))?;
+    Some((sig.to_lowercase(), rights))
+}
+
+/// What a scoped writer certificate signs: one member's place at one epoch,
+/// for only the writes `rights` names (CORD-03 §1).
+pub fn scoped_cert_digest(community_id: &Bytes32, channel_id: &Bytes32, epoch: u64, writer: &Bytes32, rights: u64) -> Bytes32 {
+    let mut h = Sha256::new();
+    h.update(SCOPED_CERT_LABEL);
+    h.update(community_id);
+    h.update(channel_id);
+    h.update(epoch.to_be_bytes());
+    h.update(writer);
+    h.update(rights.to_be_bytes());
+    h.finalize().into()
+}
 
 /// What a writer certificate signs (CORD-03 §1, A.7).
 pub fn cert_digest(community_id: &Bytes32, channel_id: &Bytes32, epoch: u64, writer: &Bytes32) -> Bytes32 {
@@ -439,16 +570,29 @@ pub fn sign_writer_cert(certifier: &SecretKey, digest: &Bytes32) -> String {
 /// if the epoch names a certifier, and not stopped; at the read address,
 /// outside any writer window. The owner's and a manager's posts stand
 /// regardless — the caller's judgement, not the ledger's.
-pub fn post_stands(l: &Ledger, community_id: &Bytes32, author: &str, ms: u64, tags: &[Vec<String>]) -> bool {
+pub fn post_stands(l: &Ledger, community_id: &Bytes32, author: &str, kind: u16, ms: u64, tags: &[Vec<String>]) -> bool {
     let Some(wepoch) = crate::rumor::tag_value(tags, "wepoch") else { return read_address_takes(l, ms) };
     let Some(epoch) = crate::parse_tag_decimal(wepoch) else { return false };
     if !writer_address_takes(l, epoch, ms) || stopped(l, epoch, author, ms) {
         return false;
     }
+    certified_for(l, community_id, epoch, author, kind, tags)
+}
+
+/// Whether a write at writer `epoch` carries a certificate the epoch's
+/// certifier signed that covers it, whole or scoped to the bit its kind
+/// needs; true where the epoch names none (Armada `certifiedFor`).
+pub fn certified_for(l: &Ledger, community_id: &Bytes32, epoch: u64, author: &str, kind: u16, tags: &[Vec<String>]) -> bool {
     let Some(certifier) = certifier_of(l, epoch) else { return true };
-    let Some(cert) = crate::rumor::tag_value(tags, "wcert") else { return false };
     let (Some(channel), Some(writer)) = (hex32(&l.channel), hex32(author)) else { return false };
-    verify_writer_cert(&certifier, &cert_digest(community_id, &channel, epoch, &writer), cert)
+    if let Some(cert) = crate::rumor::tag_value(tags, "wcert")
+        && verify_writer_cert(&certifier, &cert_digest(community_id, &channel, epoch, &writer), cert)
+    {
+        return true;
+    }
+    scoped_cert_of(tags).is_some_and(|(sig, rights)| {
+        scope_covers(rights, kind) && verify_writer_cert(&certifier, &scoped_cert_digest(community_id, &channel, epoch, &writer, rights), &sig)
+    })
 }
 
 #[cfg(test)]
@@ -495,12 +639,12 @@ mod tests {
         let l = ledger_appended(&empty_ledger(&to_hex(&chan)), 1_000, Spell::Writer { epoch: 1, pk: pk(&w), root: 0, by: pk(&by), certifier: Some(pk(&c)) }).unwrap();
         let cert = sign_writer_cert(c.secret_key(), &cert_digest(&cid, &chan, 1, &author.public_key().to_bytes()));
         let tags = vec![vec!["wepoch".into(), "1".into()], vec!["wcert".into(), cert]];
-        assert!(post_stands(&l, &cid, &pk(&author), 5_000, &tags));
-        assert!(!post_stands(&l, &cid, &pk(&author), 5_000, &tags[..1]), "the certificate is required");
-        assert!(!post_stands(&l, &cid, &pk(&author), 5_000, &[]), "the read address is closed");
+        assert!(post_stands(&l, &cid, &pk(&author), kinds::MESSAGE, 5_000, &tags));
+        assert!(!post_stands(&l, &cid, &pk(&author), kinds::MESSAGE, 5_000, &tags[..1]), "the certificate is required");
+        assert!(!post_stands(&l, &cid, &pk(&author), kinds::MESSAGE, 5_000, &[]), "the read address is closed");
         let stopped_l = ledger_appended(&l, 4_000, Spell::Stop { writer: pk(&author) }).unwrap();
-        assert!(!post_stands(&stopped_l, &cid, &pk(&author), 5_000, &tags));
-        assert!(post_stands(&stopped_l, &cid, &pk(&author), 3_000, &tags), "a stop isn't retroactive");
+        assert!(!post_stands(&stopped_l, &cid, &pk(&author), kinds::MESSAGE, 5_000, &tags));
+        assert!(post_stands(&stopped_l, &cid, &pk(&author), kinds::MESSAGE, 3_000, &tags), "a stop isn't retroactive");
     }
 
     #[test]

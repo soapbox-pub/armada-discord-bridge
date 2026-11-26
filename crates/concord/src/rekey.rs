@@ -156,6 +156,11 @@ impl Rotation {
         self.chunks.len() as u64 >= self.chunk_count
     }
 
+    /// Whether any chunk carries a blob: a rotation carrying none removes nobody (CORD-06 §2).
+    pub fn has_blobs(&self) -> bool {
+        self.chunks.values().any(|c| !c.blobs.is_empty())
+    }
+
     pub fn find_blob(&self, locator_hex: &str) -> Option<&Blob> {
         self.chunks.values().flat_map(|c| c.blobs.iter()).find(|b| b.locator == locator_hex)
     }
@@ -253,9 +258,11 @@ pub struct BaseBlob {
     pub control_root: Option<Bytes32>,
 }
 
-/// Parse a 72/104/136-byte base blob.
+/// Parse a 72/104/136-byte base blob. A wider one is a form this revision
+/// predates: its frozen prefix is read, so a new form never forks an older
+/// reader off the Community (CORD-06 §1).
 pub fn decode_base_blob(plain: &[u8], community_id: &Bytes32, epoch: u64) -> Result<BaseBlob, RekeyError> {
-    if !matches!(plain.len(), 72 | 104 | 136) {
+    if !matches!(plain.len(), 72 | 104 | 136) && plain.len() <= 136 {
         return Err(RekeyError::Width(plain.len()));
     }
     if plain[..32] != [0u8; 32] || read_epoch(plain) != epoch {
@@ -270,7 +277,11 @@ pub fn decode_base_blob(plain: &[u8], community_id: &Bytes32, epoch: u64) -> Res
         return Ok(BaseBlob { new_root, control_pk: Some(control_pk), control_root: None });
     }
     let control_root: Bytes32 = plain[104..136].try_into().unwrap();
-    if control_signer_group_key(&control_root, community_id, epoch).pk_hex() != control_pk {
+    let derives = control_signer_group_key(&control_root, community_id, epoch).pk_hex() == control_pk;
+    if plain.len() > 136 {
+        return Ok(BaseBlob { new_root, control_pk: Some(control_pk), control_root: derives.then_some(control_root) });
+    }
+    if !derives {
         return Err(RekeyError::ControlMismatch);
     }
     Ok(BaseBlob { new_root, control_pk: Some(control_pk), control_root: Some(control_root) })

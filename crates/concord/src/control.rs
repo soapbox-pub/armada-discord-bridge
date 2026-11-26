@@ -195,6 +195,19 @@ impl FoldedControl {
         }
     }
 
+    /// Whether a member could time anyone out: the owner, or an unbanned holder
+    /// of MODERATE_MEMBERS. What a Timeout rumor's author must be to be held.
+    pub fn moderates_members(&self, member: &str) -> bool {
+        member == self.owner || (!self.banned.contains(member) && self.roster.has(member, perm::MODERATE_MEMBERS))
+    }
+
+    /// Whether `actor`'s Kick of `target` is honored (CORD-04 §6): KICK, or a
+    /// BAN holder's, over a member they strictly outrank.
+    pub fn may_kick(&self, actor: &str, target: &str) -> bool {
+        !self.banned.contains(actor)
+            && (self.roster.can_act_on_member(actor, &self.owner, target, perm::KICK) || self.roster.can_act_on_member(actor, &self.owner, target, perm::BAN))
+    }
+
     /// The live Writers ledger restricting a Channel, if one does now.
     pub fn restricting_ledger(&self, channel_id_hex: &str) -> Option<&Ledger> {
         self.writers.get(channel_id_hex).filter(|l| crate::writers::ledger_restricted(l))

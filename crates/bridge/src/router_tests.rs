@@ -527,7 +527,7 @@ impl Harness {
         let chan = concord::hex32(&self.channel.id_hex).unwrap();
         let me = to.public_key().to_hex();
         let cert = concord::writers::sign_writer_cert(gate.certifier.secret_key(), &concord::writers::cert_digest(&self.client.community().id(), &chan, 1, &to.public_key().to_bytes()));
-        let wd = WriterDelivery { writer: Some(gate.address.to_hex()), certs: vec![(me.clone(), cert)], mint: false };
+        let wd = WriterDelivery { writer: Some(gate.address.to_hex()), certs: vec![(me.clone(), cert)], ..Default::default() };
         let deliverer = Keys::generate();
         let plane: StreamKey = (&self.client.community().access_plane(&chan)).into();
         let scope = concord::derive::writer_scope(&chan);

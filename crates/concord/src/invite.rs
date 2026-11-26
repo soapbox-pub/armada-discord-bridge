@@ -92,6 +92,9 @@ pub struct InviteBundle {
     pub extra: Map<String, Value>,
 }
 
+/// The longest `label` a joiner echoes (CORD-05 §1).
+pub const BUNDLE_LABEL_MAX_BYTES: usize = 64;
+
 impl InviteBundle {
     /// Bound and verify a decrypted bundle however it arrived (CORD-05 §1/§6).
     pub fn validate(mut self) -> Result<Self, InviteError> {
@@ -110,6 +113,18 @@ impl InviteBundle {
         }
         self.community_id = self.community_id.to_lowercase();
         self.owner = self.owner.to_lowercase();
+        // Read as absent rather than refused (CORD-05 §1): a joiner echoes the
+        // attribution into its Join, and a hostile link could make that too
+        // large for a relay, failing the join.
+        if self.label.as_ref().is_some_and(|l| l.len() > BUNDLE_LABEL_MAX_BYTES) {
+            self.label = None;
+        }
+        if !self.creator_npub.as_deref().is_some_and(crate::is_hex64) {
+            self.creator_npub = None;
+        }
+        if !self.control_pk.as_deref().is_some_and(crate::is_hex64) {
+            self.control_pk = None;
+        }
         Ok(self)
     }
 
@@ -263,6 +278,24 @@ pub fn parse_bundle_event(event: &Event, link: &InviteLink, now_ms: u64) -> Resu
         return Err(InviteError::Expired);
     }
     Ok(bundle)
+}
+
+/// The bundle a link resolves to from every event fetched for its signer
+/// (CORD-05 §2): relays index an empty `d` inconsistently, so it is checked
+/// here rather than filtered by; a revocation tombstone at any `created_at`
+/// revokes the link; otherwise the newest live bundle stands.
+pub fn resolve_bundle(events: &[Event], link: &InviteLink, now_ms: u64) -> Result<InviteBundle, InviteError> {
+    let ours: Vec<&Event> = events
+        .iter()
+        .filter(|e| e.kind == Kind::Custom(kinds::INVITE_BUNDLE) && e.pubkey.to_hex() == link.link_signer && e.verify().is_ok())
+        .filter(|e| e.tags.iter().map(|t| t.as_slice()).find(|t| t.first().is_some_and(|n| n == "d")).is_some_and(|t| t.get(1).is_none_or(|v| v.is_empty())))
+        .collect();
+    let marker = |e: &Event| e.tags.iter().map(|t| t.as_slice()).find(|t| t.first().is_some_and(|n| n == "vsk")).and_then(|t| t.get(1)).cloned();
+    if ours.iter().any(|e| marker(e).as_deref() == Some(kinds::VSK_INVITE_REVOKED)) {
+        return Err(InviteError::Revoked);
+    }
+    let newest = ours.iter().max_by_key(|e| e.created_at).ok_or_else(|| InviteError::BadBundle("the invite's bundle wasn't found on its relays".into()))?;
+    parse_bundle_event(newest, link, now_ms)
 }
 
 /// Build the addressable bundle event, marked live.

@@ -200,7 +200,7 @@ async fn an_approved_member_takes_its_writer_key_and_posts_where_it_stands() {
     let scope = writer_scope(&chan);
     let plane: StreamKey = (&w.community.access_plane(&chan)).into();
     let deliver = |from: &Keys, key: [u8; 32], cert: String| {
-        let wd = WriterDelivery { writer: Some(address.clone()), certs: vec![(me.clone(), cert)], mint: false };
+        let wd = WriterDelivery { writer: Some(address.clone()), certs: vec![(me.clone(), cert)], ..Default::default() };
         for rumor in build_writer_deliveries(from, &scope, 1, &key, std::slice::from_ref(&me), now_ms() / 1000, &wd).unwrap() {
             w.relay.inject(seal_and_wrap(&rumor, Plane::Rekey, &plane, from, Default::default()).unwrap());
         }

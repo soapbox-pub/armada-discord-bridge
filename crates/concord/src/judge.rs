@@ -11,10 +11,10 @@ use std::collections::HashMap;
 
 use crate::Bytes32;
 use crate::control::FoldedControl;
-use crate::guestbook::FoldedTimeout;
+use crate::guestbook::{FoldedTimeout, GuestbookHistory, away_at, is_member_in, kicked_away_in};
 use crate::kinds;
 use crate::roles::perm;
-use crate::writers::{Ledger, ledger_restricted, locked_at, post_stands, read_address_takes, rides_writer_address, writer_windows};
+use crate::writers::{Ledger, ledger_restricted, locked_at, post_stands, read_address_quiet, read_address_takes, rides_writer_address, writer_windows};
 
 /// A message dated more than this ahead of the reader's clock waits for its time (CORD-03 §3).
 pub const FUTURE_HOLD_MS: u64 = 5_000;
@@ -56,49 +56,70 @@ pub fn is_beyond_horizon(ms: u64, now_ms: u64) -> bool {
 }
 
 /// Judge one post in one Channel. `timeouts` is the Guestbook's folded
-/// Timeouts (empty when unread). Membership and departures are not judged:
-/// like Armada with its Guestbook unread, the ledger and the Roster decide.
+/// Timeouts (empty when unread). `history` is the Guestbook's entries
+/// ([`crate::guestbook::guestbook_history`]); while it's unread, membership and
+/// departures aren't judged, as Armada judges with its Guestbook unread.
 ///
 /// `public_until_ms` is when a converted Channel went private (CORD-03 §2,
 /// from its opened seal): a post dated before it was a public post, and isn't
 /// collapsed for a Send Messages the private Channel no longer gives.
+#[allow(clippy::too_many_arguments)]
 pub fn judge_post(
     folded: &FoldedControl,
     community_id: &Bytes32,
     channel_id_hex: &str,
     post: Post,
     timeouts: &HashMap<String, FoldedTimeout>,
+    history: Option<&GuestbookHistory>,
     now_ms: u64,
     public_until_ms: Option<u64>,
 ) -> Verdict {
     if let Some(ledger) = folded.writers.get(channel_id_hex)
-        && !ledger_stands(folded, ledger, community_id, channel_id_hex, &post) {
-            return Verdict::Held;
-        }
+        && !ledger_stands(folded, ledger, community_id, channel_id_hex, &post, history)
+    {
+        return Verdict::Held;
+    }
     if collapses(folded, channel_id_hex, &post, timeouts, now_ms, public_until_ms) { Verdict::Collapsed } else { Verdict::Stands }
 }
 
-/// A restricted Channel's judge (Armada `writerJudge`): a post stands by the
-/// ledger, at an address that takes it, or on the Roster, from a member who
-/// manages Channels or may make that write there and crossed a move of the ledger.
-fn ledger_stands(folded: &FoldedControl, ledger: &Ledger, community_id: &Bytes32, channel_id_hex: &str, m: &Post) -> bool {
+/// Whether readers ignore a reaction by `author` here (CORD-04 §8, Armada
+/// `reactionIgnored`): on the ranked Roster, one whose author lacks
+/// ADD_REACTIONS in the Channel as the Roster stands. Ignored, not deleted,
+/// so a Roster that gives the bit back counts it again.
+pub fn reaction_ignored(folded: &FoldedControl, channel_id_hex: &str, author: &str) -> bool {
+    folded.ranked && folded.channel_permissions(author, channel_id_hex) & perm::ADD_REACTIONS == 0
+}
+
+/// A restricted Channel's judge (Armada `writerJudge`): a write stands by the
+/// ledger, at an address that takes it from a writer who hadn't left, on a
+/// certificate covering its kind, or on the Roster, from a member who manages
+/// Channels or may make it there and crossed a move of the ledger. In a Locked
+/// window every write is judged so, and the read address takes nothing once
+/// its quiet span begins, a wrap backdated into it included.
+fn ledger_stands(folded: &FoldedControl, ledger: &Ledger, community_id: &Bytes32, channel_id_hex: &str, m: &Post, history: Option<&GuestbookHistory>) -> bool {
     let owner = folded.owner.as_str();
     if folded.banned.contains(m.author) && m.author != owner {
         return false;
     }
     let wepoch = crate::rumor::tag_value(m.tags, "wepoch").map(|t| t.parse::<u64>().ok());
     let windows = writer_windows(ledger);
-    let open = read_address_takes(ledger, m.ms);
-    let by_ledger = match wepoch {
-        // In a Locked window reactions and deletions are judged like any write.
-        None => open || !rides_writer_address(m.kind, locked_at(ledger, m.ms)),
-        Some(_) if open => true,
-        Some(_) => post_stands(ledger, community_id, m.author, m.ms, m.tags),
+    let departed = |at: u64| history.is_some_and(|h| away_at(h, m.author, at));
+    let by_ledger = {
+        let quiet = read_address_quiet(ledger, m.ms);
+        let open = read_address_takes(ledger, m.ms);
+        match wepoch {
+            None => !rides_writer_address(m.kind, locked_at(ledger, m.ms) || quiet) || (open && !quiet),
+            Some(e) => {
+                let start = e.and_then(|e| windows.iter().find(|w| w.epoch == e)).map_or(0, |w| w.from);
+                // Dated before its window, the key it rides wasn't given yet.
+                (open && m.ms >= start)
+                    || (post_stands(ledger, community_id, m.author, m.kind, m.ms, m.tags)
+                        && !history.is_some_and(|h| kicked_away_in(h, m.author, start, m.ms))
+                        && !departed(m.ms))
+            }
+        }
     };
-    if by_ledger {
-        return true;
-    }
-    if m.author == owner {
+    if by_ledger || m.author == owner {
         return true;
     }
     let just_past = |edge: u64| edge <= m.ms && m.ms - edge < ENTRY_SKEW_MS;
@@ -107,7 +128,8 @@ fn ledger_stands(folded: &FoldedControl, ledger: &Ledger, community_id: &Bytes32
         Some(e) => Some(w.epoch) == e && w.to.is_some_and(just_past),
     });
     let writes = ledger_restricted(ledger) && crossed_a_move && folded.may_send_kind(m.author, channel_id_hex, m.kind);
-    folded.manages_channels(m.author) || writes
+    let member = history.is_none_or(|h| is_member_in(h, m.author));
+    (folded.manages_channels(m.author) || writes) && member && !departed(m.ms)
 }
 
 /// Posts inside their author's running Timeout, posts after a pause from
@@ -150,18 +172,18 @@ mod tests {
     #[test]
     fn a_member_overwrite_denying_send_collapses_in_an_open_channel() {
         let mut f = folded();
-        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 1), &HashMap::new(), 2, None), Verdict::Stands);
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 1), &HashMap::new(), None, 2, None), Verdict::Stands);
         f.roster.overwrites.push(Overwrite { scope: CHAN.into(), target: OverwriteTarget::Member(ALICE.into()), allow: 0, deny: perm::SEND_MESSAGES });
-        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 1), &HashMap::new(), 2, None), Verdict::Collapsed);
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 1), &HashMap::new(), None, 2, None), Verdict::Collapsed);
     }
 
     #[test]
     fn a_timeout_collapses_inside_its_window_only() {
         let f = folded();
         let t = HashMap::from([(ALICE.to_owned(), FoldedTimeout { by: OWNER.into(), from_secs: 100, until: 200, ms: 100_000, rumor_id: String::new() })]);
-        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 150_000), &t, 160_000, None), Verdict::Collapsed);
-        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 50_000), &t, 160_000, None), Verdict::Stands);
-        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 150_000), &t, 250_000, None), Verdict::Stands, "a lapsed Timeout un-collapses");
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 150_000), &t, None, 160_000, None), Verdict::Collapsed);
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 50_000), &t, None, 160_000, None), Verdict::Stands);
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post(ALICE, 150_000), &t, None, 250_000, None), Verdict::Stands, "a lapsed Timeout un-collapses");
     }
 
     #[test]
@@ -172,9 +194,73 @@ mod tests {
         let spell = || Spell::Writer { epoch: 1, pk: writer.clone(), root: 0, by: OWNER.into(), certifier: None };
         let reaction = Post { author: ALICE, kind: kinds::REACTION, ms: 100_000_000, edited_ms: None, tags: &[] };
         f.writers.insert(CHAN.into(), ledger_appended(&empty_ledger(CHAN), 1_000, spell()).unwrap());
-        assert_eq!(judge_post(&f, &[0; 32], CHAN, reaction, &HashMap::new(), 100_000_000, None), Verdict::Stands, "reactions stay at the read address");
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, reaction, &HashMap::new(), None, 100_000_000, None), Verdict::Stands, "reactions stay at the read address");
         f.writers.insert(CHAN.into(), ledger_appended_locked(&empty_ledger(CHAN), 1_000, spell()).unwrap());
-        assert_eq!(judge_post(&f, &[0; 32], CHAN, reaction, &HashMap::new(), 100_000_000, None), Verdict::Held, "a Locked window takes them only from writers");
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, reaction, &HashMap::new(), None, 100_000_000, None), Verdict::Held, "a Locked window takes them only from writers");
+    }
+
+    #[test]
+    fn a_reaction_without_add_reactions_is_ignored_on_the_ranked_roster_only() {
+        let mut f = folded();
+        assert!(!reaction_ignored(&f, CHAN, ALICE));
+        f.roster.overwrites.push(Overwrite { scope: CHAN.into(), target: OverwriteTarget::Member(ALICE.into()), allow: 0, deny: perm::ADD_REACTIONS });
+        assert!(reaction_ignored(&f, CHAN, ALICE));
+        assert!(!reaction_ignored(&f, CHAN, OWNER));
+        f.ranked = false;
+        assert!(!reaction_ignored(&f, CHAN, ALICE));
+    }
+
+    fn certified_ledger(f: &mut FoldedControl, certifier: &nostr::prelude::Keys, writer: &nostr::prelude::Keys) -> String {
+        use crate::writers::{Spell, empty_ledger, ledger_appended_locked};
+        let spell = Spell::Writer { epoch: 1, pk: writer.public_key().to_hex(), root: 0, by: OWNER.into(), certifier: Some(certifier.public_key().to_hex()) };
+        f.writers.insert(CHAN.into(), ledger_appended_locked(&empty_ledger(CHAN), 1_000, spell).unwrap());
+        writer.public_key().to_hex()
+    }
+
+    #[test]
+    fn a_scoped_certificate_carries_a_reaction_but_never_a_post() {
+        use crate::writers::{SCOPED_BITS, scoped_cert_digest, sign_writer_cert};
+        let mut f = folded();
+        let (certifier, address, bob) = (nostr::prelude::Keys::generate(), nostr::prelude::Keys::generate(), nostr::prelude::Keys::generate());
+        certified_ledger(&mut f, &certifier, &address);
+        let digest = scoped_cert_digest(&[0; 32], &crate::hex32(CHAN).unwrap(), 1, &bob.public_key().to_bytes(), SCOPED_BITS);
+        let tags = vec![vec!["wepoch".to_string(), "1".into()], vec!["rcert".into(), sign_writer_cert(certifier.secret_key(), &digest), SCOPED_BITS.to_string()]];
+        let bob_hex = bob.public_key().to_hex();
+        let at = |kind| Post { author: &bob_hex, kind, ms: 5_000, edited_ms: None, tags: &tags };
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, at(kinds::REACTION), &HashMap::new(), None, 5_000, None), Verdict::Stands);
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, at(kinds::MESSAGE), &HashMap::new(), None, 5_000, None), Verdict::Held);
+    }
+
+    #[test]
+    fn a_kicked_writer_with_a_kept_key_is_held() {
+        use crate::guestbook::{Coalesced, MemberState};
+        use crate::writers::{cert_digest, sign_writer_cert};
+        let mut f = folded();
+        let (certifier, address, bob) = (nostr::prelude::Keys::generate(), nostr::prelude::Keys::generate(), nostr::prelude::Keys::generate());
+        certified_ledger(&mut f, &certifier, &address);
+        let bob_hex = bob.public_key().to_hex();
+        let cert = sign_writer_cert(certifier.secret_key(), &cert_digest(&[0; 32], &crate::hex32(CHAN).unwrap(), 1, &bob.public_key().to_bytes()));
+        let tags = vec![vec!["wepoch".to_string(), "1".into()], vec!["wcert".into(), cert]];
+        let post = Post { author: &bob_hex, kind: kinds::MESSAGE, ms: 9_000, edited_ms: None, tags: &tags };
+        let entry = |state, ms| Coalesced { pubkey: bob_hex.clone(), state, ms, rumor_id: format!("{ms}"), from_snapshot: false };
+        let mut h = HashMap::from([(bob_hex.clone(), vec![entry(MemberState::Join, 500)])]);
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post, &HashMap::new(), Some(&h), 9_000, None), Verdict::Stands);
+        h.get_mut(&bob_hex).unwrap().push(entry(MemberState::Kick, 7_000));
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post, &HashMap::new(), Some(&h), 9_000, None), Verdict::Held, "kicked, the key kept");
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post, &HashMap::new(), None, 9_000, None), Verdict::Stands, "with the Guestbook unread nothing is judged");
+    }
+
+    #[test]
+    fn a_post_backdated_into_a_sealed_run_is_held() {
+        use crate::writers::{Spell, empty_ledger, ledger_appended};
+        let mut f = folded();
+        let mut l = ledger_appended(&empty_ledger(CHAN), 1_000, Spell::Open).unwrap();
+        let post = Post { author: ALICE, kind: kinds::MESSAGE, ms: 2_000_000, edited_ms: None, tags: &[] };
+        f.writers.insert(CHAN.into(), l.clone());
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post, &HashMap::new(), None, 3_000_000, None), Verdict::Stands);
+        l.extra.insert("seal".into(), serde_json::json!({ "page": null, "read": 0, "until": 1_000_000, "run": 1_000_000, "count": 0 }));
+        f.writers.insert(CHAN.into(), l);
+        assert_eq!(judge_post(&f, &[0; 32], CHAN, post, &HashMap::new(), None, 3_000_000, None), Verdict::Held);
     }
 
     #[test]

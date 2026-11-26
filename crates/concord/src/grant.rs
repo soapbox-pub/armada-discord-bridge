@@ -128,6 +128,8 @@ pub enum GrantRefused {
     Staff,
     #[error("the Role isn't beneath the granter's")]
     RoleAbove,
+    #[error("the member already holds the Role")]
+    Held,
     #[error("the member holds as many Roles as one may")]
     TooMany,
     #[error(transparent)]
@@ -156,7 +158,20 @@ pub fn plan_grant(f: &FoldedControl, community_id: &Bytes32, actor: &str, member
     if !may_grant(f, actor, role) {
         return Err(GrantRefused::RoleAbove);
     }
-    let mut role_ids = f.roster.grants.iter().find(|g| g.member == member).map(|g| g.role_ids.clone()).unwrap_or_default();
+    // From the Grant's head as written, not the fold: the fold keeps only Roles
+    // this reader resolves, and dropping one it can't (unread, past the cap)
+    // would make this edit a strip for readers who can, with no Tenure (CORD-04 §9).
+    let written = f.head_editions.get(&eid).and_then(|e| MemberGrant::from_json(&e.content)).map(|g| g.role_ids);
+    let mut role_ids: Vec<String> = Vec::new();
+    for id in written.unwrap_or_else(|| f.roster.grants.iter().find(|g| g.member == member).map(|g| g.role_ids.clone()).unwrap_or_default()) {
+        let id = id.to_lowercase();
+        if !role_ids.contains(&id) {
+            role_ids.push(id);
+        }
+    }
+    if role_ids.contains(&role.role_id.to_lowercase()) {
+        return Err(GrantRefused::Held);
+    }
     if role_ids.len() >= MAX_ROLES_PER_MEMBER {
         return Err(GrantRefused::TooMany);
     }
@@ -314,6 +329,25 @@ mod tests {
         named.roster.roles.iter_mut().filter(|r| r.name == "Matrix").for_each(|r| r.permissions |= perm::KICK);
         assert_eq!(plain_role_named(&named, &["Matrix"]), None, "a Role named Matrix that isn't plain isn't taken by name");
         assert!(role_named(&named, "matrix ").is_some(), "but can be named outright");
+    }
+
+    #[test]
+    fn a_role_id_the_fold_cant_resolve_rides_through_the_grant() {
+        let mut w = World::new(perm::MANAGE_ROLES);
+        let f = w.fold();
+        let puppet = Keys::generate().public_key().to_hex();
+        let unknown = "ee".repeat(32);
+        let owner_hex = w.owner.public_key().to_hex();
+        let binding = edition_binding(&w.m.id());
+        let meta = EditionMeta { created_at: Some(1_700_000_001), ..EditionMeta::first(&owner_hex, None) }.marked(&binding);
+        let grant = MemberGrant { member: puppet.clone(), role_ids: vec![unknown.clone()], control_wrap: None };
+        w.put(&build_grant_edition(&w.m.id(), &grant, &meta).unwrap(), &w.owner.clone());
+        let f2 = w.fold();
+        assert!(f2.roster.grants.iter().all(|g| g.member != puppet || !g.role_ids.contains(&unknown)), "the fold doesn't resolve it");
+        let matrix = f.roster.role(&w.matrix.role_id).cloned().unwrap();
+        let rumor = plan_grant(&f2, &w.m.id(), &w.bot_hex(), &puppet, &matrix).unwrap();
+        let written = MemberGrant::from_json(&rumor.content).unwrap();
+        assert_eq!(written.role_ids, vec![unknown, matrix.role_id.to_lowercase()]);
     }
 
     #[test]

@@ -35,6 +35,8 @@ pub struct ParsedDelivery {
     pub writer: Option<String>,
     /// Writer certificates as carried, `(recipient, cert)`.
     pub certs: Vec<(String, String)>,
+    /// Scoped writer certificates as carried, `(recipient, cert, rights)` (CORD-03 §1).
+    pub scoped: Vec<(String, String, u64)>,
     pub blobs: Vec<Blob>,
 }
 
@@ -75,6 +77,13 @@ pub fn parse_delivery(opened: &Opened) -> Option<ParsedDelivery> {
         .take(MAX_REKEY_BLOBS_RECEIVED)
         .map(|t| (t[1].to_lowercase(), t[2].to_lowercase()))
         .collect();
+    let scoped = r
+        .tags
+        .iter()
+        .filter(|t| t.len() == 4 && t[0] == "rcert" && is_hex64(&t[1]) && t[2].len() == 128 && t[2].bytes().all(|b| b.is_ascii_hexdigit()))
+        .filter_map(|t| Some((t[1].to_lowercase(), t[2].to_lowercase(), parse_tag_decimal(&t[3])?)))
+        .take(MAX_REKEY_BLOBS_RECEIVED)
+        .collect();
     let raw = crate::strict::parse_value(&r.content)?;
     let list = raw.as_array().filter(|a| a.len() <= MAX_REKEY_BLOBS_RECEIVED)?;
     let mut blobs = Vec::with_capacity(list.len());
@@ -84,7 +93,7 @@ pub fn parse_delivery(opened: &Opened) -> Option<ParsedDelivery> {
         }
         blobs.push(Blob { locator: b.get("locator")?.as_str()?.to_owned(), wrapped: b.get("wrapped")?.as_str()?.to_owned() });
     }
-    Some(ParsedDelivery { deliverer: r.pubkey.clone(), form, scope_hex: scope.to_lowercase(), new_epoch, writer, certs, blobs })
+    Some(ParsedDelivery { deliverer: r.pubkey.clone(), form, scope_hex: scope.to_lowercase(), new_epoch, writer, certs, scoped, blobs })
 }
 
 /// Whether a reader adopts a Channel key `deliverer` handed over (CORD-03 §5):
@@ -142,6 +151,8 @@ pub struct WriterDelivery {
     pub writer: Option<String>,
     /// A writer certificate per recipient, `(recipient, cert)`, riding the event carrying its blob.
     pub certs: Vec<(String, String)>,
+    /// A scoped certificate per recipient, `(recipient, cert, rights)` (CORD-03 §1).
+    pub scoped: Vec<(String, String, u64)>,
     /// Each event is a part of the epoch's minting delivery.
     pub mint: bool,
 }
@@ -179,7 +190,7 @@ pub fn build_writer_deliveries(
         blobs.push(serde_json::json!({ "locator": locator, "wrapped": nip44::encrypt_str(&conv, &plain)? }));
         who.push(r);
     }
-    let per_event = if w.certs.is_empty() { DELIVERY_BLOBS_PER_EVENT } else { MAX_CERTIFIED_BLOBS_PER_EVENT };
+    let per_event = if w.certs.is_empty() && w.scoped.is_empty() { DELIVERY_BLOBS_PER_EVENT } else { MAX_CERTIFIED_BLOBS_PER_EVENT };
     let parts = blobs.len().div_ceil(per_event).max(1);
     Ok((0..parts)
         .map(|i| {
@@ -191,6 +202,9 @@ pub fn build_writer_deliveries(
             for r in &who[range.clone()] {
                 if let Some((_, cert)) = w.certs.iter().find(|(recipient, _)| recipient == *r) {
                     tags.push(vec!["cert".into(), (*r).clone(), cert.clone()]);
+                }
+                if let Some((_, cert, rights)) = w.scoped.iter().find(|(recipient, _, _)| recipient == *r) {
+                    tags.push(vec!["rcert".into(), (*r).clone(), cert.clone(), rights.to_string()]);
                 }
             }
             if w.mint {

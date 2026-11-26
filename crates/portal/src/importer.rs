@@ -1396,7 +1396,7 @@ impl Importer {
         let plane: StreamKey = (&community.access_plane(&id)).into();
         let at = now / 1000;
         let writer_scope = concord::derive::writer_scope(&id);
-        let mut rumors = build_writer_deliveries(op, &writer_scope, 1, &writer_secret, &writers, at, &WriterDelivery { writer: Some(writer_pk), certs, mint: true })?;
+        let mut rumors = build_writer_deliveries(op, &writer_scope, 1, &writer_secret, &writers, at, &WriterDelivery { writer: Some(writer_pk), certs, mint: true, ..Default::default() })?;
         let certifier_bytes = certifier.secret_key().to_secret_bytes();
         rumors.extend(build_writer_deliveries(
             op,

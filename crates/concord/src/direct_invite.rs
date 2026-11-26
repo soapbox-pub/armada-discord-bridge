@@ -31,6 +31,16 @@ pub struct DirectInvite {
     pub inviter: String,
     pub bundle: InviteBundle,
     pub created_at: u64,
+    /// The rumor's NIP-40 `expiration`, in seconds.
+    pub expiration: Option<u64>,
+}
+
+impl DirectInvite {
+    /// Its shelf life is the earlier of the bundle's `expires_at` and the
+    /// rumor's `expiration` (CORD-05 §6): past it, joining refuses.
+    pub fn is_expired(&self, now_ms: u64) -> bool {
+        self.bundle.is_expired(now_ms) || self.expiration.is_some_and(|e| now_ms / 1000 >= e)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -100,7 +110,10 @@ pub fn unwrap(wrap: &Event, me: &Keys) -> Option<DirectInvite> {
         return None;
     }
     let bundle: InviteBundle = serde_json::from_str(&rumor.content).ok()?;
-    Some(DirectInvite { inviter: rumor.pubkey, bundle: bundle.validate().ok()?, created_at: rumor.created_at })
+    // The rumor's, as CORD-05 §6 names it, or the wrap's, where Armada puts it.
+    let on_wrap = wrap.tags.iter().map(|t| t.as_slice()).find(|t| t.first().is_some_and(|n| n == "expiration")).and_then(|t| t.get(1)).and_then(|v| crate::parse_tag_decimal(v));
+    let expiration = crate::rumor::tag_value(&rumor.tags, "expiration").and_then(crate::parse_tag_decimal).into_iter().chain(on_wrap).min();
+    Some(DirectInvite { inviter: rumor.pubkey, bundle: bundle.validate().ok()?, created_at: rumor.created_at, expiration })
 }
 
 #[cfg(test)]
