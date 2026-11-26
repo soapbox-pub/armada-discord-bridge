@@ -41,6 +41,7 @@ use crate::env::PortalEnv;
 use crate::relay_guard::filter_public_relays;
 use crate::seal::{seal, unseal};
 
+mod bridged_role;
 mod history_jobs;
 
 /// Every column a bridge row is read with. `bridge_id` is read as text and
@@ -242,10 +243,16 @@ pub fn bridge_commands() -> Vec<BotCommand> {
     vec![
         BotCommand {
             name: "bridge",
-            description: "Manage this channel's Discord bridge. /bridge confirm <code> approves a pending link.",
+            description: "Manage this channel's Discord bridge. /bridge confirm <code> approves a pending link; /bridge role <name> chooses the Role Discord members are given.",
             args: vec![
-                BotCommandArg { name: "action", kind: "choice", description: "What to do", required: true, choices: Some(vec!["confirm"]) },
-                BotCommandArg { name: "code", kind: "string", description: "The 8-character confirm code", required: true, choices: None },
+                BotCommandArg { name: "action", kind: "choice", description: "What to do", required: true, choices: Some(vec!["confirm", "role"]) },
+                BotCommandArg {
+                    name: "code",
+                    kind: "string",
+                    description: "The 8-character confirm code, or the Role Discord members are given (off for none)",
+                    required: false,
+                    choices: None,
+                },
             ],
         },
         BotCommand { name: "help", description: "What this bridge bot does and which commands it answers.", args: vec![] },
@@ -357,6 +364,8 @@ pub struct BridgeManager {
     history_running: Mutex<std::collections::HashSet<String>>,
     /// Boots in progress, and the catch-ups their starts deferred.
     catch_ups: Mutex<(usize, Vec<DeferredCatchUp>)>,
+    /// Gives puppets the bridged Role (`/bridge role`) for every router.
+    admitter: Arc<bridged_role::RoleAdmitter>,
 }
 
 /// A started bridge's catch-up, and when its live routing attached.
@@ -385,6 +394,7 @@ impl BridgeManager {
             discord_calls: DiscordCalls::default(),
             history_running: Mutex::default(),
             catch_ups: Mutex::default(),
+            admitter: Arc::new(bridged_role::RoleAdmitter::new(me.clone())),
         })
     }
 
@@ -1378,6 +1388,9 @@ impl BridgeManager {
             }
             return Ok(());
         }
+        if self.on_role_command(rb, &chat).await {
+            return Ok(());
+        }
         let Some(router) = rb.router() else { return Ok(()) };
         match router.on_concord_chat(&chat, &rb.link).await {
             Err(error) if is_missing_permissions(&error) => {
@@ -1428,7 +1441,11 @@ impl BridgeManager {
         // races the gateway being down. Erroring — never severing — is the
         // point: a missing gateway is not the community going away.
         let adapter = self.adapter().ok_or(GatewayUnavailable)?;
-        let mut router_options = RouterOptions { bridge_edits: options.get("edits") == Some(&Value::Bool(true)), ..Default::default() };
+        let mut router_options = RouterOptions {
+            bridge_edits: options.get("edits") == Some(&Value::Bool(true)),
+            admit: Some(self.admitter.clone()),
+            ..Default::default()
+        };
         if !self.env.blossom_server.is_empty() {
             let servers = bridge::blossom::blossom_servers(&self.env.blossom_server);
             router_options.blobs = Some(Arc::new(bridge::blossom::BlossomStore::new(servers)?));
@@ -1778,7 +1795,7 @@ impl BridgeManager {
     }
 
     fn help_text() -> &'static str {
-        "Commands: /bridge confirm <code> approves a pending bridge link (Armada side)."
+        "Commands (Armada side): /bridge confirm <code> approves a pending bridge link; /bridge role [<name> | off | auto] chooses the Role Discord members are given."
     }
 
     /// Any `/command` posted in a bridged channel is answered, never silently

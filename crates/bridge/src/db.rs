@@ -34,6 +34,7 @@ pub const MIGRATIONS: &[(&str, &str)] = &[
     ("migrations/018_import_history_progress.sql", include_str!("../db/migrations/018_import_history_progress.sql")),
     ("migrations/019_bridge_groups_and_history.sql", include_str!("../db/migrations/019_bridge_groups_and_history.sql")),
     ("migrations/020_import_owner_staff_key.sql", include_str!("../db/migrations/020_import_owner_staff_key.sql")),
+    ("migrations/021_bridged_role.sql", include_str!("../db/migrations/021_bridged_role.sql")),
 ];
 
 pub fn connect(database_url: &str, max_size: usize) -> anyhow::Result<Pool> {
