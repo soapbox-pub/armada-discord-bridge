@@ -35,6 +35,12 @@ never bridged without its community's consent.
   v2 (no overwrite lets Discord members in), bridge Armada → Discord only, and
   the bridge says so once in the Discord channel. Checked against Vector's own
   fixtures as well as Armada's code.
+- **Approval to post** — in a community that requires it, each Discord member
+  is a member like any other: their puppet joins under their Discord name, so
+  Armada's moderators find it under Awaiting approval, and once approved it
+  takes the writer key Armada's writer duty delivers and posts, reacts and
+  deletes at the writer address, Locked channels included. Until then their
+  messages stay on Discord, which the channel is told once.
 - **Refoundings** followed with the bridge's own key, at start and live.
 - **Private channel keys** from Direct Invites, access-plane deliveries and
   channel rotations, read at every start and followed while running; a
