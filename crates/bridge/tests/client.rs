@@ -191,7 +191,7 @@ async fn an_approved_member_takes_its_writer_key_and_posts_where_it_stands() {
     client.set_folded(f.clone());
     let channel = client.channel(&chan_hex).unwrap();
     let refused = client.send_chat(&channel, SendChat::message(&bob, "hi")).await.unwrap_err();
-    assert!(refused.to_string().contains("read-only"), "{refused}");
+    assert!(refused.to_string().contains("writer key hasn't been delivered"), "{refused}");
 
     // The owner hands Bob the epoch's secret and his certificate on the
     // Channel's access plane. Eve, who can reach the plane too, hands him a
@@ -224,6 +224,14 @@ async fn an_approved_member_takes_its_writer_key_and_posts_where_it_stands() {
     let opened = bridge::client::open_chat(&wrap, &channel).expect("opens at the writer address");
     assert_eq!(opened.writer_epoch, Some(1));
     assert!(matches!(client.judge(&opened), concord::judge::Verdict::Stands), "{:?}", client.judge(&opened));
+
+    // A client that never took them reads the deliveries itself when Bob first
+    // posts, as the bridge does for a puppet an Armada moderator approved.
+    let fresh = w.client(Keys::generate());
+    fresh.set_folded(f);
+    let (_, wrap) = fresh.send_chat(&channel, SendChat::message(&bob, "hi again")).await.unwrap();
+    assert_eq!(wrap.pubkey.to_hex(), address);
+    assert!(fresh.held_writers_of(&me).contains_key(&format!("{chan_hex}:1")));
 }
 
 #[tokio::test]

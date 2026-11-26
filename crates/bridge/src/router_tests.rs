@@ -459,9 +459,9 @@ async fn a_private_armada_channel_on_ranked_roles_takes_nothing_from_puppets() {
     // No overwrite lets a puppet in, so Armada would collapse its posts. (The
     // harness holds no private key, so this asks the client directly.)
     let puppet = h.puppets.get(USER).unwrap();
-    let refused = h.client.post_refusal(&h.channel, &puppet.pk, kinds::MESSAGE).expect("refused");
+    let refused = h.client.post_refusal(&h.channel, &puppet.keys, kinds::MESSAGE).expect("refused");
     assert!(refused.to_string().contains("private"), "{refused}");
-    assert!(h.client.post_refusal(&h.channel, &puppet.pk, kinds::REACTION).is_none(), "reactions stay at the read address");
+    assert!(h.client.post_refusal(&h.channel, &puppet.keys, kinds::REACTION).is_none(), "reactions stay at the read address");
 }
 
 #[tokio::test]
@@ -476,6 +476,139 @@ async fn a_member_denied_send_messages_is_collapsed_and_not_mirrored() {
     assert!(h.router.on_concord_chat(&muted, &h.link).await.unwrap().is_empty());
     let other = h.chat(&Keys::generate(), kinds::MESSAGE, "hi", vec![]);
     assert_eq!(h.router.on_concord_chat(&other, &h.link).await.unwrap().len(), 1);
+}
+
+// ── Approval to post ────────────────────────────────────────────────────────
+
+/// What turning on "Require approval to post" leaves (Armada `approvalGate.ts`):
+/// `@everyone` can't post, react or join calls, a plain Role can, and the
+/// Channel is Locked at writer epoch 1.
+struct Gate {
+    secret: [u8; 32],
+    certifier: Keys,
+    role: String,
+    address: PublicKey,
+}
+
+use concord::derive::channel_writer_group_key;
+use nostr::prelude::PublicKey;
+
+impl Harness {
+    fn gate(&self) -> Gate {
+        use concord::writers::{Spell, empty_ledger, ledger_appended_locked};
+        self.rank();
+        let mut f = (*self.client.folded().unwrap()).clone();
+        let takes = perm::SEND_MESSAGES | perm::SEND_IN_THREADS | perm::ATTACH_FILES | perm::ADD_REACTIONS | perm::CONNECT;
+        f.roster.everyone = Some(perm::EVERYONE_DEFAULT & !takes);
+        let role = hex::encode([5u8; 32]);
+        let mut verified = Role::new(&role, "Verified", 2, takes, RoleScope::Server);
+        verified.rank = Some("a".into());
+        f.roster.roles.push(verified);
+        let chan = self.channel.id_hex.clone();
+        let (secret, certifier) = ([42u8; 32], Keys::generate());
+        let address = channel_writer_group_key(&secret, &concord::hex32(&chan).unwrap(), 1).pubkey();
+        let spell = Spell::Writer { epoch: 1, pk: address.to_hex(), root: 0, by: f.owner.clone(), certifier: Some(certifier.public_key().to_hex()) };
+        f.writers.insert(chan.clone(), ledger_appended_locked(&empty_ledger(&chan), now_ms() - 60_000, spell).unwrap());
+        self.client.set_folded(f);
+        Gate { secret, certifier, role, address }
+    }
+
+    /// An Armada moderator approves `member`: a Grant of the approval Role.
+    fn approve(&self, gate: &Gate, member: &Keys) {
+        let mut f = (*self.client.folded().unwrap()).clone();
+        f.roster.grants.push(MemberGrant { member: member.public_key().to_hex(), role_ids: vec![gate.role.clone()], control_wrap: None });
+        self.client.set_folded(f);
+    }
+
+    /// A moderator's writer duty hands `to` the epoch's secret and their
+    /// certificate on the Channel's access plane.
+    fn deliver_writer(&self, gate: &Gate, to: &Keys) {
+        use concord::delivery::{WriterDelivery, build_writer_deliveries};
+        let chan = concord::hex32(&self.channel.id_hex).unwrap();
+        let me = to.public_key().to_hex();
+        let cert = concord::writers::sign_writer_cert(gate.certifier.secret_key(), &concord::writers::cert_digest(&self.client.community().id(), &chan, 1, &to.public_key().to_bytes()));
+        let wd = WriterDelivery { writer: Some(gate.address.to_hex()), certs: vec![(me.clone(), cert)], mint: false };
+        let deliverer = Keys::generate();
+        let plane: StreamKey = (&self.client.community().access_plane(&chan)).into();
+        let scope = concord::derive::writer_scope(&chan);
+        for rumor in build_writer_deliveries(&deliverer, &scope, 1, &gate.secret, &[me], now_ms() / 1000, &wd).unwrap() {
+            self.relay.inject(concord::stream::seal_and_wrap(&rumor, concord::kinds::Plane::Rekey, &plane, &deliverer, Default::default()).unwrap());
+        }
+    }
+
+    /// Every write published at the gate's writer address, opened as Armada reads it.
+    fn writes_at(&self, gate: &Gate) -> Vec<OpenedChat> {
+        let view = self.client.channel(&self.channel.id_hex).unwrap();
+        self.relay.published().iter().filter(|e| e.pubkey == gate.address).map(|e| crate::client::open_chat(e, &view).expect("opens at the writer address")).collect()
+    }
+}
+
+#[tokio::test]
+async fn a_discord_member_posts_once_an_armada_moderator_approves_them() {
+    let h = harness();
+    let gate = h.gate();
+    let puppet = h.puppets.get(USER).unwrap();
+
+    // Not approved yet: nothing is posted, but the puppet joins under its
+    // Discord name, so Armada lists it among the members awaiting approval.
+    assert_eq!(h.router.on_discord_message(discord_msg(), &h.link).await.unwrap(), None);
+    assert_eq!(h.router.on_discord_message(DiscordInboundMessage { id: "2".into(), ..discord_msg() }, &h.link).await.unwrap(), None);
+    assert!(h.chats().is_empty() && h.writes_at(&gate).is_empty());
+    let gb: StreamKey = h.client.community().current_guestbook_stream();
+    assert_eq!(h.relay.published().iter().filter(|e| e.pubkey == gb.pk).count(), 1, "joined once");
+    assert_eq!(h.published_of_kind(0).len(), 1, "named as on Discord");
+    let sent = h.sent();
+    assert_eq!(sent.len(), 1, "the Discord channel is told once");
+    assert!(sent[0].content.contains("Awaiting approval"), "{}", sent[0].content);
+
+    // Approved, and handed the writer key the way Armada's members are: the
+    // next message goes out at the writer address, certified, and stands.
+    h.approve(&gate, &puppet.keys);
+    h.deliver_writer(&gate, &puppet.keys);
+    let id = h.router.on_discord_message(DiscordInboundMessage { id: "3".into(), ..discord_msg() }, &h.link).await.unwrap().expect("bridged");
+    let posts = h.writes_at(&gate);
+    assert_eq!(posts.len(), 1);
+    assert_eq!((posts[0].rumor_id(), posts[0].author(), posts[0].writer_epoch), (id.as_str(), puppet.pk.as_str(), Some(1)));
+    assert_eq!(h.client.judge(&posts[0]), Verdict::Stands);
+
+    // The Channel is Locked, so its reaction rides the writer address too.
+    let on_it = DiscordReaction { message_id: "3".into(), ..reaction(USER, "🔥", None) };
+    h.router.on_discord_reaction(&on_it, &h.link).await.unwrap().expect("reacted");
+    let react = h.writes_at(&gate).pop().unwrap();
+    assert_eq!((react.kind(), react.writer_epoch), (kinds::REACTION, Some(1)));
+    assert_eq!(h.client.judge(&react), Verdict::Stands);
+
+    // Someone not approved reacts: not posted, not even at the read address.
+    let theirs = DiscordReaction { message_id: "3".into(), ..reaction("43", "🔥", None) };
+    assert_eq!(h.router.on_discord_reaction(&theirs, &h.link).await.unwrap(), None);
+    assert_eq!(h.writes_at(&gate).len(), 2);
+    assert!(h.chats().is_empty(), "nothing at the read address, which a Locked window ignores");
+}
+
+#[tokio::test]
+async fn a_locked_channel_mirrors_only_the_reactions_its_ledger_stands_behind() {
+    let h = harness();
+    let gate = h.gate();
+    let owner = h.client.folded().unwrap().owner.clone();
+    let rumor = Rumor::new(kinds::MESSAGE, "rules", concord::stream::channel_binding_tags(&h.channel.id_hex, 0), &owner, Some(now_ms()), None);
+    let original = OpenedChat { ms: rumor.created_at * 1000, rumor, channel_id_hex: h.channel.id_hex.clone(), epoch: 0, writer_epoch: None };
+    let ids = h.router.on_concord_chat(&original, &h.link).await.unwrap();
+    assert_eq!(ids.len(), 1, "the owner's post stands at the read address");
+
+    // A reaction left at the read address is held by every Armada reader.
+    let stray = h.chat(&Keys::generate(), kinds::REACTION, "👍", vec![s(&["e", original.rumor_id()])]);
+    h.router.on_concord_chat(&stray, &h.link).await.unwrap();
+    assert!(h.webhooks.reactions.lock().unwrap().is_empty());
+
+    // An approved member's, at the writer address with their certificate, stands.
+    let alice = Keys::generate();
+    let cert = concord::writers::sign_writer_cert(
+        gate.certifier.secret_key(),
+        &concord::writers::cert_digest(&h.client.community().id(), &concord::hex32(&h.channel.id_hex).unwrap(), 1, &alice.public_key().to_bytes()),
+    );
+    let certified = h.chat(&alice, kinds::REACTION, "👍", vec![s(&["e", original.rumor_id()]), s(&["wepoch", "1"]), vec!["wcert".into(), cert]]);
+    h.router.on_concord_chat(&certified, &h.link).await.unwrap();
+    assert_eq!(*h.webhooks.reactions.lock().unwrap(), vec![(ids[0].clone(), "👍".into())]);
 }
 
 #[tokio::test]

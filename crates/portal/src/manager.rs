@@ -1008,7 +1008,7 @@ impl BridgeManager {
             // posting it anyway failed the start, which then retried forever.
             // A manager's `/bridge confirm` there still stands, and the portal
             // shows the code, so the bridge waits for it instead.
-            match client.post_refusal(&channel, &rb.primary().public_key().to_hex(), concord::kinds::MESSAGE) {
+            match client.refusal(&channel, rb.primary(), concord::kinds::MESSAGE).await {
                 Some(refused) => {
                     let detail = format!(
                         "the bridge can't post its confirm request in the Armada channel ({refused}); a member with Manage Channels can still reply there: /bridge confirm {}",

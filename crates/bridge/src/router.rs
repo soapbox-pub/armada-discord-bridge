@@ -255,17 +255,35 @@ impl BridgeRouter {
     /// message looked delivered. Once per channel per process: a restart may
     /// say it again, which beats never.
     async fn notice_refusal(&self, link: &ChannelLink, refused: &crate::client::PostRefused) {
-        if !refused.channel_wide || !self.refusals_noticed.lock().unwrap_or_else(|e| e.into_inner()).insert(link.discord_channel_id.clone()) {
+        let (key, content) = if refused.channel_wide {
+            (link.discord_channel_id.clone(), format!("Messages from this channel aren't reaching Armada: {refused}. Armada messages still arrive here."))
+        } else if refused.awaiting {
+            (
+                format!("awaiting:{}", link.discord_channel_id),
+                "The Armada community approves members before they post. Messages from Discord members it hasn't approved yet don't reach it; \
+                 an Armada moderator can approve them under Awaiting approval, where they're listed by their Discord name, and their messages go through from then on."
+                    .to_owned(),
+            )
+        } else {
+            return;
+        };
+        if !self.refusals_noticed.lock().unwrap_or_else(|e| e.into_inner()).insert(key) {
             return;
         }
-        let message = WebhookMessage {
-            username: "Armada Bridge".into(),
-            content: format!("Messages from this channel aren't reaching Armada: {refused}. Armada messages still arrive here."),
-            ..Default::default()
-        };
+        let message = WebhookMessage { username: "Armada Bridge".into(), content, ..Default::default() };
         if let Err(error) = self.webhooks.send(link, message).await {
             tracing::warn!(channel = %link.discord_channel_id, error = %format!("{error:#}"), "couldn't post the one-way notice");
         }
+    }
+
+    /// Whether a puppet's write of `kind` would not stand in Armada, so isn't
+    /// sent: a reaction or deletion in a Locked channel from a member without
+    /// a writer key, an edit in a read-only one.
+    async fn refused(&self, channel: &ChannelView, author: &Keys, kind: u16, link: &ChannelLink) -> bool {
+        let Some(refused) = self.client.refusal(channel, author, kind).await else { return false };
+        tracing::debug!(channel = %link.discord_channel_id, kind, reason = %refused, "not bridging to Armada");
+        self.notice_refusal(link, &refused).await;
+        true
     }
 
     fn channel(&self, link: &ChannelLink) -> Option<ChannelView> {
@@ -309,11 +327,19 @@ impl BridgeRouter {
         let Some(channel) = self.channel(link) else { return Ok(None) };
 
         let puppet = self.puppets.get(&msg.author.id)?;
-        // A read-only Armada channel takes posts only from its writers, and a
-        // puppet is never one: Armada would hold the post from every reader.
+        // A read-only Armada channel takes posts only from its writers: a
+        // puppet without a writer key would be held from every reader.
         // Checked before any upload, which would be wasted work.
-        if let Some(refused) = self.client.post_refusal(&channel, &puppet.pk, kinds::MESSAGE) {
+        if let Some(refused) = self.client.refusal(&channel, &puppet.keys, kinds::MESSAGE).await {
             tracing::debug!(channel = %link.discord_channel_id, reason = %refused, "not bridging to Armada");
+            // Joined, and named as on Discord, so Armada's moderators find
+            // them among the members awaiting approval.
+            if refused.awaiting {
+                if let Err(error) = self.sync_puppet_profile(&msg.author, &puppet.keys).await {
+                    tracing::warn!(user = %msg.author.id, error = %format!("{error:#}"), "puppet profile publish failed");
+                }
+                self.publish_puppet_join(&msg.author.id, &puppet.keys, None).await;
+            }
             self.notice_refusal(link, &refused).await;
             return Ok(None);
         }
@@ -379,6 +405,9 @@ impl BridgeRouter {
         }
         let Some(channel) = self.channel(link) else { return Ok(None) };
         let puppet = self.puppets.get(&row.author_ref)?;
+        if self.refused(&channel, &puppet.keys, kinds::DELETE, link).await {
+            return Ok(None);
+        }
         let tags = vec![vec!["e".into(), row.concord_rumor_id.clone()], proxy_tag(&del.guild_id, &del.channel_id, &del.id)];
         let send = SendChat { content: String::new(), author: &puppet.keys, kind: kinds::DELETE, tags, ms: None };
         let (rumor, _) = self.client.send_chat(&channel, send).await?;
@@ -401,6 +430,9 @@ impl BridgeRouter {
             return Ok(None);
         }
         let puppet = self.puppets.get(&row.author_ref)?;
+        if self.refused(&channel, &puppet.keys, kinds::EDIT, link).await {
+            return Ok(None);
+        }
         let tags = vec![vec!["e".into(), row.concord_rumor_id.clone()], proxy_tag(&msg.guild_id, &msg.channel_id, &msg.id)];
         let send = SendChat { content, author: &puppet.keys, kind: kinds::EDIT, tags, ms: None };
         let (rumor, _) = self.client.send_chat(&channel, send).await?;
@@ -429,6 +461,9 @@ impl BridgeRouter {
         let Some(channel) = self.channel(link) else { return Ok(None) };
 
         let puppet = self.puppets.get(&reaction.user.id)?;
+        if self.refused(&channel, &puppet.keys, kinds::REACTION, link).await {
+            return Ok(None);
+        }
         if let Err(error) = self.sync_puppet_profile(&reaction.user, &puppet.keys).await {
             tracing::warn!(user = %reaction.user.id, error = %format!("{error:#}"), "puppet profile publish failed");
         }
@@ -473,6 +508,9 @@ impl BridgeRouter {
         }
         let Some(channel) = self.channel(link) else { return Ok(None) };
         let puppet = self.puppets.get(&reaction.user.id)?;
+        if self.refused(&channel, &puppet.keys, kinds::DELETE, link).await {
+            return Ok(None);
+        }
         let tags = vec![
             vec!["e".into(), row.rumor_id.clone()],
             vec!["k".into(), kinds::REACTION.to_string()],
@@ -543,12 +581,16 @@ impl BridgeRouter {
         // member, a pause, a member denied Send Messages, or a post in a
         // read-only channel its Writers ledger doesn't stand behind. Relaying
         // it would make Discord the way around the community's moderation.
-        if matches!(chat.kind(), kinds::MESSAGE | kinds::COMMENT | kinds::EDIT | kinds::TYPING) {
-            let verdict = self.client.judge(chat);
-            if verdict != Verdict::Stands {
-                tracing::debug!(rumor = %&chat.rumor_id()[..8], ?verdict, "not mirroring a post Armada doesn't show");
-                return Ok(vec![]);
-            }
+        // A reaction or deletion answers to the ledger alone, and only in a
+        // Locked window (CORD-03 §1).
+        let judged = match chat.kind() {
+            kinds::MESSAGE | kinds::COMMENT | kinds::EDIT | kinds::TYPING => Some(self.client.judge(chat)).filter(|v| *v != Verdict::Stands),
+            kinds::REACTION | kinds::DELETE => Some(self.client.judge(chat)).filter(|v| *v == Verdict::Held),
+            _ => None,
+        };
+        if let Some(verdict) = judged {
+            tracing::debug!(rumor = %&chat.rumor_id()[..8], ?verdict, "not mirroring a post Armada doesn't show");
+            return Ok(vec![]);
         }
         match chat.kind() {
             kinds::TYPING => {

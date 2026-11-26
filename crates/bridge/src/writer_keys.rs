@@ -1,6 +1,6 @@
 //! Posting in a restricted Channel as one of its writers (CORD-03 §1): the
 //! live writer epoch's secret and this member's certificate, delivered on the
-//! Channel's access plane at its writer scope, and the address and tags a post
+//! Channel's access plane at its writer scope, and the address and tags a write
 //! sends with. A port of the member side of Armada's `writerKeys.ts`
 //! (`usableWriter`, `writerNeeds`, `adoptWriterDeliveries`).
 //!
@@ -8,29 +8,34 @@
 //! Channel of a Community that requires approval to post. A post at its read
 //! address is held from every reader; only one signed by the live writer key
 //! and carrying a certificate from the epoch's certifier stands. So a member
-//! the Roster lets post still can't, until a writer delivery reaches them.
+//! the Roster lets post still can't, until a writer delivery reaches them. In
+//! a Locked Channel (where `@everyone` can't react or join calls either) the
+//! same goes for reactions and deletions.
 //!
-//! Not ported: scoped certificates (a Locked Channel's reactions and calls),
-//! taking the certifier as a manager, and minting a writer epoch. A member
-//! that needs those posts nowhere it couldn't before.
+//! Every identity the bridge posts as is a member like any other here: a
+//! puppet an Armada moderator approved is owed the key by the same writer duty
+//! that serves Armada's members, and takes it the same way.
+//!
+//! Not ported: scoped certificates (writing in a Locked Channel without Send
+//! Messages), taking the certifier as a manager, and minting a writer epoch. A
+//! member that needs those writes nowhere it couldn't before.
 
 use std::collections::BTreeMap;
 
 use concord::community::Membership;
 use concord::control::FoldedControl;
-use concord::delivery::{open_access_key, parse_delivery};
+use concord::delivery::{ParsedDelivery, open_access_key, parse_delivery};
 use concord::derive::{channel_writer_group_key, writer_scope};
 use concord::kinds::{self, Plane};
-use concord::roles::perm;
 use concord::stream::{StreamKey, open_plane_wrap};
-use concord::writers::{Ledger, cert_digest, certifier_of, current_writer, stopped, verify_writer_cert};
+use concord::writers::{Ledger, cert_digest, certifier_of, current_writer, stopped, verify_writer_cert, writer_windows};
 use concord::{Bytes32, hex32, to_hex};
 use nostr::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::relays::{RelayLike, query_all_settled};
 
-/// What this identity holds for one writer epoch, hex: its secret and this
+/// What an identity holds for one writer epoch, hex: its secret and that
 /// member's certificate. Either may arrive before the other.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeldWriter {
@@ -73,10 +78,10 @@ impl UsableWriter {
     }
 }
 
-/// Whether the Channel resolves Send Messages for `me`; a legacy Roster holds
-/// no such bit (Armada `sendsIn`).
-fn sends_in(f: &FoldedControl, channel_id_hex: &str, me: &str) -> bool {
-    !f.ranked || f.channel_permissions(me, channel_id_hex) & perm::SEND_MESSAGES != 0
+/// Whether the Channel lets `me` make a write of `kind`; a legacy Roster holds
+/// no such bit (Armada `maySendKind`, `sendsIn`).
+fn writes_in(f: &FoldedControl, channel_id_hex: &str, me: &str, kind: u16) -> bool {
+    !f.ranked || f.may_send_kind(me, channel_id_hex, kind)
 }
 
 fn secret_derives(secret_hex: &str, channel: &Bytes32, epoch: u64, pk: &str) -> Option<Bytes32> {
@@ -89,14 +94,14 @@ fn cert_verifies(community_id: &Bytes32, ledger: &Ledger, epoch: u64, me: &str, 
     verify_writer_cert(&certifier, &cert_digest(community_id, &channel, epoch, &writer), cert)
 }
 
-/// The live writer key `me` may post with (Armada `usableWriter`): the Roster
-/// lets them send, the secret held derives to the ledger's address, a
-/// certificate the epoch's certifier signed is held where it names one, and
-/// they weren't stopped.
-pub fn usable_writer(f: &FoldedControl, community_id: &Bytes32, channel_id_hex: &str, me: &str, held: &HeldWriters) -> Option<UsableWriter> {
+/// The live writer key `me` may make a write of `kind` with (Armada
+/// `usableWriter`): the Roster lets them make it, the secret held derives to
+/// the ledger's address, a certificate the epoch's certifier signed is held
+/// where it names one, and they weren't stopped.
+pub fn usable_writer(f: &FoldedControl, community_id: &Bytes32, channel_id_hex: &str, me: &str, kind: u16, held: &HeldWriters) -> Option<UsableWriter> {
     let ledger = f.writers.get(channel_id_hex)?;
     let live = current_writer(ledger)?;
-    if !sends_in(f, channel_id_hex, me) {
+    if !writes_in(f, channel_id_hex, me, kind) {
         return None;
     }
     let channel = hex32(channel_id_hex)?;
@@ -126,7 +131,7 @@ pub struct WriterNeed {
 pub fn writer_needs(f: &FoldedControl, community_id: &Bytes32, channel_id_hex: &str, me: &str, held: &HeldWriters) -> Option<WriterNeed> {
     let ledger = f.writers.get(channel_id_hex)?;
     let live = current_writer(ledger)?;
-    if !sends_in(f, channel_id_hex, me) {
+    if !writes_in(f, channel_id_hex, me, kinds::MESSAGE) {
         return None;
     }
     let channel = hex32(channel_id_hex)?;
@@ -136,65 +141,94 @@ pub fn writer_needs(f: &FoldedControl, community_id: &Bytes32, channel_id_hex: &
     (key || cert).then_some(WriterNeed { epoch: live.epoch, pk: live.pk, key, cert })
 }
 
-/// Take what the writer deliveries on each owed Channel's access plane hand
-/// `identity` (Armada `adoptWriterDeliveries`), returning the epochs that
-/// changed. Only deliveries naming the ledger's address for the live epoch
-/// count; a certificate only if the epoch's certifier signed it, whoever
-/// carried it; a secret only if it derives to that address. Those checks are
-/// what make a delivery safe to take from anyone who can reach the plane: a
-/// key of someone else's choosing would sign at an address no reader follows.
-pub async fn intake_writer_keys(relays: &dyn RelayLike, identity: &Keys, community: &Membership, f: &FoldedControl, held: &HeldWriters) -> HeldWriters {
-    let me = identity.public_key().to_hex();
-    let cid = community.id();
-    let owed: Vec<(String, WriterNeed, StreamKey)> = f
-        .writers
-        .keys()
-        .filter_map(|ch| {
-            let need = writer_needs(f, &cid, ch, &me, held)?;
-            Some((ch.clone(), need, (&community.access_plane(&hex32(ch)?)).into()))
-        })
-        .collect();
-    let mut changed = HeldWriters::new();
-    if owed.is_empty() {
-        return changed;
+/// Whether a delivery is one of a Channel's writer deliveries: an access
+/// delivery at its writer scope naming the address of a window the ledger
+/// holds. Only these are worth keeping for later identities to take from.
+pub fn is_writer_delivery(d: &ParsedDelivery, channel_id_hex: &str, ledger: &Ledger) -> bool {
+    let Some(channel) = hex32(channel_id_hex) else { return false };
+    d.form == "access"
+        && d.scope_hex == to_hex(&writer_scope(&channel))
+        && writer_windows(ledger).iter().any(|w| w.epoch == d.new_epoch && d.writer.as_deref() == Some(w.pk.as_str()))
+}
+
+/// Open an access-plane wrap of one of `channels` as a writer delivery.
+pub fn open_writer_delivery(wrap: &Event, community: &Membership, f: &FoldedControl, channel_id_hex: &str) -> Option<ParsedDelivery> {
+    let plane: StreamKey = (&community.access_plane(&hex32(channel_id_hex)?)).into();
+    if wrap.pubkey != plane.pk {
+        return None;
     }
-    relays.register_auth_keys(owed.iter().filter_map(|(_, _, s)| s.sk.clone().map(Keys::new)).collect());
-    // Paged: an access plane carries a delivery per approval, and a Community
-    // approving members by the hundred is exactly the one that needs this.
-    let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).authors(owed.iter().map(|(_, _, s)| s.pk).collect::<Vec<_>>());
-    let wraps = match query_all_settled(relays, filter).await {
-        Ok(w) => w,
-        Err(error) => {
-            tracing::warn!(error = %format!("{error:#}"), "reading writer deliveries failed");
-            return changed;
-        }
+    let d = parse_delivery(&open_plane_wrap(wrap, &plane, Plane::Rekey).ok()?)?;
+    is_writer_delivery(&d, channel_id_hex, f.writers.get(channel_id_hex)?).then_some(d)
+}
+
+/// Read a restricted Channel's writer deliveries off its access plane, from
+/// `since_secs` on. Paged: an access plane carries a delivery per approval,
+/// and a Community approving members by the hundred is exactly the one that
+/// needs this.
+pub async fn fetch_writer_deliveries(relays: &dyn RelayLike, community: &Membership, f: &FoldedControl, channel_id_hex: &str, since_secs: u64) -> anyhow::Result<Vec<ParsedDelivery>> {
+    let Some(channel) = hex32(channel_id_hex) else { return Ok(vec![]) };
+    let plane: StreamKey = (&community.access_plane(&channel)).into();
+    relays.register_auth_keys(plane.sk.clone().map(Keys::new).into_iter().collect());
+    let filter = Filter::new().kind(Kind::Custom(kinds::WRAP)).author(plane.pk).since(Timestamp::from_secs(since_secs));
+    let wraps = query_all_settled(relays, filter).await?;
+    Ok(wraps.iter().filter_map(|w| open_writer_delivery(w, community, f, channel_id_hex)).collect())
+}
+
+/// Take what a Channel's writer deliveries hand `identity` (Armada
+/// `adoptWriterDeliveries`), returning the epochs that changed. Only
+/// deliveries naming the ledger's address for the live epoch count; a
+/// certificate only if the epoch's certifier signed it, whoever carried it; a
+/// secret only if it derives to that address. Those checks are what make a
+/// delivery safe to take from anyone who can reach the plane: a key of
+/// someone else's choosing would sign at an address no reader follows.
+pub fn take_writer_deliveries(deliveries: &[ParsedDelivery], identity: &Keys, community_id: &Bytes32, f: &FoldedControl, channel_id_hex: &str, held: &HeldWriters) -> HeldWriters {
+    let me = identity.public_key().to_hex();
+    let mut changed = HeldWriters::new();
+    let (Some(need), Some(ledger), Some(channel)) =
+        (writer_needs(f, community_id, channel_id_hex, &me, held), f.writers.get(channel_id_hex), hex32(channel_id_hex))
+    else {
+        return changed;
     };
-    for wrap in &wraps {
-        let Some((ch, need, plane)) = owed.iter().find(|(_, _, s)| s.pk == wrap.pubkey) else { continue };
-        let Some(d) = open_plane_wrap(wrap, plane, Plane::Rekey).ok().and_then(|o| parse_delivery(&o)) else { continue };
-        let Some(channel) = hex32(ch) else { continue };
-        let scope = writer_scope(&channel);
+    let scope = writer_scope(&channel);
+    let id = held_id(channel_id_hex, need.epoch);
+    let mut next = held.get(&id).cloned().unwrap_or_default();
+    let had = next.clone();
+    for d in deliveries {
         if d.form != "access" || d.scope_hex != to_hex(&scope) || d.new_epoch != need.epoch || d.writer.as_deref() != Some(need.pk.as_str()) {
             continue;
         }
-        let Some(ledger) = f.writers.get(ch) else { continue };
-        let id = held_id(ch, need.epoch);
-        let mut next = changed.get(&id).or_else(|| held.get(&id)).cloned().unwrap_or_default();
-        let had = next.clone();
         if need.cert
-            && !next.cert.as_deref().is_some_and(|c| cert_verifies(&cid, ledger, need.epoch, &me, c))
-            && let Some((_, cert)) = d.certs.iter().find(|(w, c)| *w == me && cert_verifies(&cid, ledger, need.epoch, &me, c))
+            && !next.cert.as_deref().is_some_and(|c| cert_verifies(community_id, ledger, need.epoch, &me, c))
+            && let Some((_, cert)) = d.certs.iter().find(|(w, c)| *w == me && cert_verifies(community_id, ledger, need.epoch, &me, c))
         {
             next.cert = Some(cert.clone());
         }
         if need.key
             && !next.secret.as_deref().is_some_and(|s| secret_derives(s, &channel, need.epoch, &need.pk).is_some())
-            && let Some((_, secret)) = open_access_key(&d, identity, &scope).filter(|(_, s)| secret_derives(&to_hex(s), &channel, need.epoch, &need.pk).is_some())
+            && let Some((_, secret)) = open_access_key(d, identity, &scope).filter(|(_, s)| secret_derives(&to_hex(s), &channel, need.epoch, &need.pk).is_some())
         {
             next.secret = Some(to_hex(&secret));
         }
-        if next != had {
-            changed.insert(id, next);
+    }
+    if next != had {
+        changed.insert(id, next);
+    }
+    changed
+}
+
+/// Read and take what the writer deliveries on each owed Channel's access
+/// plane hand `identity`, returning the epochs that changed.
+pub async fn intake_writer_keys(relays: &dyn RelayLike, identity: &Keys, community: &Membership, f: &FoldedControl, held: &HeldWriters) -> HeldWriters {
+    let me = identity.public_key().to_hex();
+    let cid = community.id();
+    let mut changed = HeldWriters::new();
+    for ch in f.writers.keys() {
+        if writer_needs(f, &cid, ch, &me, held).is_none() {
+            continue;
+        }
+        match fetch_writer_deliveries(relays, community, f, ch, 0).await {
+            Ok(deliveries) => changed.extend(take_writer_deliveries(&deliveries, identity, &cid, f, ch, held)),
+            Err(error) => tracing::warn!(error = %format!("{error:#}"), "reading writer deliveries failed"),
         }
     }
     changed

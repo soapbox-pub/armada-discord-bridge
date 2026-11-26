@@ -24,14 +24,15 @@ use concord::rumor::Rumor;
 use concord::stream::{
     MAX_EVENT_BYTES, Opened, StreamKey, WrapOptions, check_channel_binding, check_writer_binding, open_plane_wrap, seal_and_wrap, seal_rumor, wrap_seal,
 };
-use concord::writers::rides_writer_address;
+use concord::delivery::ParsedDelivery;
+use concord::writers::{current_writer, ledger_locked, rides_writer_address, writer_bit};
 use nostr::prelude::*;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 
 use crate::recent::RecentIds;
 use crate::relays::{RelayLike, query_all_settled};
-use crate::writer_keys::{HeldWriters, UsableWriter, usable_writer};
+use crate::writer_keys::{HeldWriters, UsableWriter, fetch_writer_deliveries, take_writer_deliveries, usable_writer, writer_needs};
 
 /// NIP-48 tag stamped on every bridge-published rumor:
 /// `["proxy", <discord permalink>, "web"]`. The full URL keeps the origin
@@ -75,12 +76,50 @@ pub struct PostRefused {
     pub reason: &'static str,
     /// Every Discord member's post would be refused here, not one member's.
     pub channel_wide: bool,
+    /// This member could post once an Armada moderator lets them: they lack a
+    /// Role that posts here (approval to post), or hold one and their writer
+    /// key hasn't been delivered yet.
+    pub awaiting: bool,
 }
 
 impl PostRefused {
     fn channel(reason: &'static str) -> PostRefused {
-        PostRefused { reason, channel_wide: true }
+        PostRefused { reason, channel_wide: true, awaiting: false }
     }
+
+    fn awaiting(reason: &'static str) -> PostRefused {
+        PostRefused { reason, channel_wide: false, awaiting: true }
+    }
+}
+
+/// Powers over other members or the Community: a Role holding any is staff's,
+/// not the way a member is let in to post (Armada `isPlainRole`).
+const MANAGEMENT_BITS: u64 = perm::STAFF
+    | perm::KICK
+    | perm::MANAGE_MESSAGES
+    | perm::MUTE_MEMBERS
+    | perm::DEAFEN_MEMBERS
+    | perm::MOVE_MEMBERS
+    | perm::MODERATE_MEMBERS
+    | perm::MANAGE_NICKNAMES;
+
+/// How long a Channel's writer deliveries, as read, answer for an identity
+/// still owed a key before they are read again.
+const WRITER_REREAD: Duration = Duration::from_secs(30);
+
+/// Writer keys by identity, and each restricted Channel's writer deliveries as
+/// last read, for any of this client's identities to take from (CORD-03 §1).
+#[derive(Default)]
+struct WriterBook {
+    held: HashMap<String, HeldWriters>,
+    deliveries: HashMap<String, ReadDeliveries>,
+}
+
+struct ReadDeliveries {
+    /// The live writer epoch they were read for: a new one is read afresh.
+    epoch: u64,
+    at: std::time::Instant,
+    list: Vec<ParsedDelivery>,
 }
 
 /// Every address a Channel's posts arrive at: its read streams and, in a
@@ -225,8 +264,10 @@ pub struct ConcordClient {
     folded: FoldCell,
     keyed: KeyedCache,
     timeouts: TimeoutCell,
-    /// The primary's writer keys for restricted Channels (CORD-03 §1).
-    writers: RwLock<HeldWriters>,
+    /// Every identity's writer keys for restricted Channels (CORD-03 §1).
+    writers: RwLock<WriterBook>,
+    /// Held while the access plane is read, so a burst reads it once.
+    writer_read: tokio::sync::Mutex<()>,
     /// The control editions the last whole read found, by wrap id: what the
     /// live subscription folds its news onto (see `subscribe_control`).
     synced: RwLock<Arc<HashMap<EventId, Edition>>>,
@@ -246,6 +287,7 @@ impl ConcordClient {
             keyed: KeyedCache::default(),
             timeouts: TimeoutCell::default(),
             writers: RwLock::default(),
+            writer_read: tokio::sync::Mutex::default(),
             synced: RwLock::default(),
         })
     }
@@ -264,6 +306,7 @@ impl ConcordClient {
             keyed: KeyedCache::default(),
             timeouts: with.timeouts.clone(),
             writers: RwLock::default(),
+            writer_read: tokio::sync::Mutex::default(),
             synced: RwLock::default(),
         })
     }
@@ -283,34 +326,82 @@ impl ConcordClient {
 
     /// The writer keys the primary holds.
     pub fn held_writers(&self) -> HeldWriters {
-        self.writers.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.held_writers_of(&self.primary_pk())
     }
 
-    /// Hold these writer epochs too, replacing any held under the same id.
+    /// The writer keys an identity holds.
+    pub fn held_writers_of(&self, pk: &str) -> HeldWriters {
+        self.writers.read().unwrap_or_else(|e| e.into_inner()).held.get(pk).cloned().unwrap_or_default()
+    }
+
+    /// Hold these writer epochs for the primary too, replacing any held under the same id.
     pub fn adopt_writers(&self, writers: HeldWriters) {
-        self.writers.write().unwrap_or_else(|e| e.into_inner()).extend(writers);
+        let pk = self.primary_pk();
+        self.writers.write().unwrap_or_else(|e| e.into_inner()).held.entry(pk).or_default().extend(writers);
     }
 
-    /// The live writer key `author_pk` may post with in this Channel. Only
-    /// the primary holds any: a puppet is never anyone's writer.
-    pub fn usable_writer(&self, channel_id_hex: &str, author_pk: &str) -> Option<UsableWriter> {
-        if author_pk != self.primary_pk() {
+    /// The live writer key `author` may make a write of `kind` with in this
+    /// Channel: one it holds, or one the deliveries already read hand it.
+    /// A puppet is a member like any other here, owed a key once an Armada
+    /// moderator lets it post.
+    pub fn writer_for(&self, channel_id_hex: &str, author: &Keys, kind: u16) -> Option<UsableWriter> {
+        let f = self.folded()?;
+        let cid = self.community().id();
+        let me = author.public_key().to_hex();
+        let held = self.held_writers_of(&me);
+        if let Some(w) = usable_writer(&f, &cid, channel_id_hex, &me, kind, &held) {
+            return Some(w);
+        }
+        let mut book = self.writers.write().unwrap_or_else(|e| e.into_inner());
+        let taken = take_writer_deliveries(&book.deliveries.get(channel_id_hex)?.list, author, &cid, &f, channel_id_hex, &held);
+        if taken.is_empty() {
             return None;
         }
-        let f = self.folded()?;
-        usable_writer(&f, &self.community().id(), channel_id_hex, author_pk, &self.writers.read().unwrap_or_else(|e| e.into_inner()))
+        let held = book.held.entry(me.clone()).or_default();
+        held.extend(taken);
+        usable_writer(&f, &cid, channel_id_hex, &me, kind, held)
     }
 
-    /// Where a write of `kind` by `author_pk` goes: the read address, or in a
+    /// Read a restricted Channel's writer deliveries again if `author` is
+    /// owed a key the last read didn't hand it: none was read for the live
+    /// epoch, or not for a while. Only from the live window's start, so a
+    /// Channel's long history of approvals is read once per epoch at most.
+    async fn read_writer_deliveries(&self, channel_id_hex: &str, author: &Keys) {
+        let Some(f) = self.folded() else { return };
+        let Some(live) = f.writers.get(channel_id_hex).and_then(current_writer) else { return };
+        let me = author.public_key().to_hex();
+        let community = self.community();
+        let fresh = |book: &WriterBook| book.deliveries.get(channel_id_hex).is_some_and(|d| d.epoch == live.epoch && d.at.elapsed() < WRITER_REREAD);
+        if writer_needs(&f, &community.id(), channel_id_hex, &me, &self.held_writers_of(&me)).is_none() {
+            return;
+        }
+        let _reading = self.writer_read.lock().await;
+        if fresh(&self.writers.read().unwrap_or_else(|e| e.into_inner())) {
+            return;
+        }
+        let since = live.from.saturating_sub(concord::judge::ENTRY_SKEW_MS) / 1000;
+        let list = match fetch_writer_deliveries(self.relays.as_ref(), &community, &f, channel_id_hex, since).await {
+            Ok(list) => list,
+            Err(error) => {
+                tracing::warn!(channel = %&channel_id_hex[..8.min(channel_id_hex.len())], error = %format!("{error:#}"), "reading writer deliveries failed");
+                Vec::new()
+            }
+        };
+        let read = ReadDeliveries { epoch: live.epoch, at: std::time::Instant::now(), list };
+        self.writers.write().unwrap_or_else(|e| e.into_inner()).deliveries.insert(channel_id_hex.to_owned(), read);
+    }
+
+    /// Where a write of `kind` by `author` goes: the read address, or in a
     /// restricted Channel the live writer address (signed by the writer key,
     /// encrypted under the read key) and the tags committing its epoch and
-    /// certificate (Armada `sendTarget`).
-    fn send_target(&self, channel: &ChannelView, author_pk: &str, kind: u16) -> (StreamKey, Vec<Vec<String>>) {
+    /// certificate (Armada `sendTarget`). In a Locked one reactions and
+    /// deletions go there too.
+    fn send_target(&self, channel: &ChannelView, author: &Keys, kind: u16) -> (StreamKey, Vec<Vec<String>>) {
         let read: StreamKey = (&channel.current().key).into();
-        let restricted = self.folded().is_some_and(|f| f.restricting_ledger(&channel.id_hex).is_some());
-        match self.usable_writer(&channel.id_hex, author_pk) {
-            Some(w) if restricted && rides_writer_address(kind, false) => (w.stream(&read), w.tags()),
-            _ => (read, vec![]),
+        let rides = self.folded().is_some_and(|f| f.restricting_ledger(&channel.id_hex).is_some_and(|l| rides_writer_address(kind, ledger_locked(l))));
+        match rides.then(|| self.writer_for(&channel.id_hex, author, kind)).flatten() {
+            Some(w) => (w.stream(&read), w.tags()),
+            None => (read, vec![]),
         }
     }
 
@@ -473,38 +564,71 @@ impl ConcordClient {
         judge_post(&f, &self.community().id(), &chat.channel_id_hex, post, &self.timeouts(), now_ms(), public_until)
     }
 
-    /// Why a post of `kind` by `author_pk` would not stand in this Channel, if it
-    /// wouldn't. A puppet holds `@everyone`'s bits and manages nothing, so in a
-    /// restricted (read-only) Channel its post would be held from every reader,
-    /// and with Send Messages denied it would be collapsed. Reactions and
-    /// deletions stay at the read address and are judged by no ledger.
-    pub fn post_refusal(&self, channel: &ChannelView, author_pk: &str, kind: u16) -> Option<PostRefused> {
+    /// Why a write of `kind` by `author` would not stand in this Channel, if it
+    /// wouldn't: in a restricted Channel without a writer key it would be held
+    /// from every reader, and with Send Messages denied it would be collapsed.
+    /// Reactions and deletions stay at the read address, judged by no ledger,
+    /// except in a Locked Channel. Answers from the writer deliveries already
+    /// read; [`ConcordClient::refusal`] reads them again when that's worth it.
+    pub fn post_refusal(&self, channel: &ChannelView, author: &Keys, kind: u16) -> Option<PostRefused> {
         let f = self.folded()?;
-        if !rides_writer_address(kind, false) {
+        let pk = author.public_key().to_hex();
+        let ledger = f.restricting_ledger(&channel.id_hex);
+        if !rides_writer_address(kind, ledger.is_some_and(ledger_locked)) {
             return None;
         }
         // A writer posts at the writer address; the owner and a manager's posts
         // stand at the read address too (CORD-03 §1).
-        if f.restricting_ledger(&channel.id_hex).is_some() && !f.manages_channels(author_pk) && self.usable_writer(&channel.id_hex, author_pk).is_none() {
-            return Some(PostRefused::channel("the Armada channel is read-only: only its writers can post there"));
+        if ledger.is_some() && !f.manages_channels(&pk) && self.writer_for(&channel.id_hex, author, kind).is_none() {
+            return Some(self.unwritable(&f, &channel.id_hex, &pk, kind, true, "the Armada channel is read-only: only its writers can post there"));
         }
         // A Timeout is a moderator's word on Armada: posts inside it collapse
         // there (CORD-04 §8), so a timed-out puppet isn't posted for.
-        if self.timeouts().get(author_pk).is_some_and(|t| t.running(now_ms())) {
-            return Some(PostRefused { reason: "this member is timed out in the Armada community", channel_wide: false });
+        if self.timeouts().get(&pk).is_some_and(|t| t.running(now_ms())) {
+            return Some(PostRefused { reason: "this member is timed out in the Armada community", channel_wide: false, awaiting: false });
         }
         if f.ranked {
-            let p = f.channel_permissions(author_pk, &channel.id_hex);
+            let p = f.channel_permissions(&pk, &channel.id_hex);
             // A private channel lets in only those its overwrites name, and a
             // puppet is named by none: every post would be collapsed.
             if p & perm::VIEW_CHANNEL == 0 {
                 return Some(PostRefused::channel("the Armada channel is private, and Discord members aren't let into it"));
             }
-            if p & perm::SEND_MESSAGES == 0 {
-                return Some(PostRefused::channel("Send Messages is denied to this member in the Armada channel"));
+            if writer_bit(kind).is_some_and(|bit| p & bit == 0) {
+                return Some(self.unwritable(&f, &channel.id_hex, &pk, kind, false, "Send Messages is denied to this member in the Armada channel"));
             }
         }
         None
+    }
+
+    /// [`ConcordClient::post_refusal`], reading the Channel's writer
+    /// deliveries again first when `author` is refused for want of a key it
+    /// may be owed: an Armada moderator's app delivers it once they're
+    /// approved, and the bridge picks it up on their next message.
+    pub async fn refusal(&self, channel: &ChannelView, author: &Keys, kind: u16) -> Option<PostRefused> {
+        let refused = self.post_refusal(channel, author, kind)?;
+        if !refused.awaiting {
+            return Some(refused);
+        }
+        self.read_writer_deliveries(&channel.id_hex, author).await;
+        self.post_refusal(channel, author, kind)
+    }
+
+    /// Why `pk` can't make a write of `kind` here: waiting on a writer key
+    /// they're owed, waiting on approval when a plain Role would let them
+    /// write here, or, when none would, `otherwise` for the whole Channel.
+    fn unwritable(&self, f: &FoldedControl, channel_id_hex: &str, pk: &str, kind: u16, restricted: bool, otherwise: &'static str) -> PostRefused {
+        if restricted && f.may_send_kind(pk, channel_id_hex, kind) {
+            return PostRefused::awaiting("this member's Armada writer key hasn't been delivered yet");
+        }
+        let bit = writer_bit(kind).unwrap_or(perm::SEND_MESSAGES);
+        let private = f.channels.get(channel_id_hex).is_some_and(|c| c.private);
+        let approvable = f
+            .roster
+            .roles
+            .iter()
+            .any(|r| r.rank.is_some() && r.permissions & MANAGEMENT_BITS == 0 && f.roster.role_channel_permissions(r, channel_id_hex, private) & bit != 0);
+        if approvable { PostRefused::awaiting("this member isn't approved to post in the Armada community yet") } else { PostRefused::channel(otherwise) }
     }
 
     async fn publish_signed(&self, author: &Keys, kind: u16, content: String, tags: Vec<Vec<String>>) -> anyhow::Result<Event> {
@@ -569,11 +693,11 @@ impl ConcordClient {
     pub async fn send_typing(&self, channel: &ChannelView, author: &Keys, ms: u64) -> anyhow::Result<()> {
         // Typing moves to the writer address in a restricted Channel; a signal
         // of the moment that wouldn't stand is simply not sent.
-        if self.post_refusal(channel, &author.public_key().to_hex(), kinds::TYPING).is_some() {
+        if self.post_refusal(channel, author, kinds::TYPING).is_some() {
             return Ok(());
         }
         let b = Binding { channel_id_hex: &channel.id_hex, epoch: channel.current().epoch };
-        let (stream, writer_tags) = self.send_target(channel, &author.public_key().to_hex(), kinds::TYPING);
+        let (stream, writer_tags) = self.send_target(channel, author, kinds::TYPING);
         let mut rumor = concord::chat::typing(&b, &author.public_key().to_hex(), ms);
         if !writer_tags.is_empty() {
             rumor = Rumor::new(rumor.kind, rumor.content, rumor.tags.into_iter().chain(writer_tags).collect(), &rumor.pubkey, Some(ms), None);
@@ -590,10 +714,10 @@ impl ConcordClient {
         if self.is_banned(&pk) {
             bail!("author {pk} is banned in this community");
         }
-        if let Some(refused) = self.post_refusal(channel, &pk, msg.kind) {
+        if let Some(refused) = self.refusal(channel, msg.author, msg.kind).await {
             return Err(refused.into());
         }
-        let (stream, writer_tags) = self.send_target(channel, &pk, msg.kind);
+        let (stream, writer_tags) = self.send_target(channel, msg.author, msg.kind);
         let mut tags = concord::stream::channel_binding_tags(&channel.id_hex, channel.current().epoch);
         tags.extend(msg.tags);
         tags.extend(writer_tags);
