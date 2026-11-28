@@ -1567,6 +1567,28 @@ impl Importer {
         Ok(row.map(|r| r.get(0)))
     }
 
+    /// Whether `root` is the genesis root this portal minted for `community_id`.
+    ///
+    /// This is the anchor for the communities CORD-05 §1's check can't vouch
+    /// for: before the owner signed genesis metadata (9164043), the op key did,
+    /// so those planes hold no owner-signed metadata edition and read as
+    /// Forged. No forger can produce a root that only this portal ever held.
+    pub async fn minted_root(&self, community_id: &str, root: &str) -> anyhow::Result<bool> {
+        let rows = self
+            .pool
+            .get()
+            .await?
+            .query("SELECT community_sealed FROM imports WHERE community_id = $1 AND community_sealed IS NOT NULL", &[&community_id])
+            .await?;
+        for row in rows {
+            let secrets: CommunitySecrets = serde_json::from_str(&unseal(&self.env.seal_key_hex, &row.get::<_, Vec<u8>>(0))?)?;
+            if secrets.community_root.eq_ignore_ascii_case(root) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Publish new public channels into a community this portal imported, as
     /// the operator key the owner granted Admin, and return their ids in order.
     ///
@@ -2149,6 +2171,10 @@ mod tests {
             e.vsk == kinds::VSK_METADATA && to_hex(&e.entity_id) == cid_hex && e.author == owner.public_key().to_hex() && e.version == 1
         });
         assert!(owner_genesis, "the owner signed the genesis metadata edition");
+        // The anchor for imports from before the owner signed genesis: the
+        // invite's root is the one this portal minted, and no other is.
+        assert!(importer.minted_root(&cid_hex, &joined.membership.root).await.unwrap());
+        assert!(!importer.minted_root(&cid_hex, &to_hex(&random32())).await.unwrap());
         let head = &folded.head_editions[&cid_hex];
         assert_eq!((head.version, head.author.as_str()), (2, cp.op_pk_hex.as_deref().unwrap()), "the op's edition, adding the emoji pack, chains onto the owner's");
         // The op's Grant carries the staff write key, owner↔op pairwise, as

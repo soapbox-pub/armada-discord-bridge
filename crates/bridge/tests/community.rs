@@ -347,8 +347,11 @@ async fn starts_in_one_community_share_a_fetch_of_its_refoundings_and_each_opens
     assert!(after_first > before);
 }
 
+/// An unanchored root is refused when an invite is accepted (the portal's
+/// wizard), not when a persisted join starts: communities imported before the
+/// owner signed genesis metadata have exactly this plane, and genuine roots.
 #[tokio::test]
-async fn a_root_no_owner_anchor_opens_under_is_refused() {
+async fn a_persisted_join_starts_on_a_root_no_owner_anchor_opens_under() {
     let w = world();
     // The same Community's identity paired with a root of someone else's, whose
     // plane holds a metadata edition that someone signed.
@@ -358,6 +361,6 @@ async fn a_root_no_owner_anchor_opens_under_is_refused() {
     forged.held_roots[0].key = forged.root.clone();
     let meta = build_metadata_edition(&forged.id(), &json!({ "name": "Test" }), &EditionMeta::first(&forger.public_key().to_hex(), None)).unwrap();
     w.relay.inject(seal_edition(&meta, &forged.control_write_stream().unwrap(), &forger).unwrap());
-    let err = CommunityRuntime::open(forged, Arc::new(w.relay.clone()), None).await.err().expect("refused");
-    assert!(err.to_string().contains("root"), "{err}");
+    let rt = CommunityRuntime::open(forged, Arc::new(w.relay.clone()), None).await.expect("a persisted join opens");
+    assert!(rt.folded().is_some());
 }

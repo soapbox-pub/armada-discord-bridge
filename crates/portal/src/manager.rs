@@ -25,7 +25,7 @@ use bridge::router::{BridgeRouter, RouterOptions, SelfIds, WebhookMessage, is_mi
 use bridge::store::{MappingStore, PgMappingStore};
 use bridge::transform::parse_bot_command;
 use bridge::types::{ChannelLink, DiscordInboundMessage, DiscordMessageDelete, DiscordReaction};
-use concord::community::{ChannelView, Membership};
+use concord::community::{ChannelView, Membership, RootVerdict};
 use concord::invite::{invite_delivery_relays, parse_invite_link, stock_relays};
 use concord::roles::perm;
 use deadpool_postgres::Pool;
@@ -663,6 +663,9 @@ pub struct InspectedInvite {
     pub name: String,
     pub relays: Vec<String>,
     pub channels: Vec<ChannelView>,
+    /// The root the invite delivers, and whether its plane anchors it (CORD-05 §1).
+    pub root: String,
+    pub root_verdict: RootVerdict,
 }
 
 fn random_hex(bytes: usize) -> String {
@@ -700,6 +703,8 @@ impl BridgeManager {
             name: m.name.clone(),
             relays: m.relays.clone(),
             channels: client.channels(),
+            root: m.root.clone(),
+            root_verdict: client.root_verdict(),
         })
     }
 

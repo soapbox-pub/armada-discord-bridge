@@ -97,13 +97,14 @@ impl CommunityRuntime {
     pub async fn open(base: Membership, relays: Arc<dyn RelayLike>, on_cursor: Option<CursorHandler>) -> anyhow::Result<Arc<CommunityRuntime>> {
         let control = ConcordClient::new(base, relays, Keys::generate());
         control.sync_control().await?;
-        // The invite's root must be the Community's own, or every bridge here
-        // would sit on planes whoever minted the invite controls (CORD-05 §1).
-        // An unanswered read fails the start, which is retried.
-        match control.root_verdict() {
-            concord::community::RootVerdict::Anchored => {}
-            concord::community::RootVerdict::Unread => anyhow::bail!("the community's Control Plane couldn't be read to authenticate its root"),
-            concord::community::RootVerdict::Forged => anyhow::bail!("the invite's root isn't the community's own: no owner anchor opens under it"),
+        // CORD-05 §1 authenticates the root BEFORE a join is persisted, so the
+        // gate is where an invite is accepted (the portal's wizard), not here:
+        // everything opened here is a join already made. Refusing here took
+        // down 621 bridges on communities imported before the owner signed
+        // genesis metadata — their op-signed planes hold no owner anchor, and
+        // their roots were genuine. Reported, so it stays visible.
+        if control.root_verdict() == concord::community::RootVerdict::Forged {
+            tracing::warn!(community = %control.community().community_id, "no owner anchor opens under this community's root");
         }
         let rt = Arc::new_cyclic(|me| CommunityRuntime {
             me: me.clone(),

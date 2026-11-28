@@ -10,6 +10,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
+use concord::community::RootVerdict;
 use deadpool_postgres::Pool;
 use regex::Regex;
 use serde::Deserialize;
@@ -636,6 +637,7 @@ async fn bridge_create(State(st): State<AppState>, headers: HeaderMap, body: Opt
     // "Add channel": reuse the sealed invite from a bridge the user already
     // owns instead of demanding a fresh link for every channel.
     let mut invite = field("inviteUrl").filter(|s| !s.is_empty());
+    let pasted = invite.is_some();
     if invite.is_none()
         && let Some(from) = field("fromBridgeId")
     {
@@ -649,6 +651,22 @@ async fn bridge_create(State(st): State<AppState>, headers: HeaderMap, body: Opt
         Ok(i) => i,
         Err(error) => return Ok(err(StatusCode::UNPROCESSABLE_ENTITY, format!("{error:#}"))),
     };
+    // CORD-05 §1: a pasted invite is a join, and its root is authenticated
+    // before the invite is persisted. Here and not at every start: a bridge's
+    // stored invite is a join already made, and gating the start refused every
+    // community imported before the owner signed genesis metadata — 621
+    // bridges whose roots were genuine, because this portal minted them.
+    if pasted {
+        match inspected.root_verdict {
+            RootVerdict::Anchored => {}
+            RootVerdict::Unread => return Ok(err(StatusCode::BAD_GATEWAY, "the community's Control Plane couldn't be read to authenticate the invite")),
+            RootVerdict::Forged => {
+                if !st.importer.minted_root(&inspected.community_id, &inspected.root).await? {
+                    return Ok(err(StatusCode::UNPROCESSABLE_ENTITY, "this invite's keys don't open the community's own plane, so it was forged or is stale"));
+                }
+            }
+        }
+    }
     let row = st
         .pool
         .get()
