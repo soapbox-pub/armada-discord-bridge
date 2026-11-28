@@ -857,11 +857,17 @@ async fn rehosts_discord_attachments_with_imeta_tags() {
     };
     h.router.on_discord_message(msg, &h.link).await.unwrap();
     let opened = h.chats().pop().unwrap();
-    let sha = hex::encode(Sha256::digest(b"png"));
+    let (stored, served) = h.blobs.uploads.lock().unwrap()[0].clone();
+    assert_ne!(stored, b"png", "the plaintext never reaches Blossom");
+    assert_eq!(served, "image/png", "uploaded under the plaintext's type, as Armada does");
+    let sha = hex::encode(Sha256::digest(&stored));
     let url = format!("https://blossom.example/{sha}.png");
     assert_eq!(opened.rumor.content, url);
     let imeta = opened.rumor.tags.iter().find(|t| t[0] == "imeta").unwrap();
-    assert_eq!(imeta, &vec!["imeta".into(), format!("url {url}"), "m image/png".into(), format!("x {sha}"), "size 3".into(), "name cat.png".into()]);
+    assert_eq!(imeta[..6], ["imeta".into(), format!("url {url}"), "m image/png".into(), format!("x {sha}"), format!("size {}", stored.len()), "name cat.png".into()]);
+    let parsed = concord::media::Imeta::parse(imeta).unwrap();
+    assert_eq!(parsed.ox.as_deref(), Some(hex::encode(Sha256::digest(b"png")).as_str()));
+    assert_eq!(concord::media::decrypt(&stored, &parsed.encryption.unwrap()).unwrap(), b"png");
 
     // A failed rehost keeps the CDN link so the message still bridges.
     let gone = DiscordInboundMessage {

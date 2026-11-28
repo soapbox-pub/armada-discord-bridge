@@ -961,6 +961,13 @@ impl BridgeRouter {
     /// Rehost Discord CDN attachments (signed URLs expire in ~24 h) on Blossom,
     /// signed by the puppet, and record NIP-92 imeta tags. Any failure falls
     /// back to the CDN link so the message still bridges.
+    ///
+    /// The blob is encrypted exactly as Armada's composer encrypts its own:
+    /// AES-256-GCM under a fresh key and 16-byte nonce, uploaded under the
+    /// plaintext's type, with the key material and `ox` in the imeta. These
+    /// were uploaded in the clear once, so a sealed channel's media was
+    /// readable by anyone holding the URL, or a hash of the file — the rumor
+    /// was the only thing the channel key protected.
     async fn rehost_attachments(&self, msg: &DiscordInboundMessage, author: &Keys, tags: &mut Vec<Vec<String>>) -> Vec<DiscordAttachmentIn> {
         let Some(blobs) = &self.options.blobs else { return msg.attachments.clone() };
         let mut out = Vec::with_capacity(msg.attachments.len());
@@ -971,19 +978,29 @@ impl BridgeRouter {
                 // decides whether the far side renders the image or a download
                 // card. The CDN filename is the better witness in that case.
                 let kind = if mime == "application/octet-stream" { mime_from_url(&attachment.url).map(str::to_owned).unwrap_or(mime) } else { mime };
-                let uploaded = blobs.upload(&data, &kind, author).await?;
+                let ox = concord::media::sha256_hex(&data);
+                let (ciphertext, key) = concord::media::encrypt(&data);
+                let uploaded = blobs.upload(&ciphertext, &kind, author).await?;
                 // Content-addressed URLs arrive extension-less unless the server
                 // chose one; BUD-01 serves the same blob either way, and the
                 // extension is what Discord's unfurl and Armada's sniffing read.
-                anyhow::Ok((with_extension(&uploaded.url, &kind), kind, uploaded.sha256, data.len()))
+                anyhow::Ok((with_extension(&uploaded.url, &kind), kind, uploaded.sha256, ciphertext.len(), key, ox))
             };
             match rehosted.await {
-                Ok((url, kind, sha256, size)) => {
+                Ok((url, kind, sha256, size, key, ox)) => {
+                    // `x` and `size` describe the stored ciphertext, `m` and `ox`
+                    // the plaintext, as Armada writes them.
                     let mut imeta = vec!["imeta".into(), format!("url {url}"), format!("m {kind}"), format!("x {sha256}"), format!("size {size}")];
                     // The original filename, so the far side can name a download.
                     if let Some(name) = &attachment.filename {
                         imeta.push(format!("name {name}"));
                     }
+                    imeta.extend([
+                        "encryption-algorithm aes-gcm".to_owned(),
+                        format!("decryption-key {}", hex::encode(key.key)),
+                        format!("decryption-nonce {}", hex::encode(key.nonce)),
+                        format!("ox {ox}"),
+                    ]);
                     tags.push(imeta);
                     out.push(DiscordAttachmentIn { url, filename: attachment.filename.clone() });
                 }
